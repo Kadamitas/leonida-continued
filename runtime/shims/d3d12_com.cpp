@@ -273,9 +273,20 @@ public:
                 !leonida::CommandList::is_generation_write_prefix(list_.commands(), address))) {
             const auto prefix = list_.commands();
             std::fprintf(stderr, "[rt] d3d12: generation wait requires mid-list continuation reference=%llu "
-                         "preceding=%zu first_ir=%zu last_ir=%zu\n",
-                         static_cast<unsigned long long>(reference), prefix.size(),
-                         prefix.empty() ? 0 : prefix.front().index(), prefix.empty() ? 0 : prefix.back().index());
+                         "preceding=%zu previous_waits=%zu\n",
+                         static_cast<unsigned long long>(reference), prefix.size(), list_.ordered_acquires());
+            for (std::size_t i = 0; i < std::min<std::size_t>(prefix.size(), 16); ++i) {
+                if (const auto* write = std::get_if<leonida::WriteImmediate>(&prefix[i])) {
+                    std::fprintf(stderr, "[rt]   command %zu: WriteImmediate address=0x%llx value=0x%x\n",
+                                 i, static_cast<unsigned long long>(write->address), write->value);
+                } else if (const auto* wait = std::get_if<leonida::HostMemoryAcquire>(&prefix[i])) {
+                    std::fprintf(stderr, "[rt]   command %zu: HostMemoryAcquire address=0x%llx reference=%llu\n",
+                                 i, static_cast<unsigned long long>(wait->address),
+                                 static_cast<unsigned long long>(wait->reference));
+                } else {
+                    std::fprintf(stderr, "[rt]   command %zu: IR index %zu\n", i, prefix[i].index());
+                }
+            }
             return false;
         }
         bool added = false;
