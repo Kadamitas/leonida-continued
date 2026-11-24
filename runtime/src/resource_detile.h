@@ -342,7 +342,7 @@ inline constexpr std::optional<Surface4ksLayout> sampled_surface_layout(
         mip_count > std::bit_width(std::max(width, height)) || !tile ||
         (block_dim != 1 && block_dim != 4) || (block_dim == 4 && element_bytes != 8 && element_bytes != 16))
         return std::nullopt;
-    if (display_64k && block_dim != 4) return std::nullopt;
+    if (display_64k && block_dim != 4 && element_bytes != 4) return std::nullopt;
     const auto display_shape = element_tile_shape(false, element_bytes);
     const auto block_width = display_64k ? display_shape.width : tile->width;
     const auto block_height = display_64k ? display_shape.height : tile->height;

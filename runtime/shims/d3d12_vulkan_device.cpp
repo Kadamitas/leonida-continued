@@ -11352,7 +11352,7 @@ private:
         }
         if (title_linear_texture_enabled() &&
             (implicit_sampled || title_sampled_4ks_texture_shape(desc) || title_default_bc_texture_shape(desc) ||
-             title_display_bc_texture_shape(desc))) {
+             title_display_bc_texture_shape(desc) || (xbox_query && title_display_rgba8_array_query(desc)))) {
             const auto native = title_linear_native_desc(desc);
             const auto format = state_.texture_format(native);
             const auto layout = title_tiled_texture_layout(desc, format);

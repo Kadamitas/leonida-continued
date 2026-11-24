@@ -197,6 +197,11 @@ inline constexpr bool title_display_bc_texture_shape(const D3D12_RESOURCE_DESC& 
         title_sampled_2d_texture_shape(desc) && title_sampled_bc_format(desc.Format);
 }
 
+inline constexpr bool title_display_rgba8_array_query(const D3D12_RESOURCE_DESC& desc) {
+    return UINT(desc.Layout) == kTitleDisplay64k && (!desc.Alignment || desc.Alignment == 65536) &&
+        desc.DepthOrArraySize > 1 && desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM && title_sampled_2d_texture_shape(desc);
+}
+
 // VIctory's host_texture translates resource usage and keeps the actual dimensions. Use that model for
 // the native GPU texture path. CPU-tiled textures, aliased formats and combined depth/storage need
 // separate backing rules. Native capability and placement checks still run after classification.
