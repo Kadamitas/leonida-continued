@@ -91,6 +91,55 @@ VKAPI_ATTR void VKAPI_CALL watching_barrier(VkCommandBuffer cb, VkPipelineStageF
     real_barrier(cb, src, dst, flags, memory_count, memory, buffer_count, buffers, image_count, images);
 }
 
+PFN_vkQueueSubmit real_submit = nullptr;
+VkSemaphore last_signal = VK_NULL_HANDLE, last_single_wait = VK_NULL_HANDLE;
+std::uint64_t last_single_value = 0;
+
+VKAPI_ATTR VkResult VKAPI_CALL watching_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits,
+                                               VkFence fence) {
+    if (count == 1) {
+        const auto& s = submits[0];
+        const auto* timeline = static_cast<const VkTimelineSemaphoreSubmitInfo*>(s.pNext);
+        last_signal = s.signalSemaphoreCount ? s.pSignalSemaphores[0] : VK_NULL_HANDLE;
+        last_single_wait = s.waitSemaphoreCount == 1 ? s.pWaitSemaphores[0] : VK_NULL_HANDLE;
+        last_single_value = last_single_wait && timeline ? timeline->pWaitSemaphoreValues[0] : 0;
+    }
+    return real_submit(queue, count, submits, fence);
+}
+
+// New queues must still acquire published initialization even after the publishing queue has been released.
+int check_released_publisher(vktest::Device& d, bool bindless) {
+    VulkanContext context(d.device_proc, d.device, true);
+    EXPECT(context.loaded());
+    real_submit = context.vk.vkQueueSubmit;
+    context.vk.vkQueueSubmit = watching_submit;
+    CommandList list;
+    EXPECT(list.close());
+    const CommandList* lists[] = {&list};
+    VkSemaphore producer_signal = VK_NULL_HANDLE;
+    {
+        VulkanQueue producer(context, d.queue, d.family);
+        EXPECT(producer.ok());
+        if (bindless) {
+            context.set_bindless_prepare([&](VkCommandBuffer) { context.note_bindless_upload(); return true; });
+        } else {
+            VkBuffer clear = d.buffer(256, VK_BUFFER_USAGE_TRANSFER_DST_BIT, nullptr);
+            EXPECT(clear);
+            context.zero_on_next_submit(1, clear);
+        }
+        EXPECT(producer.execute(lists) == ReplayResult::success);
+        producer_signal = last_signal;
+        EXPECT(producer_signal);
+    }
+    context.set_bindless_prepare({});
+    VulkanQueue consumer(context, d.compute_queue, d.compute_family, Kind::compute);
+    EXPECT(consumer.ok() && consumer.execute(lists) == ReplayResult::success);
+    EXPECT(last_single_wait == producer_signal && last_single_value == 1 && last_signal != producer_signal);
+    EXPECT(consumer.execute(lists) == ReplayResult::success && !last_single_wait);
+    EXPECT(consumer.idle());
+    return 0;
+}
+
 const char* flags_text(VkQueueFlags f) {
     static char buf[32];
     std::snprintf(buf, sizeof buf, "%s%s%s", f & VK_QUEUE_GRAPHICS_BIT ? "G" : "", f & VK_QUEUE_COMPUTE_BIT ? "C" : "",
@@ -221,6 +270,8 @@ int main() {
     std::printf("families: direct %u (%s)", d.family, flags_text(d.families[d.family].queueFlags));
     std::printf(", compute %u (%s)", d.compute_family, flags_text(d.families[d.compute_family].queueFlags));
     std::printf(", copy %u (%s)\n", d.copy_family, flags_text(d.families[d.copy_family].queueFlags));
+
+    if (check_released_publisher(d, false) || check_released_publisher(d, true)) return 1;
 
     VulkanContext context(d.device_proc, d.device, true);
     EXPECT(context.loaded());

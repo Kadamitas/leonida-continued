@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 
 int main() {
     leonida::RetireTickets<int> tickets;
@@ -47,6 +48,20 @@ int main() {
     tickets.record(3, 1, 16);
     done[1] = 16;
     if (tickets.completed(query) != 9) return 7;
+
+    // A host wait releases the submit lock with this snapshot. Queue teardown must leave that wait valid
+    // while immediately dropping this queue's ownership from the blocked retirement prefix.
+    leonida::RetireTickets<std::shared_ptr<int>> owned;
+    auto publisher = std::make_shared<int>(0);
+    std::weak_ptr<int> observer = publisher;
+    owned.record(1, std::make_shared<int>(1), 1);
+    owned.record(2, publisher, 1);
+    auto host_wait = owned.pending_through(2);
+    owned.queue_idle(publisher);
+    publisher.reset();
+    if (observer.expired()) return 8;
+    host_wait.clear();
+    if (!observer.expired()) return 9;
 
     std::puts("out-of-order queue completion kept the retirement prefix safe");
     return 0;

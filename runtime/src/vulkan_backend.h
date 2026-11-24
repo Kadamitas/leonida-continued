@@ -1069,6 +1069,21 @@ struct TileRange {
     std::uint64_t count;
 };
 
+// An initialization published by one queue can still be needed after its D3D12 queue is released.
+struct QueueTimeline {
+    QueueTimeline(VkDevice d, PFN_vkDestroySemaphore fn) : device(d), destroy(fn) {}
+    QueueTimeline(const QueueTimeline&) = delete;
+    QueueTimeline& operator=(const QueueTimeline&) = delete;
+    ~QueueTimeline() {
+        if (semaphore) destroy(device, semaphore, nullptr);
+    }
+
+    VkDevice device;
+    PFN_vkDestroySemaphore destroy;
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+};
+using QueueTimelineRef = std::shared_ptr<QueueTimeline>;
+
 // Per device: what the queues share. Resources are registered by their stable ID (the COM resource pointer).
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -1642,7 +1657,7 @@ public:
     // Waits (not for the device: for the queues' timelines) until every submission up to `ticket` is done, then
     // returns the completed ticket. For a caller whose list of retired objects has grown past what it will hold.
     std::uint64_t wait_retire_ticket(std::uint64_t ticket) {
-        std::vector<std::pair<VkSemaphore, std::uint64_t>> pending;
+        std::vector<std::pair<QueueTimelineRef, std::uint64_t>> pending;
         {
             std::lock_guard lock(submit_mutex_);
             if (is_device_lost()) return 0;
@@ -1651,8 +1666,8 @@ public:
         if (!pending.empty()) {
             std::vector<VkSemaphore> semaphores;
             std::vector<std::uint64_t> values;
-            for (const auto& [semaphore, value] : pending) {
-                semaphores.push_back(semaphore);
+            for (const auto& [timeline, value] : pending) {
+                semaphores.push_back(timeline->semaphore);
                 values.push_back(value);
             }
             VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
@@ -1675,9 +1690,9 @@ public:
         {
             std::lock_guard lock(submit_mutex_);
             if (is_device_lost()) return 0;
-            ticket = retire_tickets_.completed([this, &lost](VkSemaphore semaphore, std::uint64_t value) {
+            ticket = retire_tickets_.completed([this, &lost](const QueueTimelineRef& timeline, std::uint64_t value) {
                 std::uint64_t done = 0;
-                const VkResult result = vk.vkGetSemaphoreCounterValue(device_, semaphore, &done);
+                const VkResult result = vk.vkGetSemaphoreCounterValue(device_, timeline->semaphore, &done);
                 if (result == VK_ERROR_DEVICE_LOST) lost = true;
                 return result == VK_SUCCESS && done >= value;
             });
@@ -1703,10 +1718,10 @@ public:
         constexpr const char* names[] = {"clear_full", "clear_rects", "copy", "resolve", "possible_draw_or_predicated_clear"};
         for (unsigned i = 0; i < trace.last_ticket.size(); ++i) {
             const auto ticket = trace.last_ticket[i];
-            const auto retired = retire_tickets_.observe(ticket, [&](VkSemaphore semaphore, std::uint64_t value)
+            const auto retired = retire_tickets_.observe(ticket, [&](const QueueTimelineRef& timeline, std::uint64_t value)
                 -> std::optional<bool> {
                 std::uint64_t done = 0;
-                if (vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) != VK_SUCCESS) return {};
+                if (vk.vkGetSemaphoreCounterValue(device_, timeline->semaphore, &done) != VK_SUCCESS) return {};
                 return done >= value;
             });
             std::fprintf(stderr, "[rt] d3d12: native RT replay owner=0x%llx kind=%s last_global_ticket=%llu "
@@ -1718,11 +1733,11 @@ public:
 
     // Both methods are called with submit_mutex_ held. A queue's own progress timeline is
     // monotonic even when another queue completes first; global tickets are retired in order.
-    void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
+    void record_submit_locked(const QueueTimelineRef& progress, std::uint64_t value) {
         const auto ticket = submitted_ticket_.fetch_add(1, std::memory_order_acq_rel) + 1;
         retire_tickets_.record(ticket, progress, value);
     }
-    void retire_queue_idle_locked(VkSemaphore progress) {
+    void retire_queue_idle_locked(const QueueTimelineRef& progress) {
         retire_tickets_.queue_idle(progress);
     }
 
@@ -1918,7 +1933,7 @@ private:
     alignas(64) std::mutex submit_mutex_;
     FrameDrawActivity frame_draw_activity_;
     std::uintptr_t next_activity_image_ = 0;  // under resource_mutex_
-    RetireTickets<VkSemaphore> retire_tickets_;
+    RetireTickets<QueueTimelineRef> retire_tickets_;
     bool trace_native_attachments_ = false;  // protected by resource_mutex_
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
@@ -1934,7 +1949,7 @@ private:
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
-    std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
+    std::mutex storage_mutex_;  // guards pending initialization and the two published timelines
     std::unordered_set<ResourceId> storage_pending_;
     struct PendingZero {
         ResourceId id;
@@ -1944,7 +1959,7 @@ private:
     // The last submission that initialized storage images (its queue's progress semaphore and ticket) and a counter
     // that says which one: every other queue's next submission waits for it, so no queue uses such an image before
     // the zero-fill that put it in GENERAL has run.
-    VkSemaphore storage_init_semaphore_ = VK_NULL_HANDLE;
+    QueueTimelineRef storage_init_timeline_;
     std::uint64_t storage_init_value_ = 0;
     std::uint64_t storage_init_version_ = 0;
     using ViewCache = ImageViewCache<VkImage, VkImageView>;
@@ -1958,7 +1973,7 @@ private:
     bool bindless_upload_pending_ = false;  // tracker_mutex_
     // The last submission that carried a new generation's table upload (its queue's progress semaphore and value), and
     // a counter that says which one: every other queue's next submission waits for it (storage_mutex_).
-    VkSemaphore bindless_upload_semaphore_ = VK_NULL_HANDLE;
+    QueueTimelineRef bindless_upload_timeline_;
     std::uint64_t bindless_upload_value_ = 0;
     std::uint64_t bindless_upload_version_ = 0;
     std::unique_ptr<Depth24Converter> depth24_;
@@ -2093,7 +2108,8 @@ private:
     friend class VulkanPresenter;
     // A presenter's private uploader uses the same VkQueue and retirement machinery, with no guest waits.
     VulkanQueue(VulkanContext& context, VkQueue queue, std::uint32_t family, QueueKind kind, bool guest_queue)
-        : context_(context), queue_(queue), kind_(kind), family_(family), guest_queue_(guest_queue) {
+        : context_(context), queue_(queue), kind_(kind), family_(family), guest_queue_(guest_queue),
+          timeline_(std::make_shared<QueueTimeline>(context.device(), context.vk.vkDestroySemaphore)) {
         auto& vk = context.vk;
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -2102,12 +2118,11 @@ private:
         VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
-        ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_) == VK_SUCCESS;
+        ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &timeline_->semaphore) == VK_SUCCESS;
         try {
             if (guest_queue_) context_.holds().attach(this);
         } catch (...) {
             // A failed registration leaves no queue to run the destructor for these Vulkan handles.
-            if (progress_) vk.vkDestroySemaphore(context.device(), progress_, nullptr);
             if (pool_) vk.vkDestroyCommandPool(context.device(), pool_, nullptr);
             throw;
         }
@@ -2126,7 +2141,7 @@ public:
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
             const VkResult idle_result = vk.vkQueueWaitIdle(queue_);
             if (idle_result == VK_SUCCESS) {
-                if (progress_) context_.retire_queue_idle_locked(progress_);
+                if (progress_) context_.retire_queue_idle_locked(timeline_);
             } else {
                 context_.mark_device_lost();
             }
@@ -2136,14 +2151,7 @@ public:
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
             if (context_.scratch_) context_.scratch_->forget(progress_);
         }
-        if (progress_) {
-            // This queue is idle, so whatever initialisation it published (storage images, zero-filled buffers) has
-            // finished: the next submission on another queue must not wait on a semaphore that is about to go.
-            std::lock_guard lock(context_.storage_mutex_);
-            if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
-        }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
-        if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
         destroy_khr_stages(khr_stage_pool_);
         destroy_khr_as_queries(khr_as_query_pool_);
         for (auto& slot : buffers_) {
@@ -3377,18 +3385,20 @@ private:
         std::vector<VulkanContext::PendingZero> zero_buffers;
         {
             std::lock_guard lock(context_.storage_mutex_);
-            if (context_.storage_init_semaphore_ && context_.storage_init_semaphore_ != progress_ &&
+            if (context_.storage_init_timeline_ && context_.storage_init_timeline_ != timeline_ &&
                 context_.storage_init_version_ != storage_init_seen_) {
-                waits_.push_back(context_.storage_init_semaphore_);
+                waits_.push_back(context_.storage_init_timeline_->semaphore);
+                wait_pins_.push_back(context_.storage_init_timeline_);
                 wait_values_.push_back(context_.storage_init_value_);
                 storage_init_seen_ = context_.storage_init_version_;
             }
             // The set this submission binds may be a new generation whose table another queue's submission uploads:
             // wait for that one, as for the storage images (the table's buffers are used by one queue family only:
             // every D3D12 queue of the device is made in info.queue_family).
-            if (context_.bindless_upload_semaphore_ && context_.bindless_upload_semaphore_ != progress_ &&
+            if (context_.bindless_upload_timeline_ && context_.bindless_upload_timeline_ != timeline_ &&
                 context_.bindless_upload_version_ != bindless_upload_seen_) {
-                waits_.push_back(context_.bindless_upload_semaphore_);
+                waits_.push_back(context_.bindless_upload_timeline_->semaphore);
+                wait_pins_.push_back(context_.bindless_upload_timeline_);
                 wait_values_.push_back(context_.bindless_upload_value_);
             }
             bindless_upload_seen_ = context_.bindless_upload_version_;
@@ -3477,14 +3487,14 @@ private:
         }
         if (submitted && (initialized_host_images || !storage_images.empty() || !zero_buffers.empty())) {
             std::lock_guard lock(context_.storage_mutex_);
-            context_.storage_init_semaphore_ = progress_;
+            context_.storage_init_timeline_ = timeline_;
             context_.storage_init_value_ = submitted_;
             ++context_.storage_init_version_;
             storage_init_seen_ = context_.storage_init_version_;
         }
         if (submitted && bindless_uploaded) {
             std::lock_guard lock(context_.storage_mutex_);
-            context_.bindless_upload_semaphore_ = progress_;
+            context_.bindless_upload_timeline_ = timeline_;
             context_.bindless_upload_value_ = submitted_;
             ++context_.bindless_upload_version_;
             bindless_upload_seen_ = context_.bindless_upload_version_;
@@ -3887,7 +3897,7 @@ private:
                 pending_bindings_.pop_back();
                 return false;
             }
-            context_.record_submit_locked(progress_, ticket);
+            context_.record_submit_locked(timeline_, ticket);
         }
         submitted_ = last_sparse_ = ticket;
         clear_waits(ticket);
@@ -4081,7 +4091,7 @@ private:
                         family_, reinterpret_cast<void*>(queue_), reinterpret_cast<void*>(progress_),
                         static_cast<unsigned long long>(ticket), reinterpret_cast<void*>(command_buffer),
                         submit.commandBufferCount);
-                context_.record_submit_locked(progress_, ticket);
+                context_.record_submit_locked(timeline_, ticket);
                 if (attachment_writes) attachment_writes->submit(context_.submitted_retire_ticket());
                 if (signals_fence) context_.holds().signaled(fence, value);
             }
@@ -4107,7 +4117,8 @@ private:
     std::uint32_t family_;
     bool guest_queue_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
-    VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done
+    QueueTimelineRef timeline_;
+    const VkSemaphore& progress_ = timeline_->semaphore;  // the queue signals its own timeline
     std::uint64_t submitted_ = 0;
     std::vector<CommandSlot> buffers_;
     std::vector<VkEvent> free_events_;  // unsignaled, for order_timestamp_copy

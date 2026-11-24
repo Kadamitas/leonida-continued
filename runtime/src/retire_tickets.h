@@ -17,7 +17,7 @@ template<class Semaphore>
 class RetireTickets {
 public:
     void record(std::uint64_t ticket, Semaphore semaphore, std::uint64_t value) {
-        pending_.push_back({ticket, semaphore, value, false});
+        pending_.push_back({ticket, std::move(semaphore), value, false});
     }
 
     template<class Query>
@@ -63,9 +63,13 @@ public:
 
     // Call only after the owning queue's wait-idle succeeded. Merely requesting idle does not
     // prove its submissions completed and must not advance the retirement prefix.
-    void queue_idle(Semaphore semaphore) {
-        for (Entry& entry : pending_)
-            if (entry.semaphore == semaphore) entry.idle = true;
+    void queue_idle(const Semaphore& semaphore) {
+        for (Entry& entry : pending_) {
+            if (entry.semaphore == semaphore) {
+                entry.idle = true;
+                entry.semaphore = {};  // the global prefix may still be blocked by an unrelated queue
+            }
+        }
     }
 
 private:
