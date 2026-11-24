@@ -1051,7 +1051,8 @@ rt::xmem::PhysicalCpuView find_physical_cpu_view(const void* source, std::size_t
 rt::xmem::SparseTextureSnapshot snapshot_sparse_texture(const void* source, std::size_t size,
                                                        std::span<std::byte> destination,
                                                        std::span<const std::byte> previous,
-                                                       rt::xmem::SparseTextureMismatch* mismatch) noexcept {
+                                                       rt::xmem::SparseTextureMismatch* mismatch,
+                                                       rt::xmem::TextureCoverage coverage) noexcept {
     using Result = rt::xmem::SparseTextureSnapshot;
     if (!size) return Result::ready;
     const auto start = reinterpret_cast<uintptr_t>(source);
@@ -1087,6 +1088,7 @@ rt::xmem::SparseTextureSnapshot snapshot_sparse_texture(const void* source, std:
         const auto page_base = page_address(base, index);
         const auto piece_end = (std::min)(end, page_base + kPage);
         const auto slot = region.page[index];
+        if (!slot && coverage == rt::xmem::TextureCoverage::fully_mapped) return Result::failed;
         if (slot && (slot > g_slots.size() || !g_slots[slot - 1].allocated ||
             (slot - 1) / kChunkPages >= g_chunks.size() || !g_chunks[(slot - 1) / kChunkPages].view))
             return Result::failed;

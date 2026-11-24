@@ -1271,9 +1271,12 @@ struct DeviceState {
         return true;
     }
 
+    enum class DisplayReadOverlap { none, single_layer, two_layer_bc1 };
+
     bool conflicting_host_placement_locked(leonida::ResourceId owner, std::uint64_t address,
                                             std::uint64_t bytes, bool physical_snapshot,
-                                            TitleImageCollision* conflict = nullptr, bool display_sampled = false,
+                                            TitleImageCollision* conflict = nullptr,
+                                            DisplayReadOverlap display = DisplayReadOverlap::none,
                                             DisplayBcShape typed_display = {}) const {
         for (const auto& [id, range] : title_host_ranges)
             if (id != owner && conflicting_host_range(address, bytes, physical_snapshot,
@@ -1285,7 +1288,16 @@ struct DeviceState {
             }
         for (const auto& [start, view] : title_address_candidates_locked(address, bytes))
             if (conflicting_host_range(address, bytes, physical_snapshot, start, view.bytes, view.physical_snapshot)) {
-                if (display_sampled && physical_snapshot) {
+                if (physical_snapshot && display == DisplayReadOverlap::two_layer_bc1 && address != start) {
+                    // These intersecting read-only descriptors have different bases and independent image
+                    // snapshots. Verify every page of both extents together, including either end outside
+                    // their intersection. The store can read GPU-only mappings without a writable CPU alias.
+                    const auto begin = std::min(address, start);
+                    const auto extent = std::max(address + bytes, start + view.bytes) - begin;
+                    if (rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(begin), extent,
+                            rt::xmem::TextureCoverage::fully_mapped) == rt::xmem::SparseTextureSnapshot::ready) continue;
+                }
+                if (physical_snapshot && display == DisplayReadOverlap::single_layer) {
                     if (address != start && physical_readonly_view(start, view)) continue;
                     if (address == start && view.buffer_srv && !view.texture_srv &&
                         physical_buffer_prefix(start, view.bytes, bytes)) continue;
@@ -3868,7 +3880,8 @@ public:
         const auto source_span = placed_bytes ? std::size_t(placed_bytes) : source_bytes;
         const bool physical = rt::xmem::validate_sparse_texture(source, source_span) == rt::xmem::SparseTextureSnapshot::ready;
         if (require_physical && !physical) return E_INVALIDARG;
-        const bool display_sampled = layout.tile_bytes == 65536 && layout.block_dim == 4 && !volume && layers == 1;
+        const bool display_bc = layout.tile_bytes == 65536 && layout.block_dim == 4 && !volume;
+        const bool display_sampled = display_bc && layers == 1;
         const DeviceState::DisplayBcShape typed_display = physical && placed_bytes && display_sampled ?
             DeviceState::DisplayBcShape{desc_.Format, UINT(desc_.Width), desc_.Height, desc_.MipLevels} : DeviceState::DisplayBcShape{};
         static const bool defer_staging = [] {
@@ -3992,8 +4005,11 @@ public:
             try {
                 std::lock_guard lock(device_.title_placement_mutex);
                 DeviceState::TitleImageCollision conflict{};
+                using Overlap = DeviceState::DisplayReadOverlap;
+                const auto overlap = display_sampled ? Overlap::single_layer :
+                    display_bc && layers == 2 && desc_.Format == DXGI_FORMAT_BC1_UNORM ? Overlap::two_layer_bc1 : Overlap::none;
                 if (device_.conflicting_host_placement_locked(id(), address, placed_bytes, physical, &conflict,
-                                                             display_sampled, typed_display))
+                                                              overlap, typed_display))
                     return refused(DeviceState::sampled_placement_failure("placed source intersects earlier owner",
                         E_NOTIMPL, address, placed_bytes, physical, conflict));
                 const auto [first, last] = device_.title_image_resources.equal_range(address);
