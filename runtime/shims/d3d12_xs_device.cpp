@@ -2686,14 +2686,14 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             if (satisfied_host_generation_enabled() && self->device && self->device->console_lists &&
                 self->device->console_layout.load(std::memory_order_relaxed) == kConsoleLayoutNewer &&
                 a1 && a1 % 8 == 0 && a1 <= UINT64_MAX - 8 && static_cast<std::uint32_t>(a2) == 7 &&
-                (a3 == 1 || a3 == 2) && static_cast<std::uint32_t>(a4) == 1) {
+                a3 && static_cast<std::uint32_t>(a4) == 1) {
                 list_add_ref(self);
                 const std::unique_ptr<ListProxy, decltype(&list_release)> list_pin(self, &list_release);
                 const HRESULT hr = rt::d3d12::record_console_memory_acquire(self->device->real, self->real, a1, a3);
                 d3d12_trace::result("XboxList74SatisfiedStartupHostAcquire", hr);
                 if (SUCCEEDED(hr)) {
                     static std::atomic<unsigned> waits[2]{};
-                    if (waits[a3 - 1].fetch_add(1, std::memory_order_relaxed) < 16) report_wait("recorded");
+                    if (waits[a3 > 1].fetch_add(1, std::memory_order_relaxed) < 16) report_wait("recorded");
                     return 0;
                 }
             }

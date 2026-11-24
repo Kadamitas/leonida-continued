@@ -904,7 +904,7 @@ public:
         if (!closed_ || queries_open() || ordered_acquires_ != 1) return false;
         const auto at = commands_.begin() + ordered_acquire_at_;
         const auto& acquire = std::get<HostMemoryAcquire>(*at);
-        if (acquire.reference != 2 || !is_generation_write_prefix(commands().first(ordered_acquire_at_), acquire.address))
+        if (acquire.reference <= 1 || !is_generation_write_prefix(commands().first(ordered_acquire_at_), acquire.address))
             return false;
         before.commands_.assign(commands_.begin(), at);
         before.closed_ = true;

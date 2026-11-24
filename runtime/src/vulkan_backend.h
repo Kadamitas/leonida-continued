@@ -2732,7 +2732,7 @@ private:
         replay.host_memory_acquire = [this, &lists, latched_generation](const HostMemoryAcquire& acquire) {
             const auto [address, reference] = acquire;
             if (reference != 1) {
-                if (reference != 2 || !starts_with_acquire(lists, acquire) || !latched_generation ||
+                if (reference <= 1 || !starts_with_acquire(lists, acquire) || !latched_generation ||
                     !generation_cell(address, nullptr, latched_generation)) {
                     std::fprintf(stderr, "[rt] VulkanQueue: generation wait has no matching retired-prefix acquire\n");
                     return false;
