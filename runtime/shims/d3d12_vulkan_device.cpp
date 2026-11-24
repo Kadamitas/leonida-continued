@@ -1106,6 +1106,21 @@ struct DeviceState {
         }
         return true;
     }
+    static const char* view_kind(const AddressView& view) {
+        return view.buffer_srv && view.texture_srv ? "buffer and texture SRVs" : view.buffer_srv ? "buffer SRV" : "texture SRV";
+    }
+    // Address-view history describes reads only. A buffer SRV may never have needed a physical snapshot.
+    // Check its entire recorded extent, not just the intersection, without upgrading other recorded uses.
+    static bool physical_readonly_view(std::uint64_t base, const AddressView& view) {
+        if (rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(base), view.bytes) !=
+            rt::xmem::SparseTextureSnapshot::ready) return false;
+        static std::atomic<unsigned> reports{};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 12)
+            std::fprintf(stderr, "[rt] d3d12: revalidated read-only %s span va=0x%llx bytes=%llu for sampled texture\n",
+                view_kind(view), static_cast<unsigned long long>(base), static_cast<unsigned long long>(view.bytes));
+        return true;
+    }
+
     // Called with the sampled-image cache locked after image, caller reference and cache node are ready.
     // Change placement protection only on successful publication, under the native placement/host range lock.
     bool reserve_sampled_alias(std::uint64_t start, std::uint64_t bytes, TitleImageCollision& conflict) {
@@ -1126,20 +1141,10 @@ struct DeviceState {
         }
         for (const auto& [base, view] : title_address_views) {
             if (!ranges_overlap(start, bytes, base, view.bytes) || view.physical_snapshot) continue;
-            // Address-view history describes reads only. A buffer SRV may never have needed a physical snapshot,
-            // or an earlier view at this VA may have recorded a shorter/untracked range. Revalidate its entire
-            // recorded extent, not just the intersection, without changing provenance for later calls.
-            const auto backing = rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(base), view.bytes);
-            const char* kind = view.buffer_srv && view.texture_srv ? "buffer and texture SRVs" :
-                view.buffer_srv ? "buffer SRV" : "texture SRV";
-            if (backing != rt::xmem::SparseTextureSnapshot::ready) {
-                conflict = {base, view.bytes, kind};
+            if (!physical_readonly_view(base, view)) {
+                conflict = {base, view.bytes, view_kind(view)};
                 return false;
             }
-            static std::atomic<unsigned> reports{};
-            if (reports.fetch_add(1, std::memory_order_relaxed) < 12)
-                std::fprintf(stderr, "[rt] d3d12: revalidated read-only %s span va=0x%llx bytes=%llu for sampled alias\n",
-                    kind, static_cast<unsigned long long>(base), static_cast<unsigned long long>(view.bytes));
         }
         auto& protected_bytes = sampled_alias_spans[start];
         protected_bytes = std::max(protected_bytes, bytes);
@@ -1149,7 +1154,7 @@ struct DeviceState {
 
     bool conflicting_host_placement_locked(leonida::ResourceId owner, std::uint64_t address,
                                             std::uint64_t bytes, bool physical_snapshot,
-                                            TitleImageCollision* conflict = nullptr) const {
+                                            TitleImageCollision* conflict = nullptr, bool display_sampled = false) const {
         for (const auto& [id, range] : title_host_ranges)
             if (id != owner && conflicting_host_range(address, bytes, physical_snapshot,
                 range.address, range.bytes, range.physical_snapshot)) {
@@ -1159,7 +1164,11 @@ struct DeviceState {
             }
         for (const auto& [start, view] : title_address_views)
             if (conflicting_host_range(address, bytes, physical_snapshot, start, view.bytes, view.physical_snapshot)) {
-                if (conflict) *conflict = {start, view.bytes, "address-only source", 0, view.physical_snapshot};
+                // The addresses and native image identities stay distinct. Only a read-only display-BC placement
+                // with verified physical backing can admit a neighboring, separately revalidated read-only SRV.
+                if (display_sampled && physical_snapshot && address != start && physical_readonly_view(start, view))
+                    continue;
+                if (conflict) *conflict = {start, view.bytes, view_kind(view), 0, view.physical_snapshot};
                 return true;
             }
         return false;
@@ -3591,7 +3600,8 @@ public:
             try {
                 std::lock_guard lock(device_.title_placement_mutex);
                 DeviceState::TitleImageCollision conflict{};
-                if (device_.conflicting_host_placement_locked(id(), address, placed_bytes, physical, &conflict))
+                const bool display_sampled = layout.tile_bytes == 65536 && layout.block_dim == 4 && !volume && layers == 1;
+                if (device_.conflicting_host_placement_locked(id(), address, placed_bytes, physical, &conflict, display_sampled))
                     return refused(DeviceState::sampled_placement_failure("placed source intersects earlier owner",
                         E_NOTIMPL, address, placed_bytes, physical, conflict));
                 const auto [existing, inserted] = device_.title_image_resources.emplace(address,
