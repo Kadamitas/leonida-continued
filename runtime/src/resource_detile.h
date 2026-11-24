@@ -427,11 +427,12 @@ inline constexpr std::optional<Surface4ksLayout> surface_4ks_layout(
 }
 
 // SW_64KB_D uses the same thin tail placement as SW_4KB_S, with twelve tail levels and the
-// display swizzle LUT at each BC element. The packed destination has one region per native mip.
-inline bool detile_display_bc(std::span<const std::byte> tiled, std::span<std::byte> packed,
-                              const Surface4ksLayout& layout) {
-    if (layout.tile_bytes != 65536 || layout.block_dim != 4 ||
-        (layout.element_bytes != 8 && layout.element_bytes != 16) ||
+// display swizzle LUT at each element. The packed destination has one region per native mip.
+inline bool detile_display_surface(std::span<const std::byte> tiled, std::span<std::byte> packed,
+                                  const Surface4ksLayout& layout) {
+    const bool rgba8 = layout.block_dim == 1 && layout.element_bytes == 4;
+    const bool compressed = layout.block_dim == 4 && (layout.element_bytes == 8 || layout.element_bytes == 16);
+    if (layout.tile_bytes != 65536 || (!rgba8 && !compressed) ||
         tiled.size() < layout.tiled_bytes || packed.size() < layout.packed_bytes ||
         detail::spans_overlap(tiled.data(), layout.tiled_bytes, packed.data(), layout.packed_bytes)) return false;
     const auto copy = [&](const auto& lut) {
@@ -451,9 +452,15 @@ inline bool detile_display_bc(std::span<const std::byte> tiled, std::span<std::b
             }
         }
     };
-    if (layout.element_bytes == 8) copy(swizzle_lut_64k_8bpe);
+    if (rgba8) copy(swizzle_lut_64k_4bpe);
+    else if (layout.element_bytes == 8) copy(swizzle_lut_64k_8bpe);
     else copy(swizzle_lut_64k_16bpe);
     return true;
+}
+
+inline bool detile_display_bc(std::span<const std::byte> tiled, std::span<std::byte> packed,
+                              const Surface4ksLayout& layout) {
+    return layout.block_dim == 4 && detile_display_surface(tiled, packed, layout);
 }
 
 // Copy elements unchanged into ascending native mips with packed rows and aligned region offsets.

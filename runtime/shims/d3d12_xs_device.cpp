@@ -3944,11 +3944,10 @@ bool observed_linear_texture_enabled(const D3D12_RESOURCE_DESC& desc, bool alloc
     return GetEnvironmentVariableA("LEONIDA_XBOX_TEXTURE_LAYOUT", mode, sizeof(mode)) == 15 &&
            std::strcmp(mode, "observed_r8_4ks") == 0 &&
            (rt::d3d12::title_linear_texture_shape(desc) || rt::d3d12::title_default_bc_texture_shape(desc) ||
-            rt::d3d12::title_display_bc_texture_shape(desc) ||
+            rt::d3d12::title_display_bc_texture_shape(desc) || rt::d3d12::title_display_rgba8_array_shape(desc) ||
             (allocation_query && (rt::d3d12::title_sampled_4ks_texture_shape(desc) ||
                                   rt::d3d12::title_implicit_sampled_4ks_query(desc) ||
-                                  rt::d3d12::title_sampled_volume_4ks_query(desc) ||
-                                  rt::d3d12::title_display_rgba8_array_query(desc))));
+                                  rt::d3d12::title_sampled_volume_4ks_query(desc))));
 }
 
 // PR #7201's console slot uses packed 56-byte DESC entries, not the PC's 64-byte DESC1 array. Both hidden-return

@@ -948,7 +948,7 @@ struct DeviceState {
     std::mutex host_static_texture_mutex;
     struct CachedTexture {
         std::shared_ptr<void> owner;
-        std::size_t sampled_bc_bytes;
+        std::size_t sampled_placement_bytes;
     };
     std::multimap<std::uint64_t, CachedTexture> host_static_textures;
     // Marker pages are kept by their recorded/submitted lists, not by the device: each imported resource holds
@@ -3599,7 +3599,7 @@ public:
                 const auto input = tiled.subspan(layer * layout.tiled_bytes, layout.tiled_bytes);
                 const auto output = packed.subspan(layer * layout.packed_bytes, layout.packed_bytes);
                 if (layout.tile_bytes == 65536) {
-                    if (!leonida::detile_display_bc(input, output, layout)) return false;
+                    if (!leonida::detile_display_surface(input, output, layout)) return false;
                 } else if (!leonida::detile_surface_4ks(input, output, layout.mips[0].width, layout.mips[0].height,
                                layout.mip_count, layout.element_bytes, layout.block_dim)) return false;
             }
@@ -4475,9 +4475,9 @@ private:
 
 // The cache owns the first COM reference without retaining its parent. Each ordinary COM reference to the
 // same image keeps the parent device alive. The pointer remains the replay resource ID for barriers and copies.
-class CachedBcImage final : public Resource {
+class CachedSampledImage final : public Resource {
 public:
-    CachedBcImage(DeviceState& state, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
+    CachedSampledImage(DeviceState& state, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
                   IUnknown* parent, std::size_t bytes, UINT64 alignment)
         : Resource(state, desc, heap, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED), parent_(parent), bytes_(bytes),
           alignment_(alignment) {}
@@ -9879,7 +9879,8 @@ public:
                 return d3d12_trace::result(method, E_OUTOFMEMORY);
             }
         }
-        if (title_linear_texture_enabled() && (title_default_bc_texture_shape(desc) || title_display_bc_texture_shape(desc))) {
+        if (title_linear_texture_enabled() && (title_default_bc_texture_shape(desc) || title_display_bc_texture_shape(desc) ||
+            title_display_rgba8_array_shape(desc))) {
             const auto native = title_linear_native_desc(desc);
             const auto format = state_.texture_format(native);
             const auto layout = title_tiled_texture_layout(desc, format);
@@ -9893,7 +9894,7 @@ public:
             const UINT64 guest_bytes = align_up(source_bytes, alignment);
             if (!out || !address || start % alignment || guest_bytes > UINTPTR_MAX - start || clear ||
                 !readonly_initial) {
-                std::fprintf(stderr, "[rt] d3d12: default BC placement refused va=%p format=%u initial=0x%x clear=%u "
+                std::fprintf(stderr, "[rt] d3d12: tiled sampled placement refused va=%p format=%u initial=0x%x clear=%u "
                     "bytes=%llu alignment=%llu\n", address, unsigned(desc.Format), initial_layout, unsigned(clear != nullptr),
                     static_cast<unsigned long long>(guest_bytes), static_cast<unsigned long long>(alignment));
                 return d3d12_trace::result(method, E_NOTIMPL);
@@ -9905,7 +9906,7 @@ public:
                     const auto cached = std::find_if(first, last, [&](const auto& row) {
                         auto& image = *static_cast<Resource*>(row.second.owner.get());
                         return image.sampled_tile_bytes() == layout->tile_bytes &&
-                            row.second.sampled_bc_bytes == guest_bytes && image.image_address() == start &&
+                            row.second.sampled_placement_bytes == guest_bytes && image.image_address() == start &&
                             image.GetDesc().Alignment == alignment && same_texture_shape(image.desc(), native);
                     });
                     if (cached == last) {
@@ -9917,7 +9918,7 @@ public:
                                 // Use the same cache-owned COM object and raw descriptor address as slot 70. A later
                                 // identical placement or address view must find this exact native image again.
                                 const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-                                auto* image = new CachedBcImage(state_, native, heap, holder(), guest_bytes, alignment);
+                                auto* image = new CachedSampledImage(state_, native, heap, holder(), guest_bytes, alignment);
                                 std::shared_ptr<void> owner(image, [](void* p) { static_cast<Resource*>(p)->Resource::Release(); });
                                 HRESULT hr = image->create_texture(format, {}, 0, true);
                                 if (SUCCEEDED(hr)) hr = image->enable_tiled_texture_shadow(address, *layout);
@@ -9950,7 +9951,7 @@ public:
                     auto& image = *static_cast<Resource*>(cached->second.owner.get());
                     static std::atomic<unsigned> reused{};
                     if (reused.fetch_add(1, std::memory_order_relaxed) < 16)
-                        std::fprintf(stderr, "[rt] d3d12: placed sampled BC texture shares address SRV image "
+                        std::fprintf(stderr, "[rt] d3d12: placed sampled texture shares address SRV image "
                             "va=%p size=%llux%u bytes=%llu\n", address, static_cast<unsigned long long>(desc.Width),
                             desc.Height, static_cast<unsigned long long>(guest_bytes));
                     return d3d12_trace::result(method, image.QueryInterface(riid, out));
@@ -9974,7 +9975,7 @@ public:
                         rt::xmem::SparseTextureSnapshot::ready, {}));
                 static std::atomic<unsigned> created{0};
                 if (created.fetch_add(1, std::memory_order_relaxed) < 16)
-                    std::fprintf(stderr, "[rt] d3d12: default BC4KS placed shadow va=%p format=%u bytes=%llu "
+                    std::fprintf(stderr, "[rt] d3d12: tiled sampled placement va=%p format=%u bytes=%llu "
                         "mips=%u layers=%u; native uploads refresh from actual title bytes\n", address, unsigned(desc.Format),
                         static_cast<unsigned long long>(guest_bytes), unsigned(desc.MipLevels), unsigned(desc.DepthOrArraySize));
                 return d3d12_trace::result(method, hand_out(resource.release(), riid, out));
@@ -11352,7 +11353,7 @@ private:
         }
         if (title_linear_texture_enabled() &&
             (implicit_sampled || title_sampled_4ks_texture_shape(desc) || title_default_bc_texture_shape(desc) ||
-             title_display_bc_texture_shape(desc) || (xbox_query && title_display_rgba8_array_query(desc)))) {
+             title_display_bc_texture_shape(desc) || (xbox_query && title_display_rgba8_array_shape(desc)))) {
             const auto native = title_linear_native_desc(desc);
             const auto format = state_.texture_format(native);
             const auto layout = title_tiled_texture_layout(desc, format);
@@ -13649,7 +13650,8 @@ HRESULT create_live_title_texture_view(ID3D12Device* device, const D3D12_RESOURC
         resource.Flags == D3D12_RESOURCE_FLAG_NONE && resource.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
         (resource.Alignment == cached.Alignment || reported_alignment);
     const bool raw_linear = linear_image && (title_linear_texture_shape(resource) ||
-        (texture->sampled_tile_bytes() == 65536 && title_display_bc_texture_shape(resource)) ||
+        (texture->sampled_tile_bytes() == 65536 &&
+         (title_display_bc_texture_shape(resource) || title_display_rgba8_array_shape(resource))) ||
         (texture->sampled_tile_bytes() == 4096 && title_default_bc_texture_shape(resource)));
     const bool line_default_alignment = line && use == TitleTextureUse::storage &&
         cached.Alignment == 4096 && resource.Alignment == 0;
@@ -13850,7 +13852,7 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
     const bool single_array = single_color && resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         faces > 1 && faces <= 96 && block.block == 1;
     const bool default_bc = title_default_bc_texture_shape(resource);
-    const bool display_bc = title_display_bc_texture_shape(resource);
+    const bool display_tiled = title_display_bc_texture_shape(resource) || title_display_rgba8_array_shape(resource);
     const bool legacy_single_mip = resource.MipLevels == 1 && block.block == 1 &&
         (single_array || (faces == 1 && (r8_atlas || single_color)));
     const auto tiled_layout = (linear_layout || legacy_single_mip) ? std::nullopt : title_tiled_texture_layout(resource, format);
@@ -13898,10 +13900,10 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
         (!tiled_layout && !linear_layout && resource.MipLevels != 1) ||
         resource.SampleDesc.Count != 1 ||
         resource.SampleDesc.Quality ||
-        static_cast<UINT>(resource.Layout) != (linear_layout ? 0x100 : display_bc ? kTitleDisplay64k : default_bc ? 0 : 0x105) ||
+        static_cast<UINT>(resource.Layout) != (linear_layout ? 0x100 : display_tiled ? kTitleDisplay64k : default_bc ? 0 : 0x105) ||
         static_cast<UINT>(resource.Flags) != 0x300000 ||
         view.Format != resource.Format || !address ||
-        address % (linear_layout ? std::max<UINT64>(256, resource.Alignment) : display_bc ? 65536u : 4096u) ||
+        address % (linear_layout ? std::max<UINT64>(256, resource.Alignment) : display_tiled ? 65536u : 4096u) ||
         address > UINTPTR_MAX - source_bytes) return failure("resource shape, flags, layout or source span", E_NOTIMPL);
     if (!writable_descriptor(destination)) return failure("descriptor destination", E_POINTER);
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -13959,12 +13961,13 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
             D3D12_HEAP_PROPERTIES heap{};
             heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             heap.CreationNodeMask = heap.VisibleNodeMask = 1;
-            const auto bc_bytes = tiled_layout && tiled_layout->block_dim == 4 && !is_volume ? source_bytes : 0;
-            auto* texture = bc_bytes
-                ? static_cast<Resource*>(new CachedBcImage(state, desc, heap, d->holder(), bc_bytes,
+            const auto placement_bytes = tiled_layout && (tiled_layout->block_dim == 4 || display_tiled) && !is_volume
+                ? source_bytes : 0;
+            auto* texture = placement_bytes
+                ? static_cast<Resource*>(new CachedSampledImage(state, desc, heap, d->holder(), placement_bytes,
                                                             std::max<UINT64>(tiled_layout->tile_bytes, resource.Alignment)))
                 : new Resource(state, desc, heap, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED);
-            // The cache's initial reference never owns the device. CachedBcImage::Release balances only the
+            // The cache's initial reference never owns the device. CachedSampledImage::Release balances only the
             // ordinary references added after creation, so drop the cache reference directly through the base.
             std::shared_ptr<void> owner(texture, [](void* p) { static_cast<Resource*>(p)->Resource::Release(); });
             HRESULT hr = texture->create_texture(texture_storage_format(desc.Format, false), {},
@@ -13995,7 +13998,7 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                     return sampled_view_failure(actual ? "alias descriptor key collision" : "alias descriptor key missing",
                         E_NOTIMPL, address, resource, view, source_bytes, {}, int(backing), texture->id(), actual);
                 CachedTextures staged;
-                const auto row = staged.emplace(address, DeviceState::CachedTexture{std::move(owner), bc_bytes});
+                const auto row = staged.emplace(address, DeviceState::CachedTexture{std::move(owner), placement_bytes});
                 DeviceState::TitleImageCollision conflict{};
                 if (!state.reserve_sampled_alias(address, source_bytes, conflict)) {
                     report_sampled_siblings(address, first, last, int(backing), true);
@@ -14006,11 +14009,11 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                 std::memcpy(reinterpret_cast<void*>(destination.ptr), staged_key.data(), sizeof(staged_key));
                 return S_OK;
             }
-            found = state.host_static_textures.emplace_hint(last, address, DeviceState::CachedTexture{std::move(owner), bc_bytes});
+            found = state.host_static_textures.emplace_hint(last, address, DeviceState::CachedTexture{std::move(owner), placement_bytes});
             if (tiled_layout)
                 std::fprintf(stderr, "[rt] d3d12: %s %s texture shadow created with %u mips across %u layers "
                                      "address=0x%llx bytes=%zu size=%llux%u format=%u\n",
-                    display_bc ? "display 64KB" : "standard 4KB",
+                    display_tiled ? "display 64KB" : "standard 4KB",
                     is_volume ? "3D" : tiled_layout->block_dim == 4 ? "block-compressed" : "color",
                     unsigned(tiled_layout->mip_count), tiled_layers, static_cast<unsigned long long>(address), source_bytes,
                     static_cast<unsigned long long>(resource.Width), resource.Height, unsigned(resource.Format));
