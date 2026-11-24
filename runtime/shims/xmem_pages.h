@@ -21,8 +21,8 @@ constexpr size_t kPhysicalPageBytes = 0x10000;
 // offset of a page or more, or an entry that is not a live page of XMemAllocatePhysicalPages (0 included; in the map
 // calls 0 means "unmap", which is not a place to write to). `page_array` and `source` must be readable: a caller that
 // takes them from a title copies them first. Keep both spans stable during this call; source must be a separate
-// staging buffer rather than an alias of the physical pages. The current store writes its permanent backing views
-// under its page lock, so no temporary mapping or allocation can fail after validation has completed.
+// staging buffer rather than an alias of the physical pages. With commit-on-map enabled, the store commits the
+// entire validated destination before the first write, and returns false if backing cannot be committed.
 bool write_physical_pages(const uint64_t* page_array, size_t offset, const void* source, size_t size);
 
 // Reads the same page-number/offset range into separate writable staging.
@@ -41,6 +41,13 @@ struct PhysicalPageAliasRange {
 };
 
 enum class SparseTextureSnapshot { untracked, ready, failed, unchanged };
+
+struct PhysicalStoreStats {
+    std::size_t capacity_slots = 0;
+    std::size_t allocated_slots = 0;
+    std::size_t committed_slots = 0;
+    bool commit_on_map = false;
+};
 
 struct PhysicalCpuView {
     void* address = nullptr;
@@ -68,6 +75,8 @@ struct SparseTextureMismatch {
 };
 
 namespace detail {
+using PhysicalStoreStatsFn = PhysicalStoreStats (*)() noexcept;
+inline constinit std::atomic<PhysicalStoreStatsFn> physical_store_stats_handler{nullptr};
 using PhysicalPageAliasFn = bool (*)(std::span<const PhysicalPageAliasRange>) noexcept;
 using PhysicalPageIdentityFn = PhysicalPageIdentity (*)(const void*) noexcept;
 using PhysicalCpuViewFn = PhysicalCpuView (*)(const void*, std::size_t) noexcept;
@@ -81,6 +90,11 @@ inline constinit std::atomic<PhysicalPageIdentityFn> physical_page_identity_hand
 inline constinit std::atomic<PhysicalCpuViewFn> physical_cpu_view_handler{nullptr};
 inline constinit std::atomic<SparseTextureSnapshotFn> sparse_texture_snapshot_handler{nullptr};
 }  // namespace detail
+
+inline PhysicalStoreStats physical_store_stats() noexcept {
+    const auto handler = detail::physical_store_stats_handler.load(std::memory_order_acquire);
+    return handler ? handler() : PhysicalStoreStats{};
+}
 
 // Aliases live 64 KiB physical mappings, or unmaps destinations when source is zero. All non-zero sources must
 // already be mapped in this store and every destination must be in one of its physical reservations. Source

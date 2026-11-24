@@ -2948,6 +2948,7 @@ public:
         MEMORY_BASIC_INFORMATION region{};
         VirtualQuery(address, &region, sizeof(region));
         const auto pages = rt::xmem::find_physical_cpu_view(address, bytes);
+        const auto store = rt::xmem::physical_store_stats();
         const auto sparse = rt::xmem::validate_sparse_texture(address, bytes);
         PROCESS_MEMORY_COUNTERS_EX process{};
         const BOOL process_ok = GetProcessMemoryInfo(GetCurrentProcess(),
@@ -2961,11 +2962,13 @@ public:
         std::fprintf(stderr, "[rt] d3d12: host import evidence va=%p bytes=%zu type=0x%lx protect=0x%lx "
             "sparse=%d mapped_pages=%zu/%zu writable_alias=%p process_ok=%d private_bytes=%zu "
             "system_ok=%d commit_bytes=%zu commit_limit=%zu available_ram=%zu job_ok=%u job_flags=0x%lx "
-            "process_memory_limit=%zu job_memory_limit=%zu\n", address, bytes, region.Type, region.Protect,
+            "process_memory_limit=%zu job_memory_limit=%zu xmem_capacity_slots=%zu xmem_allocated_slots=%zu "
+            "xmem_committed_slots=%zu xmem_commit_on_map=%u\n", address, bytes, region.Type, region.Protect,
             int(sparse), pages.mapped_pages, pages.total_pages, pages.address, int(process_ok), process.PrivateUsage,
             int(system_ok), system.CommitTotal * system.PageSize, system.CommitLimit * system.PageSize,
             system.PhysicalAvailable * system.PageSize, unsigned(job_ok), job.BasicLimitInformation.LimitFlags,
-            job.ProcessMemoryLimit, job.JobMemoryLimit);
+            job.ProcessMemoryLimit, job.JobMemoryLimit, store.capacity_slots, store.allocated_slots,
+            store.committed_slots, unsigned(store.commit_on_map));
         const auto& gpu = device_.info;
         if (!gpu.get_instance_proc || !gpu.physical) return;
         const auto list = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(

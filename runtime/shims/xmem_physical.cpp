@@ -98,8 +98,9 @@ struct Chunk {
 };
 
 struct Slot {
-    bool allocated = false;
-    bool needs_zero = false;
+    bool allocated : 1 = false;
+    bool needs_zero : 1 = false;
+    bool committed : 1 = false;
     std::uint16_t physical_store_writes = 0;
     std::uint32_t allocation_epoch = 0;
     std::vector<uintptr_t> mapped_at;
@@ -118,6 +119,7 @@ std::vector<Chunk> g_chunks;
 std::vector<Slot> g_slots;
 std::vector<uint32_t> g_free;            // free slots, the next one at the back
 std::map<uintptr_t, std::size_t> g_import_pins;  // fixed guest page -> live coherent import count
+size_t g_committed_slots = 0;            // backed slots in the section store, including freed slots retained for reuse
 std::map<uintptr_t, Region> g_regions;  // physical reservations by base
 
 #ifdef LEONIDA_XMEM_TEST_HOOKS
@@ -164,6 +166,63 @@ void reserve_metadata(Container& entries, size_t needed, size_t limit) {
         entries.reserve((std::max)(needed, (std::min)(limit, capacity + (capacity + 1) / 2)));
 }
 
+// In this mode a physical-page request reserves space; a later map or direct page write can fail for lack
+// of system commit. Every published native view is still fully committed before the guest can use it.
+bool commit_on_map() {
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("LEONIDA_XMEM_COMMIT_ON_MAP", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    return enabled;
+}
+
+rt::xmem::PhysicalStoreStats physical_store_stats() noexcept {
+    const std::lock_guard lock(g_mutex);
+    return {g_slots.size(), g_slots.size() - g_free.size(), g_committed_slots, commit_on_map()};
+}
+
+// Called under g_mutex, within one 32 MiB section. Batch contiguous uncommitted slots into one native call.
+bool commit_slots(uint32_t first, uint32_t count) {
+    const uint32_t end = first + count;
+    while (first < end) {
+        if (g_slots[first].committed) {
+            ++first;
+            continue;
+        }
+        uint32_t stop = first + 1;
+        while (stop < end && !g_slots[stop].committed) ++stop;
+        auto* const backing = g_chunks[first / kChunkPages].view + std::size_t(first % kChunkPages) * kPage;
+        if (!VirtualAlloc(backing, std::size_t(stop - first) * kPage, MEM_COMMIT, PAGE_READWRITE)) return false;
+        const auto previous = g_committed_slots;
+        g_committed_slots += stop - first;
+        // One report per GiB of backing in the opt-in mode. A page mapped into multiple guest apertures counts once.
+        if (previous / 16384 != g_committed_slots / 16384)
+            std::fprintf(stderr, "[rt] xmem: physical store slots capacity=%zu allocated=%zu committed=%zu commit_on_map=1\n",
+                         g_slots.size(), g_slots.size() - g_free.size(), g_committed_slots);
+        for (; first < stop; ++first) g_slots[first].committed = true;
+    }
+    return true;
+}
+
+// encoded_slot returns slot+1, or zero for a placeholder. Real contiguous pages share a single
+// commit operation unless they cross a backing section. The caller already validated the entire request.
+template <typename EncodedSlot>
+bool prepare_slots(std::size_t count, EncodedSlot encoded_slot) {
+    if (!commit_on_map()) return true;
+    for (std::size_t i = 0; i < count;) {
+        const uint32_t encoded = encoded_slot(i++);
+        if (!encoded) continue;
+        const uint32_t first = encoded - 1;
+        uint32_t run = 1;
+        while (i < count && run < kChunkPages - first % kChunkPages && encoded_slot(i) == encoded + run) {
+            ++run;
+            ++i;
+        }
+        if (!commit_slots(first, run)) return false;
+    }
+    return true;
+}
+
 // Adds sections until `count` slots are free.
 bool grow(size_t count) {
     if (count <= g_free.size()) return true;
@@ -180,9 +239,10 @@ bool grow(size_t count) {
     reserve_metadata(g_slots, needed * kChunkPages, max_chunks * kChunkPages);
     reserve_metadata(g_free, g_free.size() + additional * kChunkPages, max_chunks * kChunkPages);
     g_slots.resize(needed * kChunkPages);
+    const DWORD mode = commit_on_map() ? SEC_RESERVE : SEC_COMMIT;
     while (g_chunks.size() < needed) {
         constexpr uint64_t bytes = static_cast<uint64_t>(kChunkPages) * kPage;
-        HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
+        HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | mode,
                                             static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
         void* view = section ? MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0) : nullptr;
         if (!view) {
@@ -203,8 +263,12 @@ bool grow(size_t count) {
     }
     for (size_t chunk = old_chunks; chunk < needed; ++chunk) {
         const uint32_t first = static_cast<uint32_t>(chunk * kChunkPages);
-        for (uint32_t i = kChunkPages; i-- > 0;) g_free.push_back(first + i);
+        for (uint32_t i = kChunkPages; i-- > 0;) {
+            g_slots[first + i].committed = mode == SEC_COMMIT;
+            g_free.push_back(first + i);
+        }
     }
+    if (mode == SEC_COMMIT) g_committed_slots += additional * kChunkPages;
     return true;
 }
 
@@ -362,6 +426,8 @@ bool apply_mappings(std::vector<MappingChange>& changes) {
             }
         }
     }
+    // A failed backing commit leaves all previously published guest views intact.
+    if (!prepare_slots(changes.size(), [&](std::size_t i) { return changes[i].slot; })) return false;
     size_t undo = 0;
     DWORD error = ERROR_SUCCESS;
     try {
@@ -494,7 +560,7 @@ BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, ULONG_PTR* page_array) {
         for (const uint32_t slot : slots) {
             Slot& s = g_slots[slot];
             s.allocated = false;
-            s.needs_zero = true;
+            s.needs_zero = s.committed;
             g_free.push_back(slot);
         }
         return TRUE;
@@ -1102,6 +1168,7 @@ rt::xmem::SparseTextureSnapshot snapshot_sparse_texture(const void* source, std:
 
 const bool g_registered = (rt::xmem::set_physical_reserve(&reserve_physical),
                            rt::xmem::set_placeholder_reserve(&reserve_placeholder),
+                           rt::xmem::detail::physical_store_stats_handler.store(&physical_store_stats, std::memory_order_release),
                            rt::xmem::detail::physical_page_alias_handler.store(&alias_physical_page_ranges,
                                std::memory_order_release),
                            rt::xmem::detail::physical_import_ops.store(&import_ops, std::memory_order_release),
@@ -1124,7 +1191,7 @@ bool rt::xmem::write_physical_pages(const uint64_t* page_array, size_t offset, c
         size > (std::numeric_limits<size_t>::max)() - offset - (kPage - 1)) return false;
     const size_t count = (offset + size + kPage - 1) / kPage;
     const std::lock_guard lock(g_mutex);
-    // No allocations or mapping operations are needed. Reject every invalid number before writing the first byte.
+    // Reject every invalid number before changing any bytes, including the validated prefix.
     for (size_t i = 0; i < count; ++i) {
         uint32_t slot;
         if (!slot_of(page_array[i], slot)) return false;
@@ -1134,6 +1201,8 @@ bool rt::xmem::write_physical_pages(const uint64_t* page_array, size_t offset, c
         return GetEnvironmentVariableW(L"LEONIDA_TRACE_TEXTURE_RANGES", value, 2) == 1 && value[0] == L'1';
     }();
     auto* from = static_cast<const uint8_t*>(source);
+    if (!prepare_slots(count, [&](std::size_t i) { return static_cast<uint32_t>(page_array[i] / kFramesPerPage); }))
+        return false;
     for (size_t i = 0; i < count; ++i) {
         uint32_t slot;
         if (!slot_of(page_array[i], slot)) std::terminate();  // cannot change while g_mutex is held
@@ -1168,7 +1237,9 @@ bool rt::xmem::read_physical_pages(const uint64_t* page_array, size_t offset, vo
         if (!slot_of(page_array[i], slot)) std::terminate();  // stable IDs and g_mutex make this invariant
         const size_t bytes = (std::min)(size, kPage - offset);
         const auto* source = g_chunks[slot / kChunkPages].view + static_cast<size_t>(slot % kChunkPages) * kPage;
-        std::memcpy(to, source + offset, bytes);
+        // A never-committed slot has had neither a guest mapping nor a direct write. Its contents are zero.
+        if (!g_slots[slot].committed) std::memset(to, 0, bytes);
+        else std::memcpy(to, source + offset, bytes);
         to += bytes;
         size -= bytes;
         offset = 0;
