@@ -527,6 +527,7 @@ public:
     void table_upload_result(bool submitted) {
         if (!upload_in_flight_) return;
         upload_in_flight_ = false;
+        table_epoch_ = submitted ? recorded_epoch_ : 0;
         if (submitted) return;
         table_dirty_ = true;
         force_full_upload_ = true;
@@ -887,20 +888,22 @@ private:
                     return false;
                 }
             }
-            retired_.back() = {table_buffers_, pool_, set_, retire_ticket, table_device_local_};
+            retired_.back() = {table_buffers_, pool_, set_, retire_ticket, table_device_local_, table_epoch_};
             table_buffers_ = next.buffers;
             pool_ = next.pool;
             set_ = next.set;
             table_device_local_ = next.device_local;
+            table_epoch_ = next.table_epoch;
             write_table_binding(table_buffers_.table.buffer);
             replaced = true;
             ++generations_made_;
         }
         DescriptorTable::Changes changes = table_.take_changes();
         full = full || changes.all;
+        const auto slot_count = std::uint32_t((bytes - sizeof(std::uint32_t)) / entry_bytes);
+        note_changed_pages(slot_count, changes);
         bool recorded = false;
-        // A first upload or replacement uses a new or fully retired staging buffer. Its whole contents and all
-        // descriptors previously written are republished. Later appends use vkCmdUpdateBuffer in flight.
+        // Only a new or fully retired generation can reuse mapped staging. In-place updates use vkCmdUpdateBuffer.
         const bool fresh = replace || !table_uploaded_;
         const auto upload_all = [&]() {
             if (fresh) {
@@ -913,7 +916,10 @@ private:
             recorded = true;
         };
         if (full) {
-            upload_all();
+            if (replace && !force_full_upload_ && table_epoch_ && upload_changed_pages(command_buffer, slot_count))
+                recorded = true;
+            else
+                upload_all();
         } else if (!changes.slots.empty()) {
             std::vector<std::uint32_t> slots = std::move(changes.slots);
             std::sort(slots.begin(), slots.end());
@@ -937,10 +943,71 @@ private:
         }
         if (!recorded) return true;  // nothing was copied: keep the obligation for the next flush
         record_table_barrier(command_buffer);
+        // Never treat a merely recorded buffer as a baseline. An in-place update of an unknown buffer also
+        // stays unknown until a full initialization has successfully reached the queue.
+        recorded_epoch_ = (full || table_epoch_ != 0) ? change_epoch_ : 0;
+        table_epoch_ = 0;
         upload_in_flight_ = true;
         table_dirty_ = existing_entries_changed_ = false;
         table_uploaded_ = true;
         force_full_upload_ = false;
+        return true;
+    }
+
+    // Keep one stamp per 128 slots, shared by all generations. An old, retired GPU buffer may have missed
+    // several uploads, including in-place updates which changed its GPU table but never touched its staging.
+    static constexpr std::uint32_t page_slots = 128;
+    void note_changed_pages(std::uint32_t slots, const DescriptorTable::Changes& changes) {
+        if (++change_epoch_ == 0) {
+            change_epoch_ = 1;
+            table_epoch_ = recorded_epoch_ = spare_.table_epoch = 0;
+            for (auto& generation : retired_) generation.table_epoch = 0;
+            page_epochs_.clear();
+        }
+        const auto pages = (std::size_t(slots) + page_slots - 1) / page_slots;
+        if (pages != page_epochs_.size()) {
+            try { page_epochs_.assign(pages, change_epoch_); }
+            catch (const std::bad_alloc&) { page_epochs_.clear(); }
+            return;
+        }
+        if (changes.all || force_full_upload_) {
+            std::fill(page_epochs_.begin(), page_epochs_.end(), change_epoch_);
+            return;
+        }
+        for (const auto slot : changes.slots) {
+            if (slot >= slots) {
+                std::fill(page_epochs_.begin(), page_epochs_.end(), change_epoch_);
+                return;
+            }
+            page_epochs_[slot / page_slots] = change_epoch_;
+        }
+    }
+
+    bool upload_changed_pages(VkCommandBuffer command_buffer, std::uint32_t slots) {
+        std::array<VkBufferCopy, 64> ranges;
+        std::uint32_t count = 0;
+        std::size_t dirty = 0;
+        for (std::size_t i = 0; i < page_epochs_.size();) {
+            if (page_epochs_[i] <= table_epoch_) { ++i; continue; }
+            const auto first = i;
+            do { ++i; } while (i < page_epochs_.size() && page_epochs_[i] > table_epoch_);
+            dirty += i - first;
+            if (dirty > page_epochs_.size() / 2 || count == ranges.size()) return false;
+            const auto start = std::uint32_t(first * page_slots);
+            const auto end = std::min<std::size_t>(slots, i * page_slots);
+            const auto offset = entry_offset(start);
+            ranges[count++] = {offset, offset, (end - start) * entry_bytes};
+        }
+        if (!count) return false;
+        auto* const staging = static_cast<std::uint8_t*>(table_buffers_.staging.mapped);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto& range = ranges[i];
+            const auto slot = std::uint32_t((range.srcOffset - sizeof(std::uint32_t)) / entry_bytes);
+            if (!table_.read_slots(slot, std::uint32_t(range.size / entry_bytes),
+                                   reinterpret_cast<std::uint32_t*>(staging + range.srcOffset))) return false;
+        }
+        vk_.vkCmdCopyBuffer(command_buffer, table_buffers_.staging.buffer, table_buffers_.table.buffer,
+                            count, ranges.data());
         return true;
     }
 
@@ -1088,6 +1155,10 @@ private:
     bool table_dirty_ = false;    // the table differs from the buffer
     bool existing_entries_changed_ = false;  // ... and not only by entries added
     bool upload_in_flight_ = false;   // a copy is recorded, not yet known to have reached the queue
+    std::vector<std::uint64_t> page_epochs_;
+    std::uint64_t change_epoch_ = 0;    // CPU table version at the last consumed change list
+    std::uint64_t table_epoch_ = 0;     // known submitted contents of the active GPU table; 0 for unknown
+    std::uint64_t recorded_epoch_ = 0;  // becomes known only when its command buffer is submitted
     bool force_full_upload_ = false;  // the last submit failed: rebuild the whole table on the next flush
     struct Generation {  // what a replaced table leaves for release_retired()
         TableBuffers buffers;
@@ -1095,13 +1166,14 @@ private:
         VkDescriptorSet set = VK_NULL_HANDLE;
         std::uint64_t ticket = 0;
         bool device_local = false;
+        std::uint64_t table_epoch = 0;
     };
     void destroy_generation(Generation& generation) const {
         destroy(generation.buffers);
         if (generation.pool) vk_.vkDestroyDescriptorPool(device_, generation.pool, nullptr);
         generation = {};
     }
-    Generation spare_;  // never submitted again without a complete table upload and descriptor shadow republish
+    Generation spare_;  // usable after retirement; descriptor shadow is always republished
     std::vector<Generation> retired_;
     std::uint64_t generations_made_ = 0;
     FrameProfile flush_profile_;

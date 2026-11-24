@@ -214,12 +214,7 @@ public:
         if (count > 0 && !dest) return false;
         std::lock_guard lock(mutex_);
         if (first > entries_.size() || count > entries_.size() - first) return false;
-        for (std::uint32_t i = 0; i < count; ++i) {
-            const DescriptorEntry& entry = entries_[first + i];
-            std::memcpy(dest + i * 10, entry.key, sizeof(entry.key));
-            dest[i * 10 + 8] = entry.index;
-            dest[i * 10 + 9] = entry.pad;
-        }
+        if (count) std::memcpy(dest, entries_.data() + first, std::size_t(count) * sizeof(DescriptorEntry));
         return true;
     }
 
