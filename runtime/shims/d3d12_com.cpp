@@ -21,6 +21,7 @@
 #include <cstring>
 #include <mutex>
 #include <set>
+#include <source_location>
 #include <string>
 #include <thread>
 #include <utility>
@@ -185,6 +186,14 @@ private:
     const void* recording_ = nullptr;
 };
 
+bool trace_console_graphics_recording() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("LEONIDA_TRACE_TEXTURE_RANGES");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 class GraphicsCommandList final
     : public Child<GraphicsCommandList, ID3D12GraphicsCommandList8Stubs, ID3D12Object, ID3D12DeviceChild,
                     ID3D12CommandList, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList1,
@@ -211,16 +220,10 @@ public:
     bool can_record_graphics_state() const {
         const bool active_allocator = allocator_ && allocator_->recording() == this;
         const bool ready = type_ == D3D12_COMMAND_LIST_TYPE_DIRECT && !list_.closed() && !invalid_ && active_allocator;
-        if (!ready) {
-            static const bool trace = [] {
-                const char* value = std::getenv("LEONIDA_TRACE_TEXTURE_RANGES");
-                return value && std::strcmp(value, "1") == 0;
-            }();
-            if (trace)
-                std::fprintf(stderr, "[rt] d3d12: graphics state rejected list_type=%u closed=%u invalid=%u "
-                    "allocator_present=%u allocator_recording=%u\n", unsigned(type_), unsigned(list_.closed()),
-                    unsigned(invalid_), unsigned(allocator_ != nullptr), unsigned(active_allocator));
-        }
+        if (!ready && trace_console_graphics_recording())
+            std::fprintf(stderr, "[rt] d3d12: graphics state rejected list=%p list_type=%u closed=%u invalid=%u "
+                "allocator_present=%u allocator_recording=%u\n", static_cast<const void*>(this), unsigned(type_),
+                unsigned(list_.closed()), unsigned(invalid_), unsigned(allocator_ != nullptr), unsigned(active_allocator));
         return ready;
     }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
@@ -1189,8 +1192,12 @@ private:
         return out;
     }
 
-    void check(bool ok) {
-        if (!ok) invalid_ = true;
+    void check(bool ok, std::source_location source = std::source_location::current()) {
+        if (ok || invalid_) return;
+        invalid_ = true;
+        if (trace_console_graphics_recording())
+            std::fprintf(stderr, "[rt] d3d12: first recording rejection list=%p type=%u function=%s line=%u\n",
+                static_cast<const void*>(this), unsigned(type_), source.function_name(), unsigned(source.line()));
     }
 
     void stop_recording() {
