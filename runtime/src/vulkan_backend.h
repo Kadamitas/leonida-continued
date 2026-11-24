@@ -3123,6 +3123,7 @@ private:
             VkBuffer staging;
         };
         std::vector<MutableUpload> mutable_uploads;
+        std::vector<std::shared_ptr<void>> upload_lifetimes;
         std::vector<VkBufferMemoryBarrier> upload_sources;
         std::vector<VkImageMemoryBarrier> upload_before, upload_after;
         VkPipelineStageFlags upload_src_stages = VK_PIPELINE_STAGE_HOST_BIT;
@@ -3220,9 +3221,11 @@ private:
                         return shadow_refused("mutable-tracked-layout", &image);
                 if (!dirty) continue;
                 VkBuffer staging = image.host_shadow_buffer;
-                if (!staging) staging = shadow->prepare_staging();
+                std::shared_ptr<void> lifetime;
+                if (!staging) staging = shadow->prepare_staging(lifetime);
                 if (!staging) return shadow_refused("mutable-native-staging", &image);
                 try {
+                    if (lifetime) upload_lifetimes.push_back(std::move(lifetime));
                     mutable_uploads.push_back({id, &image, shadow, staging});
                     VkBufferMemoryBarrier source{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
                     source.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
@@ -3519,6 +3522,7 @@ private:
             wait_values_.pop_back();
         }
         if (submitted) {
+            slot->upload_lifetimes = std::move(upload_lifetimes);
             context_.tracker_.commit_changes(std::move(next_tracker));
             for (const auto& upload : mutable_uploads) upload.owner->commit();
             slot->predicate = std::move(batch);
@@ -3789,6 +3793,7 @@ private:
         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
         std::vector<KhrAsQueryPool> khr_as_queries;   // KHR postbuild COMPACTED_SIZE query pools, same lifetime
         std::vector<VkQueryPool> timestamp_queries;  // fresh native marker queries, retained until this slot completes
+        std::vector<std::shared_ptr<void>> upload_lifetimes;  // tiled first-upload staging
     };
 
     struct PendingBindings {
@@ -3956,6 +3961,7 @@ private:
         CommandSlot* reuse = nullptr;
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
+            slot.upload_lifetimes.clear();
             slot.segments.clear();
             recycle_khr_stages(slot.khr_instances);
             recycle_khr_as_queries(slot.khr_as_queries);
