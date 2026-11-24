@@ -154,31 +154,52 @@ bool slot_of(ULONG_PTR frame, uint32_t& slot) {
     return true;
 }
 
+template <typename Container>
+void reserve_metadata(Container& entries, size_t needed, size_t limit) {
+    const size_t capacity = entries.capacity();
+    if (needed > capacity)
+        entries.reserve((std::max)(needed, (std::min)(limit, capacity + (capacity + 1) / 2)));
+}
+
 // Adds sections until `count` slots are free.
 bool grow(size_t count) {
-    while (g_free.size() < count) {
-        if (g_slots.size() + kChunkPages > kMaxSlots) {
-            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-            return false;
-        }
-        // Finish throwing container allocations before acquiring native resources.
-        g_chunks.reserve(g_chunks.size() + 1);
-        g_slots.reserve(g_slots.size() + kChunkPages);
-        g_free.reserve(g_free.size() + kChunkPages);
+    if (count <= g_free.size()) return true;
+    constexpr size_t max_chunks = kMaxSlots / kChunkPages;
+    const size_t old_chunks = g_chunks.size();
+    const size_t additional = 1 + (count - g_free.size() - 1) / kChunkPages;
+    if (additional > max_chunks - old_chunks) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return false;
+    }
+    const size_t needed = old_chunks + additional;
+    // Reserve metadata in bulk. Only the requested sections acquire native backing.
+    reserve_metadata(g_chunks, needed, max_chunks);
+    reserve_metadata(g_slots, needed * kChunkPages, max_chunks * kChunkPages);
+    reserve_metadata(g_free, g_free.size() + additional * kChunkPages, max_chunks * kChunkPages);
+    g_slots.resize(needed * kChunkPages);
+    while (g_chunks.size() < needed) {
         constexpr uint64_t bytes = static_cast<uint64_t>(kChunkPages) * kPage;
         HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
                                             static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
-        if (!section) return false;
-        void* view = MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+        void* view = section ? MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0) : nullptr;
         if (!view) {
             const DWORD error = GetLastError();
-            CloseHandle(section);
+            if (section) CloseHandle(section);
+            // None of these sections has published a frame number or a guest view yet.
+            while (g_chunks.size() > old_chunks) {
+                const Chunk& chunk = g_chunks.back();
+                UnmapViewOfFile(chunk.view);
+                CloseHandle(chunk.section);
+                g_chunks.pop_back();
+            }
+            g_slots.resize(old_chunks * kChunkPages);
             SetLastError(error);
             return false;
         }
-        const uint32_t first = static_cast<uint32_t>(g_slots.size());
         g_chunks.push_back({section, static_cast<uint8_t*>(view)});
-        g_slots.resize(first + kChunkPages);
+    }
+    for (size_t chunk = old_chunks; chunk < needed; ++chunk) {
+        const uint32_t first = static_cast<uint32_t>(chunk * kChunkPages);
         for (uint32_t i = kChunkPages; i-- > 0;) g_free.push_back(first + i);
     }
     return true;
