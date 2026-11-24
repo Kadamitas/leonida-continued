@@ -5006,13 +5006,31 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             } else {
                 vk.draw(command_buffer, d.vertex_count, draw->instances, d.first_vertex, draw->first_instance);
             }
-            if (vk.attachment_writes && scissor.extent.width && scissor.extent.height) {
+            // A shader may route output to any active viewport. An empty slot zero alone does not prove
+            // the target was untouched. Skip the per-slot check when neither observer needs it.
+            const auto visible_scissor = [&] {
+                const auto nonempty = [](const Rect& r) {
+                    return r.right > std::max(0, r.left) && r.bottom > std::max(0, r.top);
+                };
+                if (!graphics.viewport_with_count) return nonempty(draw->scissor);
+                if (!draw->viewports)
+                    return draw->viewport.width > 0 && draw->viewport.height > 0 && nonempty(draw->scissor);
+                const auto& views = *draw->viewports;
+                const auto count = std::min({views.viewport_count, views.scissor_count, DrawViewports::max_count});
+                for (std::uint32_t slot = 0; slot < count; ++slot) {
+                    const auto& viewport = views.viewports[slot];
+                    if (viewport.width > 0 && viewport.height > 0 && nonempty(views.scissors[slot])) return true;
+                }
+                return false;
+            };
+            const bool can_rasterize = (vk.attachment_writes || vk.frame_draws) && visible_scissor();
+            if (vk.attachment_writes && can_rasterize) {
                 for (const auto& color : d.colors)
                     vk.attachment_writes->add(color.binding.attachment_write_trace, AttachmentWrite::possible);
             }
             if (vk.frame_draws && !graphics_indirect && !predicate.buffer && draw->instances &&
                 (draw->mesh ? draw->count && draw->first : draw->indexed ? draw->count : d.vertex_count) &&
-                scissor.extent.width && scissor.extent.height) {
+                can_rasterize) {
                 for (const auto& color : d.colors)
                     if (color.binding.draw_activity_image && color.range.baseMipLevel == 0 && color.range.baseArrayLayer == 0)
                         vk.frame_draws->add({color.binding.draw_activity_image, 0, 1, draw->mesh ? 1u : 0u});
