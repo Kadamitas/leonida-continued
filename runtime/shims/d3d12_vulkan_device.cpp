@@ -2964,6 +2964,36 @@ public:
         return S_OK;
     }
 
+    // Windows can increase the commit limit while a streaming workload is still allocating.
+    // Retry only after the actual available commit has risen, even if the reported limit grows.
+    static bool wait_for_host_import_commit() {
+        const char* setting = std::getenv("LEONIDA_XMEM_IMPORT_COMMIT_RETRY");
+        if (!setting || std::strcmp(setting, "1") != 0) return false;
+        const auto available = []() -> std::optional<std::uint64_t> {
+            PERFORMANCE_INFORMATION info{sizeof(info)};
+            if (!GetPerformanceInfo(&info, sizeof(info)) || !info.PageSize || info.CommitTotal > info.CommitLimit)
+                return std::nullopt;
+            const auto pages = info.CommitLimit - info.CommitTotal;
+            if (pages > UINT64_MAX / info.PageSize) return std::nullopt;
+            return std::uint64_t(pages) * info.PageSize;
+        };
+        constexpr std::uint64_t mib = 1024 * 1024;
+        const auto initial = available();
+        if (!initial || *initial > 1024 * mib) return false;
+        std::fprintf(stderr, "[rt] d3d12: physical buffer import waiting for commit headroom initial_MiB=%llu\n",
+            static_cast<unsigned long long>(*initial / mib));
+        const auto started = GetTickCount64();
+        constexpr ULONGLONG timeout_ms = 2500;
+        for (;;) {
+            const auto elapsed = GetTickCount64() - started;
+            if (elapsed >= timeout_ms) return false;
+            Sleep(static_cast<DWORD>((std::min)(timeout_ms - elapsed, ULONGLONG{50})));
+            const auto current = available();
+            if (!current) return false;
+            if (*current >= *initial + 256 * mib) return true;
+        }
+    }
+
     void trace_host_import_failure(const void* address, std::size_t bytes, std::uint32_t types) const {
         static std::atomic<unsigned> reports{};
         if (!DeviceState::trace_texture_ranges() || reports.fetch_add(1, std::memory_order_relaxed) >= 4) return;
@@ -3148,6 +3178,7 @@ public:
         // The guest accesses these pages directly, without Map/Unmap cache maintenance. A terminal HOST_READ
         // dependency supplies visibility for coherent imports; it cannot invalidate non-coherent CPU caches.
         constexpr VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        std::uint32_t attempted_type = 0;
         const auto allocate_coherent = [&](void* pointer, std::uint32_t mask) {
             import.pHostPointer = pointer;
             bool compatible = false;
@@ -3158,6 +3189,7 @@ public:
                                               need_bda ? static_cast<const void*>(&flags) : &import};
                 allocate.allocationSize = bytes;
                 allocate.memoryTypeIndex = i;
+                attempted_type = i;
                 native_result = vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_);
                 if (native_result == VK_SUCCESS) memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
                 else memory_ = VK_NULL_HANDLE;
@@ -3179,8 +3211,18 @@ public:
                 VkMemoryHostPointerPropertiesEXT alternate{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
                 const auto queried = device_.get_host_pointer_properties(device_.info.device,
                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, backing, &alternate);
-                if (queried == VK_SUCCESS && reinterpret_cast<std::uintptr_t>(backing) % alignment == 0)
-                    allocate_coherent(backing, alternate.memoryTypeBits & requirements.memoryTypeBits);
+                if (queried == VK_SUCCESS && reinterpret_cast<std::uintptr_t>(backing) % alignment == 0) {
+                    const auto mask = alternate.memoryTypeBits & requirements.memoryTypeBits;
+                    const bool attempted = allocate_coherent(backing, mask);
+                    if (attempted && !memory_ && native_result == VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                        wait_for_host_import_commit()) {
+                        // Pick one type which really failed the canonical import. Keep the original pin,
+                        // extent, BDA flags and source-page protection throughout the bounded wait.
+                        allocate_coherent(backing, 1u << attempted_type);
+                        std::fprintf(stderr, "[rt] d3d12: physical buffer import retry after commit headroom "
+                            "increased by 256 MiB va=%p type=%u vk=%d\n", address, attempted_type, int(native_result));
+                    }
+                }
                 static std::atomic<unsigned> reports{};
                 if (reports.fetch_add(1, std::memory_order_relaxed) < 12)
                     std::fprintf(stderr, "[rt] d3d12: pinned physical buffer import va=%p bytes=%llu "
