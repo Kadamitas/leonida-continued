@@ -20,17 +20,17 @@ instead of write-combined: null address, allocation type 0x20401000, attributes 
 This changes the cache modifier of a new allocation only. Existing pages are not reprotected, and arbitrary
 write-combined imports remain refused.
 
-`LEONIDA_XBOX_MEMORY_WAIT=satisfied_host_generation` enables a bounded startup acquire for slot 74:
-GREATER_EQUAL, reference 1, flags DWORD 1, and the observed CPU control-page role. The CPU initializes this cell
-to 1 before publishing it; reviewed later publications remain positive. An actual coherent 64-bit read during
-every replay must satisfy the predicate. Replay then records a HOST_WRITE-to-ALL_COMMANDS memory barrier at
-the command's position. An unsatisfied value fails preparation rather than being overwritten or signalled.
-Reference 2 can follow a prefix of immediate memory writes disjoint from the control cell. The queue submits
-preceding complete lists and the verified write prefix, then waits for their real Vulkan progress ticket without
-holding the device's resource or submission locks. At that boundary a fresh unsigned comparison consumes a CPU
-publication that may subsequently regress. The suffix is prepared and submitted only on success. A failure after
-prefix submission stops the guest device and reports partial execution. Multiple later waits, other mid-list
-prefixes and unsatisfied values remain unsupported. The remaining console flag-1 semantics are unverified.
+`LEONIDA_XBOX_MEMORY_WAIT=satisfied_host_generation` enables slot 74 for a certified CPU control page, a
+positive reference, GREATER_EQUAL and flags DWORD 1. The CPU initializes this cell to 1 before publishing
+it. Reviewed later writes stay positive, so each replay can prove reference 1 with a coherent 64-bit read.
+Replay records a HOST_WRITE-to-ALL_COMMANDS memory barrier at the command's position.
+
+A later reference can follow immediate or timestamp writes disjoint from the control cell. The queue submits
+preceding complete lists and those writes, then waits for their native Vulkan ticket without holding the device's
+resource or submission locks. At that boundary it polls the live control allocation for up to 250 ms. The first
+satisfied comparison releases the suffix, even if the CPU subsequently publishes an older value. The allocation
+identity must still match when the suffix is prepared. Failure after prefix submission reports partial execution
+and stops the guest device. The current path supports one later wait per batch and the verified write prefix.
 
 The separate `LEONIDA_XBOX_QUEUE_SUBMIT=immediate` experiment issues a real PC ExecuteCommandLists after
 validating and retaining the complete console list array. Console token pacing remains unverified. Recording
