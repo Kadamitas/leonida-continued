@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -400,6 +401,7 @@ public:
         ID3D12DescriptorHeap* smp = nullptr;
         D3D12_GPU_VIRTUAL_ADDRESS cbv_base = 0;
         D3D12_GPU_VIRTUAL_ADDRESS smp_base = 0;
+        std::uint32_t cbv_offset = 0, smp_offset = 0;
         IUnknown* const owner = this->attached_device();
         for (UINT i = 0; i < num; ++i) {
             ID3D12DescriptorHeap* raw = heaps[i];
@@ -407,17 +409,20 @@ public:
             if (ID3D12DescriptorHeap* real = d3d12_xs::heap_proxy_real_heap(raw)) raw = real;
             D3D12_DESCRIPTOR_HEAP_DESC desc{};
             D3D12_GPU_VIRTUAL_ADDRESS base = 0;
-            IUnknown* const heap_owner = descriptor_heap_info(raw, desc, base);
+            std::uint32_t shader_offset = 0;
+            IUnknown* const heap_owner = descriptor_heap_info(raw, desc, base, &shader_offset);
             if (!heap_owner || (owner && heap_owner != owner)) return check(false);
             if (!(desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return check(false);
             if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
                 if (cbv) return check(false);
                 cbv = raw;
                 cbv_base = base;
+                cbv_offset = shader_offset;
             } else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
                 if (smp) return check(false);
                 smp = raw;
                 smp_base = base;
+                smp_offset = shader_offset;
             } else {
                 return check(false);
             }
@@ -425,7 +430,7 @@ public:
         hold(cbv);
         hold(smp);
         if (defer([=](GraphicsCommandList& l) { l.verify_bundle_descriptor_heaps(cbv, smp); })) return;
-        set_descriptor_heaps(cbv, cbv_base, smp, smp_base);
+        set_descriptor_heaps(cbv, cbv_base, smp, smp_base, cbv_offset, smp_offset);
     }
 
     void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) override {
@@ -991,7 +996,7 @@ public:
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_.data;
+            cmd.user_data = compute_user_data();
             if (!capture_descriptor_tables(compute_, cmd.descriptor_tables)) return check(false);
         }
         if (kind != leonida::IndirectKind::dispatch && max_command_count) {
@@ -1474,6 +1479,7 @@ private:
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
     D3D12_GPU_VIRTUAL_ADDRESS sampler_base_ = 0;
+    std::uint32_t resource_shader_offset_ = 0, sampler_shader_offset_ = 0;
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
@@ -1549,7 +1555,8 @@ private:
     }
 
     void set_descriptor_heaps(ID3D12DescriptorHeap* cbv, D3D12_GPU_VIRTUAL_ADDRESS cbv_base,
-                              ID3D12DescriptorHeap* smp, D3D12_GPU_VIRTUAL_ADDRESS smp_base) {
+                              ID3D12DescriptorHeap* smp, D3D12_GPU_VIRTUAL_ADDRESS smp_base,
+                              std::uint32_t cbv_offset, std::uint32_t smp_offset) {
         if (cbv != cbv_srv_uav_heap_ || cbv_base != cbv_srv_uav_base_) {
             compute_.clear_tables();
             graphics_.clear_tables();
@@ -1563,6 +1570,8 @@ private:
         cbv_srv_uav_base_ = cbv_base;
         sampler_heap_ = smp;
         sampler_base_ = smp_base;
+        resource_shader_offset_ = cbv_offset;
+        sampler_shader_offset_ = smp_offset;
     }
 
     // D3D12 bundle rule: every non-null heap bound by a bundle's SetDescriptorHeaps must match the parent list's
@@ -1583,13 +1592,13 @@ private:
             if (!cbv_srv_uav_heap_)
                 note(missing_resource, "draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
             else
-                note(bound_resource, "CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+                note(bound_resource, "CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list");
         }
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
             if (!sampler_heap_)
                 note(missing_sampler, "draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
             else
-                note(bound_sampler, "SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+                note(bound_sampler, "SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list");
         }
     }
 
@@ -1601,6 +1610,7 @@ private:
         sampler_heap_ = nullptr;
         cbv_srv_uav_base_ = 0;
         sampler_base_ = 0;
+        resource_shader_offset_ = sampler_shader_offset_ = 0;
         topology_ = 0;
         vertex_buffers_ = {};
         index_ = {};
@@ -1670,10 +1680,30 @@ private:
         }
     }
 
+    // PR #1064 observed these inline heap words in a compute shader during story loading.
+    // The general placement is inferred. Record only arena offsets the shader can actually dereference.
+    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> compute_user_data() const {
+        auto data = compute_.data;
+        const auto flags = compute_.layout->flags;
+        if (!(flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                       D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED))) return data;
+        static const bool enabled = [] {
+            const char* value = std::getenv("LEONIDA_COMPUTE_DIRECT_HEAPS");
+            return !value || std::strcmp(value, "0") != 0;
+        }();
+        if (!enabled) return data;
+        auto slot = compute_.layout->compute_arguments_end;
+        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && slot < data.size())
+            data[slot++] = resource_shader_offset_;
+        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && slot < data.size())
+            data[slot] = sampler_shader_offset_;
+        return data;
+    }
+
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         note_direct_heap_indexing(compute_.layout);
-        leonida::Dispatch dispatch{compute_pipeline_, compute_.data, x, y, z};
+        leonida::Dispatch dispatch{compute_pipeline_, compute_user_data(), x, y, z};
         if (x && y && z && !capture_descriptor_tables(compute_, dispatch.descriptor_tables)) return check(false);
         check(list_.dispatch(std::move(dispatch)));
     }

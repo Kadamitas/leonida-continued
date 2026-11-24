@@ -39,6 +39,21 @@ void main() {
     const uint i = gl_GlobalInvocationID.x;
     Words table = at(uvec2(pc.s[8], 0u));
     Words result = at(uvec2(pc.s[6], pc.s[7]));
+    if (pc.s[5] == 0xFFFFFFFCu) {
+        // Direct resource indexing. The explicit table is unrelated; the heap follows it at s9.
+        uint value = 0u;
+        if (pc.s[9] != 0u) {
+            Words view = at(uvec2(pc.s[9] + 32u * pc.s[4], 0u));
+            uint byteOffset = (i % 4u) * 4u;
+            if (view.w[2] >= byteOffset + 4u) {
+                // V# buffer addresses are signed 48-bit offsets from heap_base.
+                uint high = uint(int(view.w[1] << 16u) >> 16);
+                value = at(uvec2(view.w[0], high)).w[byteOffset / 4u];
+            }
+        }
+        result.w[i] = value;
+        return;
+    }
     if (pc.s[5] == 0u) {
         // CBV V# mode: table holds a 16-byte GFX10 raw buffer descriptor written by CreateConstantBufferView.
         const uint num_records = table.w[2];

@@ -468,6 +468,7 @@ struct RootArgumentLayout {
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
     bool compute_ok = true;
+    std::uint32_t compute_arguments_end = rt::rootsig::kNoSgpr;
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a
@@ -481,7 +482,7 @@ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12Pi
 // Unwraps an Xbox-ABI heap proxy if needed and inspects one of this module's descriptor heaps; returns its owning
 // device identity pointer, or nullptr when `heap` is null or belongs to another implementation.
 IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP_DESC& desc,
-                               D3D12_GPU_VIRTUAL_ADDRESS& gpu_base);
+                               D3D12_GPU_VIRTUAL_ADDRESS& gpu_base, std::uint32_t* shader_offset = nullptr);
 
 const leonida::DescriptorHeapMirror* descriptor_heap_mirror(ID3D12DescriptorHeap* heap);
 

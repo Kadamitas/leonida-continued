@@ -2427,6 +2427,11 @@ public:
         return {in_arena_ ? UINT64(arena_offset_) : 0};
     }
 
+    // Console-addressed heaps expose a guest handle even when they have no shader-accessible arena storage.
+    std::uint32_t shader_offset() const {
+        return in_arena_ && arena_offset_ <= UINT32_MAX ? static_cast<std::uint32_t>(arena_offset_) : 0;
+    }
+
     const leonida::DescriptorHeapMirror* mirror() const { return mirror_.arena ? &mirror_ : nullptr; }
     const D3D12_DESCRIPTOR_HEAP_DESC& raw_desc() const { return desc_; }
     D3D12_GPU_VIRTUAL_ADDRESS gpu_base() const {
@@ -8444,6 +8449,7 @@ public:
         layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
+        if (compute.ok) layout.compute_arguments_end = compute.end_sgpr;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = UINT32_MAX;
             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
@@ -11812,13 +11818,14 @@ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12Pi
 }
 
 IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP_DESC& desc,
-                               D3D12_GPU_VIRTUAL_ADDRESS& gpu_base) {
+                               D3D12_GPU_VIRTUAL_ADDRESS& gpu_base, std::uint32_t* shader_offset) {
     if (!heap) return nullptr;
     if (ID3D12DescriptorHeap* real = rt::d3d12_xs::heap_proxy_real_heap(heap)) heap = real;
     const DescriptorHeap* d = DescriptorHeap::from<DescriptorHeap>(heap);
     if (!d) return nullptr;
     desc = d->raw_desc();
     gpu_base = d->gpu_base();
+    if (shader_offset) *shader_offset = d->shader_offset();
     return d->attached_device();
 }
 
