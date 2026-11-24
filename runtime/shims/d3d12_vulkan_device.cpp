@@ -2917,11 +2917,7 @@ public:
         binding.imported_host_size = bytes;
         binding.va = va_;
         binding.control_allocation = rt::shims::control_pages::allocation_id(va_);
-        if (binding.control_allocation) {
-            binding.control_allocation_matches = [](std::uint64_t base, std::uint64_t expected) {
-                return rt::shims::control_pages::allocation_id(base) == expected;
-            };
-        }
+        binding.snapshot_control_generation = rt::shims::control_pages::snapshot_generation;
         device_.context->add_resource(id(), binding);
         if (leading) {
             static std::atomic<unsigned> imports{0};

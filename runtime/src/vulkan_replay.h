@@ -124,7 +124,7 @@ struct ResourceBinding {
     std::uint64_t imported_host_size = 0;
     bool sparse_buffer = false;
     std::uint64_t control_allocation = 0;  // lifetime of a certified XMem generation cell, if any
-    bool (*control_allocation_matches)(std::uint64_t base, std::uint64_t expected) = nullptr;
+    bool (*snapshot_control_generation)(std::uint64_t base, std::uint64_t epoch, std::uint64_t* observed) = nullptr;
     bool packed4444_projection = false;  // a console 16-bit render target backed by a wider native image
     std::uint64_t host_image_address = 0;  // descriptor identity, zero when no bounded identity is available
     std::uintptr_t draw_activity_image = 0;  // diagnostic identity for this native image's registration lifetime

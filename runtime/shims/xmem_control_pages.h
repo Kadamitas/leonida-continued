@@ -51,6 +51,26 @@ inline std::uint64_t allocation_id(std::uintptr_t base) noexcept {
     return 0;
 }
 
+// A title free/decommit revokes under this lock before it changes the Windows mapping. Hold the lock through the
+// load so even a recycled address can never make an old generation wait dereference released or replacement memory.
+// A null output only rechecks the allocation after a satisfied wait, whose word may subsequently regress.
+inline bool snapshot_generation(std::uint64_t base, std::uint64_t expected, std::uint64_t* observed) noexcept {
+    if constexpr (!std::atomic_ref<std::uint64_t>::is_always_lock_free) return false;
+    if (!base || !expected || base > UINTPTR_MAX || base % std::atomic_ref<std::uint64_t>::required_alignment)
+        return false;
+    const detail::Lock lock;
+    for (const auto& entry : detail::state.allocations) {
+        if (entry.epoch != expected || entry.copy_arena || entry.base != base || entry.bytes < sizeof(std::uint64_t))
+            continue;
+        if (observed) {
+            auto* word = reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(base));
+            *observed = std::atomic_ref<std::uint64_t>(*word).load(std::memory_order_acquire);
+        }
+        return true;
+    }
+    return false;
+}
+
 // Returns zero when no bounded slot/unique epoch is available; the allocation then has no control-page role.
 inline std::uint64_t note_allocation(std::uintptr_t base, std::size_t bytes, bool copy_arena = false) noexcept {
     if (!base || !bytes || bytes > std::numeric_limits<std::uintptr_t>::max() - base) return 0;

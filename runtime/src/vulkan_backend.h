@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -42,6 +43,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_set>
 #include <shared_mutex>
 #include <span>
@@ -2525,6 +2527,76 @@ private:
     HostShadowProfile shadow_profile_;
     std::vector<const DescriptorHeapMirror*> bound_descriptor_heaps_;
     std::vector<VulkanContext::HostImages::Node> selected_host_images_;
+    struct GenerationCell {
+        std::uint64_t* word;
+        ResourceId resource;
+        std::uint64_t allocation;
+
+        bool operator==(const GenerationCell&) const = default;
+    };
+
+    // Called under resource_mutex_. A retained host import must still refer to the live control allocation.
+    std::optional<GenerationCell> generation_cell(std::uint64_t address, std::uint64_t* observed,
+                                                   const GenerationCell* expected = nullptr) const {
+        if constexpr (!std::atomic_ref<std::uint64_t>::is_always_lock_free) return std::nullopt;
+        if (!address || address % sizeof(std::uint64_t) ||
+            address % std::atomic_ref<std::uint64_t>::required_alignment ||
+            address > UINT64_MAX - sizeof(std::uint64_t)) return std::nullopt;
+        BufferVaIndex<ResourceId>::Hit hit{};
+        if (!context_.buffer_vas_.find(address, hit, sizeof(std::uint64_t))) return std::nullopt;
+        const ResourceBinding* binding = context_.resolve(hit.id);
+        if (!binding || binding->image || !binding->buffer || !binding->coherent_host_import ||
+            !binding->host_readable || !binding->host || address < binding->va) return std::nullopt;
+        const std::uint64_t offset = address - binding->va;
+        if (offset > binding->size || sizeof(std::uint64_t) > binding->size - offset) return std::nullopt;
+        const auto* host = binding->host + offset;
+        if (reinterpret_cast<std::uintptr_t>(host) != address) return std::nullopt;
+        GenerationCell cell{reinterpret_cast<std::uint64_t*>(const_cast<std::uint8_t*>(host)),
+                            hit.id, binding->control_allocation};
+        if (expected && cell != *expected) return std::nullopt;
+        if (binding->snapshot_control_generation) {
+            if (address != binding->va ||
+                !binding->snapshot_control_generation(address, cell.allocation, observed)) return std::nullopt;
+        } else {
+            // The portable Vulkan interface also accepts caller-owned test/import storage. A binding that
+            // advertises revocable XMem backing must always supply the locked snapshot operation.
+            if (cell.allocation) return std::nullopt;
+            if (observed) *observed = std::atomic_ref<std::uint64_t>(*cell.word).load(std::memory_order_acquire);
+        }
+        return cell;
+    }
+
+    std::optional<GenerationCell> await_generation(const HostMemoryAcquire& acquire) const {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        std::uint64_t observed = 0;
+        bool waited = false;
+        std::optional<GenerationCell> first;
+        do {
+            if (context_.is_device_lost()) return std::nullopt;
+            {
+                std::shared_lock lock(context_.resource_mutex_);
+                const auto cell = generation_cell(acquire.address, &observed, first ? &*first : nullptr);
+                if (!cell) return std::nullopt;
+                if (!first) first = cell;
+                if (observed >= acquire.reference) {
+                    static std::atomic<unsigned> traces{0};
+                    if (traces.fetch_add(1, std::memory_order_relaxed) < 12)
+                        std::fprintf(stderr, "[rt] VulkanQueue: CPU generation acquired after prefix "
+                                             "reference=%llu observed=%llu waited=%u\n",
+                            static_cast<unsigned long long>(acquire.reference),
+                            static_cast<unsigned long long>(observed), unsigned(waited));
+                    return cell;
+                }
+            }
+            // Allow the CPU publisher and other queues to make progress without retaining either Vulkan lock.
+            waited = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (std::chrono::steady_clock::now() < deadline);
+        std::fprintf(stderr, "[rt] VulkanQueue: CPU generation publication timed out reference=%llu observed=%llu\n",
+                     static_cast<unsigned long long>(acquire.reference), static_cast<unsigned long long>(observed));
+        return std::nullopt;
+    }
+
     ReplayResult execute_guest_batch(std::span<const CommandList* const> lists, std::vector<std::shared_ptr<void>>& pins) {
         const auto split = std::find_if(lists.begin(), lists.end(), [](const auto* list) {
             return list->ordered_acquires() != 0;
@@ -2570,8 +2642,10 @@ private:
                 if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
                 if (result != VK_SUCCESS) return failure(ReplayResult::unsupported);
             }
-            // Suffix preparation performs the actual atomic acquire before reading its descriptor or image data.
-            const auto result = execute_now(suffix, pins);
+            const auto& acquire = std::get<HostMemoryAcquire>(after.commands().front());
+            const auto latched = await_generation(acquire);
+            if (!latched) return failure(ReplayResult::unsupported);
+            const auto result = execute_now(suffix, pins, {}, &*latched);
             if (result != ReplayResult::success) return failure(result);
             static std::atomic<unsigned> traces{0};
             if (traces.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -2585,7 +2659,8 @@ private:
     }
 
     ReplayResult execute_now(std::span<const CommandList* const> lists, std::vector<std::shared_ptr<void>>& pins,
-                             std::span<const ResourceId> present_sources = {}) {
+                             std::span<const ResourceId> present_sources = {},
+                             const GenerationCell* latched_generation = nullptr) {
         const auto profile_start = FrameProfile::now();
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
@@ -2654,59 +2729,26 @@ private:
         // prepare() holds resource_mutex_ shared. Validate the exact live coherent import and read the CPU's real
         // word on every execution. The startup floor is stable. Later generations may regress:
         // observe them only at their logical execution boundary, after all queue predecessors retire.
-        replay.host_memory_acquire = [this, &lists](const HostMemoryAcquire& acquire) {
+        replay.host_memory_acquire = [this, &lists, latched_generation](const HostMemoryAcquire& acquire) {
             const auto [address, reference] = acquire;
-            if constexpr (!std::atomic_ref<std::uint64_t>::is_always_lock_free) {
-                return false;
-            } else {
-                if (!address || address % sizeof(std::uint64_t) ||
-                    address % std::atomic_ref<std::uint64_t>::required_alignment ||
-                    address > UINT64_MAX - sizeof(std::uint64_t)) return false;
-                BufferVaIndex<ResourceId>::Hit hit{};
-                if (!context_.buffer_vas_.find(address, hit, sizeof(std::uint64_t))) return false;
-                const ResourceBinding* binding = context_.resolve(hit.id);
-                if (!binding || binding->image || !binding->buffer || !binding->coherent_host_import ||
-                    !binding->host_readable || !binding->host || address < binding->va) return false;
-                if (binding->control_allocation_matches &&
-                    !binding->control_allocation_matches(binding->va, binding->control_allocation)) return false;
-                const std::uint64_t offset = address - binding->va;
-                if (offset > binding->size || sizeof(std::uint64_t) > binding->size - offset) return false;
-                const auto* host = binding->host + offset;
-                if (reinterpret_cast<std::uintptr_t>(host) != address) return false;
-                if (reference != 1) {
-                    if (reference != 2) return false;
-                    if (!starts_with_acquire(lists, acquire)) {
-                        std::fprintf(stderr, "[rt] VulkanQueue: generation wait has unsubmitted batch predecessors\n");
-                        return false;
-                    }
-                    // state_mutex_ serializes guest queue operations. All explicit wait dependencies plus the
-                    // last submitted ticket must have executed. Never block while holding resource_mutex_.
-                    const auto retired = [&](VkSemaphore semaphore, std::uint64_t value) {
-                        std::uint64_t done = 0;
-                        return context_.vk.vkGetSemaphoreCounterValue(context_.device(), semaphore, &done) == VK_SUCCESS &&
-                               done >= value;
-                    };
-                    if (submitted_ && !retired(progress_, submitted_)) {
-                        std::fprintf(stderr, "[rt] VulkanQueue: generation wait has an unretired queue predecessor\n");
-                        return false;
-                    }
-                    for (std::size_t i = 0; i < waits_.size(); ++i)
-                        if (!retired(waits_[i], wait_values_[i])) {
-                            std::fprintf(stderr, "[rt] VulkanQueue: generation wait has an unretired fence dependency\n");
-                            return false;
-                        }
+            if (reference != 1) {
+                if (reference != 2 || !starts_with_acquire(lists, acquire) || !latched_generation ||
+                    !generation_cell(address, nullptr, latched_generation)) {
+                    std::fprintf(stderr, "[rt] VulkanQueue: generation wait has no matching retired-prefix acquire\n");
+                    return false;
                 }
-                auto* word = reinterpret_cast<std::uint64_t*>(const_cast<std::uint8_t*>(host));
-                const auto observed = std::atomic_ref<std::uint64_t>(*word).load(std::memory_order_acquire);
-                static std::atomic<unsigned> observations[2]{};
-                if ((reference != 1 && observed < reference) ||
-                    observations[reference != 1].fetch_add(1, std::memory_order_relaxed) < 16)
-                    std::fprintf(stderr, "[rt] VulkanQueue: startup host acquire address=0x%llx reference=%llu "
-                                         "observed=%llu satisfied=%u\n",
-                        static_cast<unsigned long long>(address), static_cast<unsigned long long>(reference),
-                        static_cast<unsigned long long>(observed), unsigned(observed >= reference));
-                return observed >= reference;
+                // A satisfied wait is one-shot. The CPU can publish an older generation again after this point.
+                return true;
             }
+            std::uint64_t observed = 0;
+            if (!generation_cell(address, &observed)) return false;
+            static std::atomic<unsigned> observations{0};
+            if (observations.fetch_add(1, std::memory_order_relaxed) < 16)
+                std::fprintf(stderr, "[rt] VulkanQueue: startup host acquire address=0x%llx reference=%llu "
+                                     "observed=%llu satisfied=%u\n",
+                    static_cast<unsigned long long>(address), static_cast<unsigned long long>(reference),
+                    static_cast<unsigned long long>(observed), unsigned(observed >= reference));
+            return observed >= reference;
         };
         const auto& timestamp_vk = context_.vk;
         const double timestamp_period = context_.timestamp_period();
