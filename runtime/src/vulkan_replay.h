@@ -71,7 +71,8 @@ struct MutableHostShadow {
     std::vector<VkBufferImageCopy> regions;
     std::function<bool(bool& dirty)> capture;
     // Called by serialized queue preparation after a dirty capture, before staging bytes or recording a copy.
-    std::function<VkBuffer()> prepare_staging;
+    // Optional ownership is retained by the native command slot through GPU completion.
+    std::function<VkBuffer(std::shared_ptr<void>&)> prepare_staging;
     std::function<void()> stage;
     std::function<void()> commit;
 };

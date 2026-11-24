@@ -3934,8 +3934,27 @@ public:
         if (const HRESULT hr = allocate_texture_shadow(source, source_span, upload_bytes, physical, typed_display,
                                                         defer_staging); FAILED(hr))
             return hr;
+        struct FirstUpload {
+            std::unique_ptr<leonida::PooledStagingBuffer> pooled;
+            VkDevice device{};
+            VkBuffer buffer{};
+            VkDeviceMemory memory{};
+            void* mapped{};
+            PFN_vkUnmapMemory unmap{};
+            PFN_vkDestroyBuffer destroy{};
+            PFN_vkFreeMemory free{};
+
+            ~FirstUpload() {
+                if (!pooled && buffer) {
+                    unmap(device, memory);
+                    destroy(device, buffer, nullptr);
+                    free(device, memory, nullptr);
+                }
+            }
+        };
         struct Capture {
             std::vector<std::byte> tiled, uploaded, packed;
+            std::shared_ptr<FirstUpload> first_upload;
             bool initialized = false;
         };
         auto capture = std::make_shared<Capture>();
@@ -4018,14 +4037,39 @@ public:
             return true;
         };
         if (defer_staging) {
-            shadow->prepare_staging = [this, upload_bytes] {
-                return SUCCEEDED(prepare_texture_staging(upload_bytes)) ? shadow_buffer_ : VK_NULL_HANDLE;
+            static const bool retire_first = [] {
+                const char* setting = std::getenv("LEONIDA_TILED_STAGING_RETIRE");
+                return setting && std::strcmp(setting, "1") == 0;
+            }();
+            shadow->prepare_staging = [this, capture, upload_bytes](std::shared_ptr<void>& lifetime) -> VkBuffer {
+                if (!capture->first_upload) {
+                    if (FAILED(prepare_texture_staging(upload_bytes))) return VK_NULL_HANDLE;
+                    // Recurrent updates keep one persistent allocation, as do all eager/linear shadows.
+                    if (!retire_first || capture->initialized) return shadow_buffer_;
+                    try { capture->first_upload = std::make_shared<FirstUpload>(); }
+                    catch (const std::bad_alloc&) { return VK_NULL_HANDLE; }
+                    auto& first = *capture->first_upload;
+                    auto& vk = device_.context->vk;
+                    first.device = device_.info.device;
+                    first.unmap = vk.vkUnmapMemory;
+                    first.destroy = vk.vkDestroyBuffer;
+                    first.free = vk.vkFreeMemory;
+                    first.pooled = std::move(pooled_shadow_);
+                    first.buffer = std::exchange(shadow_buffer_, VK_NULL_HANDLE);
+                    first.memory = std::exchange(shadow_memory_, VK_NULL_HANDLE);
+                    first.mapped = std::exchange(shadow_mapped_, nullptr);
+                }
+                // A rejected submit doesn't commit. Retry with the same allocation and fresh source bytes.
+                lifetime = capture->first_upload;
+                return capture->first_upload->buffer;
             };
         }
         shadow->stage = [this, capture] {
-            std::memcpy(shadow_mapped_, capture->packed.data(), capture->packed.size());
+            auto* mapped = capture->first_upload ? capture->first_upload->mapped : shadow_mapped_;
+            std::memcpy(mapped, capture->packed.data(), capture->packed.size());
         };
         shadow->commit = [capture] {
+            capture->first_upload.reset();  // the accepted command buffer now owns its GPU use
             capture->uploaded.swap(capture->tiled);
             // One-shot uploads need no permanent packed copy. Retain it after a later actual change so
             // animated textures allocate at most once more and reuse the buffers for every subsequent refresh.
