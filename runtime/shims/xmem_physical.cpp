@@ -1106,7 +1106,7 @@ rt::xmem::SparseTextureSnapshot snapshot_sparse_texture(const void* source, std:
             cursor = (std::min)(piece_end, native_end);
         }
     }
-    if (destination.empty()) return Result::ready;
+    if (destination.empty() && previous.empty()) return Result::ready;
     // Merge consecutive live physical slots into bulk reads, without crossing a permanent backing chunk.
     // Zero runs contain only metadata-confirmed holes whose native reservation was checked above.
     const auto visit_runs = [&](auto&& visit) {
@@ -1154,6 +1154,7 @@ rt::xmem::SparseTextureSnapshot snapshot_sparse_texture(const void* source, std:
         }
         return true;
     })) return Result::unchanged;
+    if (destination.empty()) return Result::ready;
     const bool copied = visit_runs([&](std::size_t at, const uint8_t* from, std::size_t bytes) {
         if (!from) {
             std::memset(destination.data() + at, 0, bytes);

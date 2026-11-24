@@ -300,7 +300,11 @@ void test_map(const Api& x) {
         check(at(rw, 1)[2] == 0x69 && at(alias, 10)[2] == 0x69 &&
               rt::xmem::snapshot_sparse_texture(plane, pixels) == rt::xmem::SparseTextureSnapshot::ready &&
               pixels[9] == std::byte{0x69}, "actual CPU writes are visible through every alias and the GPU snapshot");
+        check(rt::xmem::compare_sparse_texture(plane, pixels) == rt::xmem::SparseTextureSnapshot::unchanged,
+              "an unchanged physical range compares without an output buffer");
         at(rw, 1)[2] = 0x11;
+        check(rt::xmem::compare_sparse_texture(plane, pixels) == rt::xmem::SparseTextureSnapshot::ready &&
+              pixels[9] == std::byte{0x69}, "a CPU alias write is detected without changing the previous snapshot");
     }
     check(x.map(at(rw, 1), 1, frames + 2) == at(rw, 1), "change the writable mapping's second physical page");
     view = rt::xmem::find_physical_cpu_view(plane, 16);

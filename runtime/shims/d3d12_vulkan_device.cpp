@@ -3786,9 +3786,17 @@ public:
                 catch (const std::bad_alloc&) { return false; }
                 return true;
             };
-            if (!resize(capture->tiled, source_bytes)) return false;
             const auto previous = capture->initialized ? std::span<const std::byte>(capture->uploaded) :
                                                          std::span<const std::byte>{};
+            if (physical && capture->tiled.empty() && !previous.empty()) {
+                const auto comparison = rt::xmem::compare_sparse_texture(source, previous);
+                if (comparison == rt::xmem::SparseTextureSnapshot::unchanged) {
+                    dirty = false;
+                    return true;
+                }
+                if (comparison != rt::xmem::SparseTextureSnapshot::ready) return false;
+            }
+            if (!resize(capture->tiled, source_bytes)) return false;
             const auto sparse = rt::xmem::snapshot_sparse_texture(source, capture->tiled, previous);
             if (sparse == rt::xmem::SparseTextureSnapshot::failed ||
                 (physical && sparse == rt::xmem::SparseTextureSnapshot::untracked)) return false;

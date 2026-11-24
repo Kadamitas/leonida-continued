@@ -148,4 +148,11 @@ inline SparseTextureSnapshot validate_sparse_texture(const void* source, std::si
     return handler ? handler(source, size, {}, {}, nullptr) : SparseTextureSnapshot::untracked;
 }
 
+// Compare all current physical bytes, including holes, before reserving scratch for a refresh.
+// Ready means a difference was observed. A later capture validates the mapping again.
+inline SparseTextureSnapshot compare_sparse_texture(const void* source, std::span<const std::byte> previous) noexcept {
+    const auto handler = detail::sparse_texture_snapshot_handler.load(std::memory_order_acquire);
+    return handler ? handler(source, previous.size(), {}, previous, nullptr) : SparseTextureSnapshot::untracked;
+}
+
 }  // namespace rt::xmem
