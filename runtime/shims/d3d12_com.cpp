@@ -280,6 +280,9 @@ public:
                 if (const auto* write = std::get_if<leonida::WriteImmediate>(&prefix[i])) {
                     std::fprintf(stderr, "[rt]   command %zu: WriteImmediate address=0x%llx value=0x%x\n",
                                  i, static_cast<unsigned long long>(write->address), write->value);
+                } else if (const auto* timestamp = std::get_if<leonida::WriteTimestamp>(&prefix[i])) {
+                    std::fprintf(stderr, "[rt]   command %zu: WriteTimestamp address=0x%llx\n", i,
+                                 static_cast<unsigned long long>(timestamp->address));
                 } else if (const auto* wait = std::get_if<leonida::HostMemoryAcquire>(&prefix[i])) {
                     std::fprintf(stderr, "[rt]   command %zu: HostMemoryAcquire address=0x%llx reference=%llu\n",
                                  i, static_cast<unsigned long long>(wait->address),

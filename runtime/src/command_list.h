@@ -886,13 +886,19 @@ public:
     std::size_t ordered_acquires() const { return ordered_acquires_; }
 
     static bool is_generation_write_prefix(std::span<const Command> commands, std::uint64_t address) {
+        const auto disjoint = [address](std::uint64_t write_address, std::uint64_t size) {
+            return write_address < address ? address - write_address >= size : write_address - address >= 8;
+        };
         return std::all_of(commands.begin(), commands.end(), [&](const Command& command) {
-            const auto* write = std::get_if<WriteImmediate>(&command);
-            return write && (write->address < address || write->address - address >= 8);
+            if (const auto* write = std::get_if<WriteImmediate>(&command))
+                return disjoint(write->address, sizeof(std::uint32_t));
+            if (const auto* timestamp = std::get_if<WriteTimestamp>(&command))
+                return disjoint(timestamp->address, sizeof(std::uint64_t));
+            return false;
         });
     }
 
-    // An immediate write records no persistent rendering state. A root-state or descriptor-heap
+    // Immediate and timestamp writes record no persistent rendering state. A root-state or descriptor-heap
     // snapshot belongs to the suffix; no query/predicate/rendering scope crosses this split.
     bool split_generation_wait(CommandList& before, CommandList& after) const {
         if (!closed_ || queries_open() || ordered_acquires_ != 1) return false;
