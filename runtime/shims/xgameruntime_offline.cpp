@@ -15,9 +15,9 @@
 //   XGameStreamingImpl  the game is never streamed: initialising succeeds, IsStreaming is false, there are no
 //                       clients, the connection-state registration hands out a token that never fires.
 //   XDisplayImpl        XDisplayTryEnableHdrMode: Disabled (the host output is SDR), Enabled with LEONIDA_HDR=1.
-//   XUserDeviceImpl     every device belongs to the offline user; associations and audio endpoints never change, so
-//                       their change registrations are kept until unregistered and never called back; the user has
-//                       no audio endpoint of its own; finding a controller shows no UI (as on desktop).
+//   XUserDeviceImpl     connected GameInput pads belong to the successfully added offline user. Pairing changes
+//                       use the title's task queue; there is no dedicated headset/audio endpoint, and finding a
+//                       controller shows no UI (as on desktop).
 //   XAccessibilityImpl  high contrast is Off, closed captions can't be configured, one silent voice is installed
 //                       (enumerating calls back once), XSpeechSynthesizerCreate hands out a synthesizer whose
 //                       text/SSML streams return a valid 44-byte empty 16 kHz mono 16-bit PCM WAVE header so titles
@@ -31,17 +31,25 @@
 
 #include <atomic>
 #include <cstddef>
+#include <algorithm>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iterator>
+#include <list>
 #include <mutex>
+#include <memory>
+#include <new>
 #include <vector>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
+
+#include "input_user_bridge.h"
 
 namespace rt::shims {
 void* xgameruntime_user_new_handle();   // xgameruntime_user.cpp
@@ -441,20 +449,31 @@ const GUID kUserDeviceInterfaces[] = {
     {0x0cc6a956, 0xe7e1, 0x4fdf, {0x93, 0x41, 0x9d, 0x5d, 0xa6, 0x49, 0xeb, 0xc8}},    // IXUserDeviceImpl2 (no methods)
 };
 
-// APP_LOCAL_DEVICE_ID is taken to be 32 bytes (APP_LOCAL_DEVICE_ID_SIZE), not on the pages read for this file. No
-// caller confirms it: the executable links no XUserDeviceImpl thunk (docs/runtime_imports.md).
+// APP_LOCAL_DEVICE_ID's public 32-byte layout matches GameInputDeviceInfo::deviceRootId (gameinput_abi.h).
 struct APP_LOCAL_DEVICE_ID {
     uint8_t value[32];
 };
 
 const char kFindControllerIdentity = 0;
 
-// 3: HRESULT XUserFindForDevice(const APP_LOCAL_DEVICE_ID* deviceId, XUserHandle* handle): every device belongs to
-// the one offline user.
+// 3: HRESULT XUserFindForDevice(const APP_LOCAL_DEVICE_ID* deviceId, XUserHandle* handle). This desktop's connected
+// GameInput pads belong to the one offline user after the title has successfully added that user. Unknown IDs,
+// disconnected devices and a user not added to the title have no association. See Microsoft's public XUserFindForDevice
+// and XUserAddAsync reference: device lookup must not add a user implicitly.
 HRESULT STDMETHODCALLTYPE device_find_user(void*, const APP_LOCAL_DEVICE_ID* device, XUserHandle* out) {
     if (!device || !out) return E_INVALIDARG;
-    *out = rt::shims::xgameruntime_user_new_handle();
-    return S_OK;
+    *out = nullptr;
+    constexpr HRESULT user_not_found = static_cast<HRESULT>(0x89245104);
+    if (!rt::input_user::user_added.load(std::memory_order_acquire)) return user_not_found;
+    try {
+        const auto connected = rt::input_user::connected_devices();
+        for (const auto& id : connected)
+            if (std::memcmp(id.data(), device->value, id.size()) == 0) {
+                *out = rt::shims::xgameruntime_user_new_handle();
+                return S_OK;
+            }
+    } catch (...) { return E_OUTOFMEMORY; }
+    return user_not_found;
 }
 
 // 4: HRESULT XUserRegisterForDeviceAssociationChanged(XTaskQueueHandle queue, void* context,
@@ -464,69 +483,9 @@ HRESULT STDMETHODCALLTYPE device_find_user(void*, const APP_LOCAL_DEVICE_ID* dev
 //        XUserDefaultAudioEndpointUtf16ChangedCallback* callback, XTaskQueueRegistrationToken* token)
 // 8: bool XUserUnregisterForDefaultAudioEndpointUtf16Changed(XTaskQueueRegistrationToken token, bool wait)
 //
-// Each registration is kept (its kind, a duplicate of its queue, its context and callback) under a token unique
-// across both kinds and never 0, until the title unregisters it with the matching function. Offline, the device
-// association and the default audio endpoint never change, so no event is ever raised: no callback is queued or
-// run, and nothing here calls one. Unregistering therefore never has to wait, whatever `wait` says, and removes the
-// registration at once. It returns true for every token, as XUserUnregisterForChangeEvent does: a token already
-// unregistered, never handed out or of the other kind is left alone (a title polling with wait = false would spin
-// on false). queue and context are _In_opt_; a null queue stays null (the process queue, if an event ever came);
-// callback and token are required (E_INVALIDARG).
-//
-// The state is namespace-scope and the lock a constinit SRW lock, not function-local statics: these calls run on
-// the title's threads.
-enum class DeviceEvent : uint32_t { Association = 0, AudioEndpoint = 1 };
-
-struct DeviceRegistration {
-    uint64_t token;
-    DeviceEvent kind;
-    XTaskQueueHandle queue;   // our duplicate, closed on unregister; null for the process queue
-    void* context;
-    void* callback;
-};
-
-constinit SRWLOCK g_device_lock = SRWLOCK_INIT;
-std::vector<DeviceRegistration> g_device_registrations;   // guarded by g_device_lock
-constinit uint64_t g_device_next_token = 1;               // guarded by g_device_lock
-
-template <DeviceEvent Kind>
-HRESULT STDMETHODCALLTYPE device_register(void*, XTaskQueueHandle queue, void* context, void* callback,
-                                          XTaskQueueRegistrationToken* token) {
-    if (!callback || !token) return E_INVALIDARG;
-    XTaskQueueHandle kept = nullptr;
-    if (queue) {
-        const HRESULT hr = XTaskQueueDuplicateHandle(queue, &kept);
-        if (FAILED(hr)) return hr;
-    }
-    uint64_t issued = 0;
-    AcquireSRWLockExclusive(&g_device_lock);
-    try {
-        g_device_registrations.push_back({g_device_next_token, Kind, kept, context, callback});
-        issued = g_device_next_token++;
-    } catch (...) {   // out of memory: no exception reaches the title
-    }
-    ReleaseSRWLockExclusive(&g_device_lock);
-    if (!issued) {
-        if (kept) XTaskQueueCloseHandle(kept);
-        return E_OUTOFMEMORY;
-    }
-    token->token = issued;
-    return S_OK;
-}
-
-template <DeviceEvent Kind> bool STDMETHODCALLTYPE device_unregister(void*, XTaskQueueRegistrationToken token, bool) {
-    XTaskQueueHandle queue = nullptr;
-    AcquireSRWLockExclusive(&g_device_lock);
-    for (auto it = g_device_registrations.begin(); it != g_device_registrations.end(); ++it)
-        if (it->token == token.token && it->kind == Kind) {
-            queue = it->queue;
-            g_device_registrations.erase(it);
-            break;
-        }
-    ReleaseSRWLockExclusive(&g_device_lock);
-    if (queue) XTaskQueueCloseHandle(queue);
-    return true;
-}
+// Registrations retain their queue. Device changes carry copied IDs and local user IDs, never borrowed input
+// objects. Unregister disables queued work and optionally waits for callbacks already using the title's context.
+#include "input_user_association.inl"
 
 // 6: HRESULT XUserGetDefaultAudioEndpointUtf16(XUserLocalId user, XUserDefaultAudioEndpointKind kind,
 //        size_t endpointIdUtf16Count, wchar_t* endpointIdUtf16, size_t* endpointIdUtf16Used)
@@ -827,7 +786,7 @@ long xgameruntime_offline_device_registrations(uint32_t kind) {
     long n = 0;
     AcquireSRWLockShared(&g_device_lock);
     for (const auto& registration : g_device_registrations)
-        if (static_cast<uint32_t>(registration.kind) == kind) ++n;
+        if (static_cast<uint32_t>(registration->kind) == kind) ++n;
     ReleaseSRWLockShared(&g_device_lock);
     return n;
 }

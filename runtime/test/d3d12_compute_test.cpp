@@ -321,7 +321,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
 
         // Root signature: [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-CBV table (s8, its 32-bit VA):
@@ -611,6 +611,17 @@ int main() {
         list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
         list->SetComputeRootSignature(root.p);
         list->Dispatch(1, 1, 1);
+        {
+            std::vector<leonida::Command> commands;
+            EXPECT(rt::d3d12::recorded_commands(list.p, commands));
+            std::vector<std::shared_ptr<const leonida::DescriptorTableBindings>> tables;
+            for (const auto& command : commands)
+                if (const auto* dispatch = std::get_if<leonida::Dispatch>(&command))
+                    tables.push_back(dispatch->descriptor_tables);
+            EXPECT(tables.size() == 3 && tables[0] && tables[0] == tables[1] && tables[2] && tables[0] != tables[2]);
+            EXPECT(tables[0]->size() == 1 && tables[2]->size() == 1);
+            EXPECT(tables[0]->front().cpu_address == tables[2]->front().cpu_address);
+        }
         D3D12_RESOURCE_BARRIER barriers[3] = {
             transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(out_b.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),

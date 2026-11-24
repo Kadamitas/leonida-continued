@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -220,7 +221,7 @@ inline int decode(BitReader& in, const Huffman& h) {
 }
 
 inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const Huffman& lengths,
-                          const Huffman& distances, std::size_t limit) {
+                               const Huffman& distances, std::size_t limit) {
     static constexpr std::int16_t length_base[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
                                                      31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
     static constexpr std::int16_t length_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
@@ -247,8 +248,21 @@ inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, co
         const std::size_t distance = std::size_t(distance_base[d]) + in.bits(distance_extra[d]);
         if (in.failed() || distance > out.size()) return ZlibError::data;
         if (out.size() > limit || length > limit - out.size()) return ZlibError::limit;
-        const std::size_t from = out.size() - distance;
-        for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
+        const std::size_t start = out.size();
+        out.resize(start + length);
+        auto* dest = out.data() + start;
+        if (distance == 1) {
+            std::fill_n(dest, length, dest[-1]);
+        } else {
+            // Overlapping matches repeat their first distance bytes. Each copy reads only completed output.
+            std::size_t copied = std::min(distance, length);
+            std::memcpy(dest, dest - distance, copied);
+            while (copied < length) {
+                const auto count = std::min(copied, length - copied);
+                std::memcpy(dest + copied, dest, count);
+                copied += count;
+            }
+        }
     }
 }
 
@@ -303,7 +317,8 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 detail::build_huffman(t.second, lengths, 30);
                 return t;
             }();
-            if (const ZlibError e = detail::inflate_codes(reader, out, tables.first, tables.second, limit); e != ZlibError::none)
+            if (const ZlibError e = detail::inflate_codes(reader, out, tables.first, tables.second, limit);
+                e != ZlibError::none)
                 return fail(e);
         } else if (type == 2) {  // dynamic Huffman
             const int literal_count = int(reader.bits(5)) + 257, distance_count = int(reader.bits(5)) + 1;
@@ -351,9 +366,16 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
     const std::size_t at = 2 + reader.position();
     if (at > in.size() || in.size() - at < 4) return fail(ZlibError::data);
     std::uint32_t a = 1, b = 0;
-    for (const std::uint8_t x : out) {
-        a = (a + x) % 65521;
-        b = (b + a) % 65521;
+    // At most 5,552 bytes of 0xff fit in both 32-bit accumulators between reductions.
+    for (std::span<const std::uint8_t> tail(out); !tail.empty();) {
+        const auto block = tail.first(std::min<std::size_t>(tail.size(), 5552));
+        for (const auto x : block) {
+            a += x;
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+        tail = tail.subspan(block.size());
     }
     const std::uint32_t expected = (std::uint32_t(in[at]) << 24) | (std::uint32_t(in[at + 1]) << 16) |
                                    (std::uint32_t(in[at + 2]) << 8) | in[at + 3];
@@ -614,6 +636,23 @@ inline std::span<const std::uint8_t> dxbc_part(std::span<const std::uint8_t> con
     return {};
 }
 
+// A single scalar constant-buffer binding in DXC's PSVResourceBindInfo1 table. This is checked on
+// the actual pipeline bytecode: two containers with identical FSSM can declare different resources.
+inline bool declares_one_cbuffer(std::span<const std::uint8_t> psv) {
+    const auto word = [&](std::size_t at) {
+        std::uint32_t value;
+        std::memcpy(&value, psv.data() + at, sizeof(value));
+        return value;
+    };
+    if (psv.size() < 4) return false;
+    const auto runtime_bytes = word(0);
+    if (runtime_bytes > psv.size() - 4) return false;
+    const std::size_t at = 4 + std::size_t(runtime_bytes);
+    if (psv.size() - at < 32 || word(at) != 1 || word(at + 4) != 24) return false;
+    return word(at + 8) == 2 && word(at + 16) == word(at + 20) &&
+           word(at + 16) != UINT32_MAX && word(at + 24) == 13 && word(at + 28) == 0;
+}
+
 // The FSSM blob of a shader: inflated from the container's DXIL/XDAT/XBCH entry, or the bytecode itself when it is
 // already a bare FSSM blob. Empty when neither applies.
 inline std::vector<std::uint8_t> fssm_program(std::span<const std::uint8_t> bytecode) {
@@ -806,6 +845,28 @@ struct SignatureElement {
     std::string component_type;      // "float", "uint", "sint"
 };
 
+// A shader's bounded descriptor-table contract. Constant views name byte prefixes to snapshot, not data.
+struct ShaderRootTable {
+    struct ConstantView {
+        std::uint32_t offset = 0;
+        std::uint32_t bytes = 0;
+        // Indexed full-row reads. bytes caps the complete source capacity, not a prefix.
+        std::uint32_t record_stride = 0;
+        // Set from the actual pipeline's resource declarations, never from the shader manifest.
+        bool cbv_rows = false;
+        bool operator==(const ConstantView&) const = default;
+    };
+    std::uint32_t dword = 0;
+    std::uint32_t bytes = 0;
+    std::vector<ConstantView> constant_views;
+    // If present, every image key used by this stage comes from one of these table byte offsets.
+    // Older or unbounded contracts leave this absent and retain the full image refresh.
+    std::optional<std::vector<std::uint32_t>> image_offsets;
+    std::uint32_t source_dword = 0;  // logical root packing; dword is the translated shader's destination SGPR
+    bool single_graphics_binding = false; // only use this remap for a unique table and empty destination SGPR
+    bool operator==(const ShaderRootTable&) const = default;
+};
+
 struct ShaderEntry {
     std::string name;
     std::string stage;  // "vs", "ps", "cs", "ms", "gs"
@@ -839,6 +900,11 @@ struct ShaderEntry {
     // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
     std::uint32_t max_vertices = 0;
     std::uint32_t max_primitives = 0;
+    std::optional<ShaderRootTable> root_table;
+    bool rectangle_inputs_affine = false;  // verified input-space corner construction is valid for this VS
+    std::optional<std::uint32_t> rectangle_position_xy; // input location passed to clip XY with constant positive W
+    bool declares_no_bindings = false;  // only an explicit, unambiguous empty bindings array proves this
+    bool bounded_image_keys() const { return declares_no_bindings || (root_table && root_table->image_offsets); }
 };
 
 class ShaderLibrary {
@@ -932,8 +998,9 @@ public:
         if (all.size() > 1) {
             const auto first = spirv(*all.front());
             const auto runtime_metadata = [](const ShaderEntry& e) {
-                return std::tie(e.binding_count, e.push_constant_bytes, e.local_size, e.lds_bytes, e.uses_code_base,
-                                e.wave64, e.subgroup_size, e.wave64_exchange, e.literal_samplers);
+                return std::tie(e.binding_count, e.declares_no_bindings, e.push_constant_bytes, e.local_size,
+                                e.lds_bytes, e.uses_code_base, e.wave64, e.subgroup_size, e.wave64_exchange,
+                                e.literal_samplers, e.root_table);
             };
             for (std::size_t i = 1; i < all.size(); ++i) {
                 if (first.empty() || runtime_metadata(*all[i]) != runtime_metadata(*all.front()) ||
@@ -960,6 +1027,78 @@ private:
         if (!value || value->kind != Json::Kind::number) return 0;
         const double n = value->number;
         return n >= 0 && n <= 4294967295.0 ? std::uint32_t(n) : 0;
+    }
+
+    static bool bounded_u32(const Json* value, std::uint32_t maximum, std::uint32_t& out) {
+        if (!value || value->kind != Json::Kind::number) return false;
+        const double n = value->number;
+        if (!(n >= 0 && n <= maximum)) return false;
+        out = std::uint32_t(n);
+        return double(out) == n;
+    }
+
+    // Duplicate contract fields are ambiguous even when the JSON reader accepts the surrounding object.
+    static bool unique_field(const Json& object, std::string_view name, const Json*& out) {
+        out = nullptr;
+        for (const auto& [key, value] : object.object) {
+            if (key != name) continue;
+            if (out) return false;
+            out = &value;
+        }
+        return true;
+    }
+
+    static bool parse_root_table(const Json& table, ShaderRootTable& out) {
+        if (table.kind != Json::Kind::object) return false;
+        const Json* dword = nullptr;
+        const Json* bytes = nullptr;
+        const Json* views = nullptr;
+        const Json* source = nullptr;
+        if (!unique_field(table, "dword", dword) || !unique_field(table, "bytes", bytes) ||
+            !unique_field(table, "constant_views", views) || !unique_field(table, "source_dword", source) ||
+            !bounded_u32(dword, 31, out.dword) ||
+            !bounded_u32(bytes, 65536, out.bytes) || !out.bytes || out.bytes % 32 ||
+            !views || views->kind != Json::Kind::array || views->array.size() > out.bytes / 32) return false;
+        out.source_dword = out.dword;
+        if (source && !bounded_u32(source, 31, out.source_dword)) return false;
+        const Json* single = nullptr;
+        if (!unique_field(table, "single_graphics_binding", single)) return false;
+        if (single) {
+            if (single->kind != Json::Kind::boolean) return false;
+            out.single_graphics_binding = single->boolean;
+            if (out.single_graphics_binding && !source) return false;
+        }
+        std::array<bool, 2048> seen{};
+        for (const Json& view : views->array) {
+            if (view.kind != Json::Kind::object) return false;
+            const Json* offset = nullptr;
+            const Json* prefix = nullptr;
+            const Json* stride = nullptr;
+            ShaderRootTable::ConstantView parsed;
+            if (!unique_field(view, "offset", offset) || !unique_field(view, "bytes", prefix) ||
+                !unique_field(view, "record_stride", stride) ||
+                !bounded_u32(offset, 65536, parsed.offset) || parsed.offset % 32 ||
+                parsed.offset > out.bytes || out.bytes - parsed.offset < 16 ||
+                !bounded_u32(prefix, 65536, parsed.bytes) || !parsed.bytes) return false;
+            if (stride && (!bounded_u32(stride, 16, parsed.record_stride) || parsed.record_stride != 16 ||
+                           parsed.bytes % 16)) return false;
+            if (seen[parsed.offset / 32]) return false;
+            seen[parsed.offset / 32] = true;
+            out.constant_views.push_back(parsed);
+        }
+        const Json* images = nullptr;
+        if (!unique_field(table, "image_offsets", images)) return false;
+        if (images) {
+            if (images->kind != Json::Kind::array || images->array.size() > out.bytes / 32) return false;
+            out.image_offsets.emplace();
+            for (const auto& item : images->array) {
+                std::uint32_t offset = 0;
+                if (!bounded_u32(&item, out.bytes - 32, offset) || offset % 32 || seen[offset / 32]) return false;
+                seen[offset / 32] = true;
+                out.image_offsets->push_back(offset);
+            }
+        }
+        return true;
     }
 
     using LookupKey = std::pair<std::string_view, std::string_view>;
@@ -1011,11 +1150,37 @@ private:
             ShaderEntry e;
             e.name = prefix + name;
             e.stage = stage->string;
+            const Json* affine = nullptr;
+            if (!unique_field(meta, "rectangle_inputs_affine", affine)) continue;
+            if (affine) {
+                if (e.stage != "vs" || affine->kind != Json::Kind::boolean) continue;
+                e.rectangle_inputs_affine = affine->boolean;
+            }
+            const Json* xy = nullptr;
+            if (!unique_field(meta, "rectangle_position_xy", xy)) continue;
+            if (xy) {
+                std::uint32_t location;
+                if (!e.rectangle_inputs_affine || !bounded_u32(xy, 31, location)) continue;
+                e.rectangle_position_xy = location;
+            }
+            const Json* table = nullptr;
+            if (!unique_field(meta, "root_table", table)) continue;
+            if (table) {
+                ShaderRootTable parsed;
+                if ((e.stage != "cs" && e.stage != "vs" && e.stage != "ps") || !parse_root_table(*table, parsed)) continue;
+                if (parsed.single_graphics_binding && (e.stage == "cs" || !parsed.image_offsets)) continue;
+                e.root_table = std::move(parsed);
+            }
             if (by_fssm) e.fssm_sha256 = hash->string;
             if (by_fspx) e.fspx_code_sha256 = code_hash->string;
             if (const Json* s = meta.find("fspx_state_sha256"); s && s->kind == Json::Kind::string)
                 e.fspx_state_sha256 = s->string;
-            if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
+            const Json* bindings = nullptr;
+            const bool unique_bindings = unique_field(meta, "bindings", bindings);
+            if (bindings && bindings->kind == Json::Kind::array) {
+                e.binding_count = bindings->array.size();
+                e.declares_no_bindings = unique_bindings && bindings->array.empty();
+            }
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
             e.lds_bytes = u32(meta.find("lds_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)

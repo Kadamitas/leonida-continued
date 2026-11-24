@@ -149,6 +149,7 @@ class FspxStage(unittest.TestCase):
         # A translation with programs publishes a non-empty index. Default the mock to one so the reuse tests keep
         # their meaning; a test that needs the empty case sets self.translations = {} itself.
         self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"synthetic module")}
+        self.program_names = ["upscaler_00"]
 
     def write_dll(self, code):
         with open(self.dll, "wb") as f:
@@ -159,6 +160,8 @@ class FspxStage(unittest.TestCase):
         if tool == "fspx_unpack.py":
             os.makedirs(os.path.join(self.unpacked, "disasm"), exist_ok=True)
             open(os.path.join(self.unpacked, "disasm", "upscaler.s"), "w").close()
+            with open(os.path.join(self.unpacked, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"file": name + ".dxbc"} for name in self.program_names], f)
         elif tool == "rdna2spirv.py":
             os.makedirs(self.spirv, exist_ok=True)
             open(os.path.join(self.spirv, "upscaler.spv"), "w").close()
@@ -179,21 +182,30 @@ class FspxStage(unittest.TestCase):
     def test_runs_once_then_nothing(self):
         self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
         (_, unpack), (_, translate) = self.calls
-        self.assertEqual(unpack, (self.dll, "--out", self.unpacked, "--disasm"))
+        self.assertEqual(unpack, (self.dll, "--out", self.unpacked, "--disasm", "--backend", "python"))
         self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
         self.assertEqual(self.run_step(), [])
 
-    def test_empty_index_is_retranslated_every_run(self):
+    def test_empty_index_fails_without_a_finished_marker(self):
         """A translation that produced no modules publishes `{}`: that is not a finished FSPX stage, and
         the build marker must not latch it as done forever (the port would silently ship with zero FSPX programs)."""
         self.translations = {}
+        for _ in range(2):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                self.run_step()
+            self.assertFalse(os.path.isfile(os.path.join(self.spirv, "index.json")))
+            self.assertFalse(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
+
+    def test_partial_nonempty_translation_fails_and_is_not_cached(self):
+        self.program_names = ["upscaler_00", "upscaler_01"]
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.run_step()
+        self.assertFalse(os.path.isfile(os.path.join(self.spirv, "index.json")))
+        self.assertFalse(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
+        self.translations["upscaler_01"] = ("d" * 64, "t" * 64, b"another synthetic module")
         self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
-        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
-            self.assertEqual(json.load(f), {})
-        self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
-        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
-        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertEqual(self.run_step(), [])
 
     def test_empty_index_drops_stale_modules_from_the_previous_run(self):
         self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"stale module")}
@@ -205,10 +217,10 @@ class FspxStage(unittest.TestCase):
         with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
             f.write("{}")
         self.translations = {}
-        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.run_step()
         self.assertFalse(os.path.exists(stale))
-        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
-            self.assertEqual(json.load(f), {})
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
 
     def test_failed_disassembly_leaves_no_marker_and_is_retried(self):
         mc = os.path.join(self.tmp.name, "fake_mc.py")
@@ -224,7 +236,8 @@ class FspxStage(unittest.TestCase):
                 self.fake_py(tool, *args)
 
         env = dict(LLVM_MC=f'"{sys.executable}" "{mc}"')
-        with mock.patch.dict(os.environ, env), mock.patch.object(make_game, "py", run_tool), \
+        with mock.patch.dict(os.environ, env), mock.patch.object(make_game, "FSPX_BACKEND", "llvm-mc"), \
+                mock.patch.object(make_game, "py", run_tool), \
                 mock.patch.object(make_game, "log", lambda *a: None):
             with self.assertRaises(SystemExit) as error, contextlib.redirect_stderr(io.StringIO()):
                 make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
@@ -236,6 +249,8 @@ class FspxStage(unittest.TestCase):
             with open(mc, "w", encoding="utf-8", newline="\n") as f:
                 f.write("print('\\ts_endpgm')\n")
             self.calls = []
+            # The real unpacker writes the same inventory as its DLL basename.
+            self.translations = {"amd_fidelityfx_upscaler_xbox": ("c" * 64, "s" * 64, b"synthetic module")}
             make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
             self.assertEqual([tool for tool, _ in self.calls], ["fspx_unpack.py", "rdna2spirv.py"])
             self.assertTrue(os.path.isfile(os.path.join(self.spirv, "index.json")))
@@ -278,6 +293,17 @@ class FspxStage(unittest.TestCase):
             self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=flags),
                              ["fspx_unpack.py", "rdna2spirv.py"])
 
+    def test_decoder_change_rebuilds_the_fspx_cache(self):
+        self.run_step()
+        original = make_game.file_sha256
+
+        def changed_decoder(path):
+            return "0" * 64 if os.path.basename(path) == "rdna2_decode.py" else original(path)
+
+        with mock.patch.object(make_game, "file_sha256", side_effect=changed_decoder):
+            self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+            self.assertEqual(self.run_step(), [])
+
     def test_same_keys_with_different_modules_fail_the_step(self):
         """Same kind 6 and same kind 0 must translate to one module; otherwise the runtime could not choose."""
         self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"module A"),
@@ -293,6 +319,7 @@ class FspxStage(unittest.TestCase):
         self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"module A"),
                              "upscaler_01": ("c" * 64, "t" * 64, b"module B"),     # Vonsek's case: other kind 0
                              "upscaler_02": ("c" * 64, "s" * 64, b"module A")}     # a duplicate of 00
+        self.program_names = list(self.translations)
         self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
 
@@ -371,6 +398,11 @@ class ShadersStageWithTheDll(unittest.TestCase):
                     # make_game checks that every unpacked shader got a non-empty listing
                     with open(os.path.join(dxbc, "disasm", "shader.s"), "w") as f:
                         f.write("s_endpgm\n")
+                elif tool == "fspx_unpack.py":
+                    out = args[args.index("--out") + 1]
+                    touch(out, "index.json")
+                    with open(os.path.join(out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                        json.dump([{"file": "upscaler_00.dxbc"}], f)
                 elif tool == "rdna2spirv.py":
                     out = args[args.index("--out") + 1]
                     touch(out, "index.json")
@@ -446,15 +478,27 @@ class FspxCacheComplete(unittest.TestCase):
         self.write_index(json.dumps({"upscaler_00": {"stage": "cs", "fspx_code_sha256": "e" * 64}}))
         self.assertFalse(make_game.fspx_cache_complete(self.spirv))
 
-    def test_existing_module_without_runtime_lookup_metadata_is_not_complete(self):
+    def test_inventory_requires_every_program_and_exact_names(self):
+        unpacked = os.path.join(self.tmp.name, "unpacked")
+        os.mkdir(unpacked)
+        for name in ("upscaler_00", "upscaler_01", "unrelated"):
+            with open(os.path.join(self.spirv, name + ".spv"), "wb") as f:
+                f.write(b"synthetic module")
+        with open(os.path.join(unpacked, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"file": name + ".dxbc"} for name in ("upscaler_00", "upscaler_01")], f)
+        for incomplete in ({"upscaler_00": {}}, {"upscaler_00": {}, "unrelated": {}}):
+            self.write_index(json.dumps(incomplete))
+            self.assertFalse(make_game.fspx_cache_complete(self.spirv, unpacked))
+        self.write_index('{"upscaler_00": {}, "upscaler_01": {}}')
+        self.assertTrue(make_game.fspx_cache_complete(self.spirv, unpacked))
+        os.remove(os.path.join(unpacked, "index.json"))
+        self.assertFalse(make_game.fspx_cache_complete(self.spirv, unpacked))
+
+    def test_metadata_failure_is_not_complete(self):
+        self.write_index('{"upscaler_00": {"error": "synthetic failure"}}')
         with open(os.path.join(self.spirv, "upscaler_00.spv"), "wb") as f:
             f.write(b"synthetic module")
-        for metadata in ({"error": "synthetic metadata failure"},
-                         {"stage": "cs", "fspx_code_sha256": "abbreviated"},
-                         {"stage": "ps", "fspx_code_sha256": "e" * 64}):
-            with self.subTest(metadata=metadata):
-                self.write_index(json.dumps({"upscaler_00": metadata}))
-                self.assertFalse(make_game.fspx_cache_complete(self.spirv))
+        self.assertFalse(make_game.fspx_cache_complete(self.spirv))
 
 
 if __name__ == "__main__":

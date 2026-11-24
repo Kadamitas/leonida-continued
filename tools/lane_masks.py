@@ -216,6 +216,9 @@ def step(state, ins, wave64=True):
             return op != "v_mov_b32"
     if "_saveexec_b" in op or "_wrexec_b" in op:
         put(state, a[0], MASK_LO if (wave64 and op.endswith("_b32")) else MASK, wave64)
+    elif (wave64 and op == "s_bitreplicate_b64_b32" and len(a) == 2 and not mods
+          and a[0].get("t") == "vcc" and a[1]["k"] == "imm"):
+        put(state, a[0], MASK, wave64)
     elif op == "s_bfm_b64":
         # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
         # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.

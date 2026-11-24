@@ -26,6 +26,7 @@ class FirstLookExitTest(unittest.TestCase):
             (tools / "pe_inspect.py").write_text(
                 "from pathlib import Path\n"
                 "import sys\n"
+                "if '--runtime-sidecars' in sys.argv: sys.exit(0)\n"
                 "report = Path(sys.argv[-1]) / (Path(sys.argv[1]).name + '.json')\n"
                 "report.write_text('{\"imports\":[{\"where\":\"shim\",\"dll\":\"stub.dll\","
                 "\"functions\":[\"Example\"]}],\"sections\":[]}', encoding='utf-8', newline='\\n')\n",

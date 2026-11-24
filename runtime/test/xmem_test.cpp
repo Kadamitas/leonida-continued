@@ -2,7 +2,7 @@
 //
 // Every function is resolved through rt::shims::find, so the test exercises the same shim table and calling
 // convention the runtime installs for xmem.dll imports instead of a private copy of the implementation. The checks
-// cover what the measured call sites use: 64-byte-aligned allocations, XMemFree, working-set statistics with the
+// cover what the measured call sites use: attribute-aligned allocations and cross-freeing, working-set statistics with the
 // size at +8, and XMemVirtualQuery's MEMORY_BASIC_INFORMATION prefix inside a zeroed 64-byte output.
 // XMemTransferMemory follows the call shape in Microsoft's public samples: TRUE for any direction and size, with
 // nothing committed, and one trace event per distinct (type, size). XMemVirtualAlloc accepts attribute words and console
@@ -39,17 +39,10 @@ using XMemResetWriteWatchFn = UINT(WINAPI*)(void*, SIZE_T);
 // BOOL XMemTransferMemory(XMEM_TRANSFER_TYPE, SIZE_T): the shape Microsoft's public NetRumble and NativeAOT-Xbox
 // samples call (see runtime/shims/xmem.cpp).
 using XMemTransferMemoryFn = BOOL(WINAPI*)(uint32_t, SIZE_T);
-// The shapes measured at a title's call sites (see runtime/shims/xmem.cpp).
 using XMemIsToolsMemAvailableFn = BOOL(WINAPI*)();
-using XMemAllocatePhysicalPagesFn = BOOL(WINAPI*)(uint64_t, uint64_t*, uint64_t*);
-using XMemFreePhysicalPagesFn = BOOL(WINAPI*)(uint64_t, const uint64_t*);
-using XMemMapPhysicalPagesFn = void*(WINAPI*)(void*, uint64_t, const uint64_t*);
-using XMemMapPhysicalPagesScatterFn = BOOL(WINAPI*)(void* const*, uint32_t, const uint64_t*);
 constexpr uint32_t kMeasuredKind = 0x20000001;
-constexpr DWORD kXmemLargePages = 0x20000000;
-constexpr DWORD kXmem64kPages = 0x20400000;
-constexpr SIZE_T kPage64k = 0x10000;
 constexpr SIZE_T kPage2m = 0x200000;
+constexpr DWORD kGuest2m = 0x20000000;
 
 int g_checks = 0;
 int g_failures = 0;
@@ -95,6 +88,56 @@ void test_alloc(XMemAllocFn alloc, XMemFreeFn free_mem) {
     free_mem(zero, 0);
     free_mem(big, 0x5e50000);
     check(true, "XMemFree accepts both blocks (no crash)");
+}
+
+void test_default_alloc(XMemAllocFn alloc, XMemFreeFn free_mem, XMemAllocFn alloc_default,
+                        XMemFreeFn free_default) {
+    // Public measured attribute word: the 64 KiB alignment is observable by callers even when the allocation
+    // itself is small. Both allocator entry points must honor it and allow the other free entry point.
+    constexpr uint64_t attributes = 0xf0814000;
+    void* const a = alloc_default(0x80, attributes);
+    void* const b = alloc(0x60000, attributes);
+    check(a && (reinterpret_cast<uintptr_t>(a) & 0xffff) == 0,
+          "XMemAllocDefault honors the measured 64 KiB alignment");
+    check(b && (reinterpret_cast<uintptr_t>(b) & 0xffff) == 0,
+          "XMemAlloc shares the measured 64 KiB alignment");
+    if (a) {
+        std::memset(a, 0x5a, 0x80);
+        check(static_cast<uint8_t*>(a)[0x7f] == 0x5a, "the default allocation holds the requested byte range");
+    }
+    if (b) {
+        static_cast<uint8_t*>(b)[0x5ffff] = 0xa5;
+        check(static_cast<uint8_t*>(b)[0x5ffff] == 0xa5, "the regular allocation holds the requested byte range");
+    }
+    free_mem(a, attributes);
+    free_default(b, attributes);
+    check(true, "both allocators can be released by the opposite free routine");
+
+    void* const zero = alloc_default(0, 0);
+    check(aligned_64(zero), "XMemAllocDefault(0) returns a stable aligned block");
+    if (zero) {
+        static_cast<uint8_t*>(zero)[0] = 0x37;
+        check(static_cast<uint8_t*>(zero)[0] == 0x37, "the default zero-byte allocation has one writable byte");
+    }
+    free_default(zero, 0);
+    free_default(nullptr, 0);
+    check(alloc_default((std::numeric_limits<size_t>::max)(), 0) == nullptr,
+          "an impossible default heap allocation reports failure");
+
+    // The independently measured page-size code also supplies the coarse alignment when its explicit
+    // alignment exponent is smaller (FSR's public call-site word).
+    void* const page = alloc_default(256, 0xa8004000);
+    check(page && (reinterpret_cast<uintptr_t>(page) & 0xffff) == 0,
+          "the 64 KiB page code supplies alignment with a smaller exponent");
+    free_default(page, 0xa8004000);
+
+    // Do not spend GiB of heap padding, or claim success with a pointer that is less aligned than requested.
+    SetLastError(ERROR_SUCCESS);
+    check(alloc_default(1, uint64_t{31} << 24) == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
+          "the default allocator explicitly rejects unsupported GiB alignment");
+    SetLastError(ERROR_SUCCESS);
+    check(alloc(1, uint64_t{22} << 24) == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
+          "the regular allocator rejects alignment above the supported 2 MiB limit");
 }
 
 void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
@@ -233,34 +276,6 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
           "write-watch records writes again after reset");
 
     check(VirtualFree(base, 0, MEM_RELEASE), "release the synthetic write-watch region");
-
-    // 2 MiB guest pages: the region is 2 MiB-aligned, rounded up to whole 2 MiB pages and committed.
-    void* const large_page = virtual_alloc(nullptr, kPage2m + page_size, MEM_RESERVE | MEM_COMMIT | kXmemLargePages,
-                                           0x183, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE | PAGE_GRAPHICS_COHERENT);
-    check(large_page != nullptr, "XMemVirtualAlloc commits 2 MiB guest pages");
-    if (large_page) {
-        check((reinterpret_cast<uintptr_t>(large_page) & (kPage2m - 1)) == 0, "a 2 MiB-page region is 2 MiB-aligned");
-        MEMORY_BASIC_INFORMATION info{};
-        VirtualQuery(large_page, &info, sizeof(info));
-        check(info.State == MEM_COMMIT && info.RegionSize >= 2 * kPage2m && info.Protect == PAGE_READWRITE,
-              "a 2 MiB-page region is rounded up to whole pages, committed read-write without the graphics bits");
-        static_cast<volatile uint8_t*>(large_page)[2 * kPage2m - 1] = 0x77;
-        check(VirtualFree(large_page, 0, MEM_RELEASE), "release the 2 MiB-page region");
-    }
-
-    // The attribute word is accepted (every measured call passes a nonzero one) and the protection loses its graphics
-    // bits, in the 64 KiB page mode as well.
-    void* const attributed = virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT | kXmem64kPages, 0x181,
-                                           PAGE_READWRITE | PAGE_GRAPHICS_READWRITE);
-    check(attributed != nullptr, "XMemVirtualAlloc accepts a nonzero attribute word and console protection bits");
-    if (attributed) {
-        MEMORY_BASIC_INFORMATION info{};
-        VirtualQuery(attributed, &info, sizeof(info));
-        check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
-              "the region is committed PAGE_READWRITE (graphics bits dropped)");
-        static_cast<volatile uint8_t*>(attributed)[0] = 0x42;
-        check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed region");
-    }
 
     // The retail executable's GPU pools: the attribute word is recorded, and the PAGE_GRAPHICS_* bits are dropped.
     MEMORY_BASIC_INFORMATION mbi{};
@@ -724,8 +739,64 @@ void test_write_combine_window(const PhysicalApi& api) {
     check(api.free_pages(1, &page) == TRUE, "free the write-combine window's page");
 }
 
+void test_large_virtual_alloc(XMemVirtualAllocFn virtual_alloc) {
+    // A measured reserve+commit form, with graphics access/coherence flags: this must work without the host's
+    // large-page privilege while preserving the guest's base alignment, size and CPU access.
+    void* const committed = virtual_alloc(nullptr, kPage2m + 4096, MEM_RESERVE | MEM_COMMIT | kGuest2m, 0x183, 0x22004);
+    check(committed != nullptr, "the 2 MiB graphics-coherent allocation form succeeds");
+    if (committed) {
+        check((reinterpret_cast<uintptr_t>(committed) & (kPage2m - 1)) == 0, "the new region is 2 MiB-aligned");
+        MEMORY_BASIC_INFORMATION info{};
+        check(VirtualQuery(committed, &info, sizeof(info)) && info.AllocationBase == committed &&
+                  info.State == MEM_COMMIT && info.RegionSize == 2 * kPage2m && info.Protect == PAGE_READWRITE,
+              "2 MiB plus 4 KiB rounds to a single 4 MiB committed read/write region");
+        auto* const bytes = static_cast<uint8_t*>(committed);
+        bytes[2 * kPage2m - 1] = 0x6d;
+        check(bytes[2 * kPage2m - 1] == 0x6d, "the last rounded byte is committed and writable");
+        check(VirtualFree(committed, 0, MEM_RELEASE), "one VirtualFree releases the whole aligned region");
+    }
+
+    void* const reserved = virtual_alloc(nullptr, 2 * kPage2m, MEM_RESERVE | kGuest2m, 0x283, PAGE_READWRITE);
+    check(reserved != nullptr, "a 2 MiB-page reservation starts uncommitted");
+    if (reserved) {
+        auto* const second = static_cast<uint8_t*>(reserved) + kPage2m;
+        void* const result = virtual_alloc(second + 123, 1, MEM_COMMIT | kGuest2m, 0x183, 0x2004);
+        check(result == second, "an existing-address byte commit rounds down to its 2 MiB guest page");
+        MEMORY_BASIC_INFORMATION first{}, last{};
+        check(VirtualQuery(reserved, &first, sizeof(first)) && first.State == MEM_RESERVE && first.RegionSize == kPage2m,
+              "committing the second guest page leaves the first reserved");
+        check(VirtualQuery(second, &last, sizeof(last)) && last.State == MEM_COMMIT &&
+                  last.RegionSize == kPage2m && last.Protect == PAGE_READWRITE,
+              "the byte commit expands to the whole second guest page");
+        if (result == second) {
+            second[kPage2m - 1] = 0x49;
+            check(second[kPage2m - 1] == 0x49, "the expanded commit covers its last byte");
+        }
+        check(VirtualFree(reserved, 0, MEM_RELEASE), "release the partially committed reservation");
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    check(virtual_alloc(nullptr, (std::numeric_limits<SIZE_T>::max)(), MEM_RESERVE | MEM_COMMIT | kGuest2m,
+                        0x183, PAGE_READWRITE) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "overflowing 2 MiB size rounding fails before allocation");
+    SetLastError(ERROR_SUCCESS);
+    check(virtual_alloc(reinterpret_cast<void*>((std::numeric_limits<uintptr_t>::max)() - 15), 64,
+                        MEM_COMMIT | kGuest2m, 0x183, PAGE_READWRITE) == nullptr &&
+              GetLastError() == ERROR_INVALID_PARAMETER,
+          "overflowing an existing-address range fails before allocation");
+    SetLastError(ERROR_SUCCESS);
+    check(virtual_alloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT | 0x00400000, 0, PAGE_READWRITE) == nullptr &&
+              GetLastError() == ERROR_INVALID_PARAMETER,
+          "an invalid guest page-size combination is rejected");
+    SetLastError(ERROR_SUCCESS);
+    check(virtual_alloc(nullptr, 0, MEM_RESERVE | MEM_COMMIT | kGuest2m, 0, PAGE_READWRITE) == nullptr &&
+              GetLastError() == ERROR_INVALID_PARAMETER,
+          "zero-byte virtual allocations remain invalid");
+}
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
-void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
+void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc,
+                          XMemAllocFn alloc_default, XMemFreeFn free_default) {
     wchar_t temp[MAX_PATH];
     GetTempPathW(MAX_PATH, temp);
     const std::wstring path =
@@ -744,6 +815,10 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     free_mem(b, 0x5e50000);  // same word again: no second event
     free_mem(c, 0x99);
     free_mem(nullptr, 0x77);  // a free-only word is recorded too
+    void* const d = alloc_default(24, 0x99);
+    void* const e = alloc_default(32, 0x99);
+    free_default(d, 0x99);
+    free_default(e, 0x99);
     void* const v = virtual_alloc ? virtual_alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x183, PAGE_READWRITE)
                                   : nullptr;
     if (v) VirtualFree(v, 0, MEM_RELEASE);
@@ -758,7 +833,7 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
         for (size_t at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1)) ++n;
         return n;
     };
-    check(count("\"kind\":\"xmem_attributes\"") == 6, "six events: two XMemAlloc words, three XMemFree words and one XMemVirtualAlloc word");
+    check(count("\"kind\":\"xmem_attributes\"") == 8, "eight events include distinct default-allocation API names");
     check(count("\"api\":\"XMemVirtualAlloc\",\"attributes\":\"0x183\",\"size\":65536") == 1,
           "XMemVirtualAlloc 0x183 is recorded once, with its size");
     check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x5e50000\",\"size\":4096") == 1,
@@ -767,7 +842,11 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x5e50000\"") == 1, "XMemFree 0x5e50000 is recorded once");
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
     check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
-    check(count("\"caller\":\"") == 6, "every event names its caller");
+    check(count("\"api\":\"XMemAllocDefault\",\"attributes\":\"0x99\",\"size\":24") == 1,
+          "the default allocator records its own API once with its first size");
+    check(count("\"api\":\"XMemFreeDefault\",\"attributes\":\"0x99\"") == 1,
+          "the default free records its own API once");
+    check(count("\"caller\":\"") == 8, "every event names its caller");
     DeleteFileW(path.c_str());
 }
 
@@ -905,6 +984,10 @@ int main() {
 
     const auto alloc = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAlloc"));
     const auto free_mem = reinterpret_cast<XMemFreeFn>(rt::shims::find("xmem.dll", "XMemFree"));
+    const auto alloc_default = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAllocDefault"));
+    const auto free_default = reinterpret_cast<XMemFreeFn>(rt::shims::find("xmem.dll", "XMemFreeDefault"));
+    const auto tools_available =
+        reinterpret_cast<XMemIsToolsMemAvailableFn>(rt::shims::find("xmem.dll", "XMemIsToolsMemAvailable"));
     const auto query = reinterpret_cast<XMemVirtualQueryFn>(rt::shims::find("xmem.dll", "XMemVirtualQuery"));
     const auto get_stats =
         reinterpret_cast<XMemGetWorkingSetStatisticsFn>(rt::shims::find("xmem.dll", "XMemGetWorkingSetStatistics"));
@@ -919,6 +1002,9 @@ int main() {
 
     check(alloc != nullptr, "registry exposes xmem.dll!XMemAlloc");
     check(free_mem != nullptr, "registry exposes xmem.dll!XMemFree");
+    check(alloc_default != nullptr, "registry exposes xmem.dll!XMemAllocDefault");
+    check(free_default != nullptr, "registry exposes xmem.dll!XMemFreeDefault");
+    check(tools_available != nullptr, "registry exposes xmem.dll!XMemIsToolsMemAvailable");
     check(query != nullptr, "registry exposes xmem.dll!XMemVirtualQuery");
     check(get_stats != nullptr, "registry exposes xmem.dll!XMemGetWorkingSetStatistics");
     check(virtual_alloc != nullptr, "registry exposes xmem.dll!XMemVirtualAlloc");
@@ -926,37 +1012,21 @@ int main() {
     check(reset_write_watch != nullptr, "registry exposes xmem.dll!XMemResetWriteWatch");
     check(transfer != nullptr, "registry exposes xmem.dll!XMemTransferMemory");
 
-    const auto alloc_default = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAllocDefault"));
-    const auto free_default = reinterpret_cast<XMemFreeFn>(rt::shims::find("xmem.dll", "XMemFreeDefault"));
-    const auto tools_mem =
-        reinterpret_cast<XMemIsToolsMemAvailableFn>(rt::shims::find("xmem.dll", "XMemIsToolsMemAvailable"));
-    const PhysicalApi physical{
-        virtual_alloc,
-        reinterpret_cast<XMemAllocatePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages")),
-        reinterpret_cast<XMemFreePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages")),
-        reinterpret_cast<XMemMapPhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages")),
-        reinterpret_cast<XMemMapPhysicalPagesScatterFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPagesScatter")),
-    };
-    check(alloc_default != nullptr, "registry exposes xmem.dll!XMemAllocDefault");
-    check(free_default != nullptr, "registry exposes xmem.dll!XMemFreeDefault");
-    check(tools_mem != nullptr, "registry exposes xmem.dll!XMemIsToolsMemAvailable");
-    check(physical.allocate != nullptr, "registry exposes xmem.dll!XMemAllocatePhysicalPages");
-    check(physical.free_pages != nullptr, "registry exposes xmem.dll!XMemFreePhysicalPages");
-    check(physical.map != nullptr, "registry exposes xmem.dll!XMemMapPhysicalPages");
-    check(physical.scatter != nullptr, "registry exposes xmem.dll!XMemMapPhysicalPagesScatter");
-
-    if (!alloc || !free_mem || !query || !get_stats) {
+    if (!alloc || !free_mem || !query || !get_stats || !alloc_default || !free_default || !tools_available) {
         print_result();
         return 1;
     }
 
     test_alloc(alloc, free_mem);
+    test_default_alloc(alloc, free_mem, alloc_default, free_default);
+    check(tools_available() == FALSE, "a desktop process does not advertise devkit tools memory");
     test_working_set(get_stats);
     test_virtual_query(query);
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
+        test_large_virtual_alloc(virtual_alloc);
     }
-    test_attribute_trace(alloc, free_mem, virtual_alloc);
+    test_attribute_trace(alloc, free_mem, virtual_alloc, alloc_default, free_default);
     if (transfer) {
         test_transfer_memory(transfer);
         test_transfer_trace(transfer);

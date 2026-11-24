@@ -103,8 +103,10 @@ int main() {
         EXPECT(f.counts[bindless::sampler_binding] == 4000 - bindless::reserved_samplers);
         EXPECT(f.counts[bindless::sampler_binding] > 2048);  // a full sampler heap and the fallback
         EXPECT(storage(f, D::dim_2d) == bindless::max_storage_indices);
-        EXPECT(storage(f, D::dim_2d_array) == 1024 && storage(f, D::dim_3d) == 256 && storage(f, D::dim_1d) == 256);
-        EXPECT(count(f, D::dim_2d_array) == 1024 && count(f, D::dim_3d) == 256 && count(f, D::dim_1d) == 256);
+        EXPECT(storage(f, D::dim_2d_array) == bindless::max_storage_indices &&
+               storage(f, D::dim_3d) == bindless::max_3d_images && storage(f, D::dim_1d) == 256);
+        EXPECT(count(f, D::dim_2d_array) == bindless::max_2d_array_images &&
+               count(f, D::dim_3d) == bindless::max_3d_images && count(f, D::dim_1d) == 256);
         EXPECT(f.ms_samples[0] == VK_SAMPLE_COUNT_4_BIT && f.ms_samples[2] == VK_SAMPLE_COUNT_4_BIT);
         EXPECT(storage_consistent(f));
         if (update_after_bind)

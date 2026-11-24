@@ -39,6 +39,7 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <new>
 #include <mutex>
 #include <vector>
 
@@ -46,6 +47,7 @@ namespace leonida {
 
 // HRESULT values as plain numbers, so this header stands alone.
 namespace pacer_hr {
+inline constexpr std::int32_t out_of_memory = std::int32_t(0x8007000E);
 inline constexpr std::int32_t ok = 0;
 inline constexpr std::int32_t false_ = 1;                                  // S_FALSE
 inline constexpr std::int32_t invalid_arg = std::int32_t(0x80070057);      // E_INVALIDARG
@@ -113,6 +115,7 @@ inline constexpr std::uint32_t frame_event_flip = 2;
 inline constexpr std::uint32_t frame_event_count = 3;
 // Issue a consecutive frame token even when WaitFrameEventX(origin, ...) times out (returns S_FALSE).
 inline constexpr std::uint32_t frame_wait_flag_token_on_timeout = 2;
+inline constexpr std::uint32_t frame_wait_process_token_on_timeout = frame_wait_flag_token_on_timeout;
 // Statistics types (bit mask). Interval and render entries are never produced here.
 inline constexpr std::uint32_t stat_frame_interval = 0x01;
 inline constexpr std::uint32_t stat_frame_event = 0x02;
@@ -237,12 +240,24 @@ public:
     std::int32_t wait_frame_event(std::uint32_t event, std::uint32_t timeout_ms, std::uint32_t flags,
                                   std::uint64_t* token) {
         if (event >= frame_event_count) return pacer_hr::invalid_arg;
-        if (event == frame_event_origin && !token) return pacer_hr::invalid_arg;
+        if ((event == frame_event_origin && !token) || (flags & ~frame_wait_flag_token_on_timeout))
+            return pacer_hr::invalid_arg;
         std::unique_lock lock(mutex_);
         ++waiters_;
-        const std::int32_t result = wait_locked(lock, event, timeout_ms, flags, token);
+        std::int32_t result;
+        try { result = wait_locked(lock, event, timeout_ms, flags, token); }
+        catch (const std::bad_alloc&) { result = pacer_hr::out_of_memory; }
         if (--waiters_ == 0) cv_.notify_all();
         return result;
+    }
+
+    bool issued_token(std::uint64_t token) const {
+        std::lock_guard guard(mutex_);
+        return token && token <= issued_;
+    }
+    std::uint64_t last_issued_token() const {
+        std::lock_guard guard(mutex_);
+        return issued_;
     }
 
     // GetFrameStatisticsX(token, type_mask, &count, array). `count` is the room in `out` on entry and the number of
@@ -266,7 +281,7 @@ public:
             found[n++] = FrameStatistic{type, 0, token, time, type == stat_display ? record->percent_scanned : 0.0f};
         };
         if (record) {
-            add(stat_frame_event, true, record->origin_us);
+            add(stat_frame_event, record->origin_observed, record->origin_us);
             add(stat_present, record->presented, record->present_us);
             add(stat_display, record->displayed, record->display_us);
         } else {
@@ -461,6 +476,7 @@ private:
         std::uint64_t token = 0, origin_us = 0, present_us = 0, display_us = 0;
         std::uint64_t due_us = 0;  // vblank after this token's origin, fixed when issued
         float percent_scanned = 0.0f;
+        bool origin_observed = true;
         bool presented = false, displayed = false;
     };
 
@@ -504,20 +520,23 @@ private:
         return event_armed_[0] || event_armed_[1] || event_armed_[2];
     }
 
-    std::uint64_t issue_token_locked(std::uint64_t origin_us, std::uint64_t due_us) {
-        const std::uint64_t tok = ++issued_;
+    std::uint64_t issue_token_locked(std::uint64_t origin_us, std::uint64_t due_us, bool observed = true) {
+        const std::uint64_t tok = issued_ + 1;
         Record record;
         record.token = tok;
         record.origin_us = origin_us;
+        record.origin_observed = observed;
         record.due_us = due_us;
         records_.push_back(record);
         if (records_.size() > 64) records_.pop_front();
+        issued_ = tok;
         return tok;
     }
 
     std::int32_t wait_locked(std::unique_lock<std::mutex>& lock, std::uint32_t event, std::uint32_t timeout_ms,
                              std::uint32_t flags, std::uint64_t* token) {
         const bool is_origin = (event == frame_event_origin);
+        if (is_origin && issued_ == (std::numeric_limits<std::uint64_t>::max)()) return pacer_hr::invalid_state;
         const bool token_on_timeout = (flags & frame_wait_flag_token_on_timeout) != 0;
         const std::uint64_t start = clock_.now_us();
         const std::uint64_t give_up = timeout_ms == infinite_timeout_ms ? no_deadline
@@ -556,7 +575,7 @@ private:
             if (give_up != no_deadline && now >= give_up) {
                 if (is_origin && token_on_timeout) {
                     // Frame started early on timeout: issue a consecutive token without consuming the tick.
-                    *token = issue_token_locked(now, next_us - offset + period_us_);
+                    *token = issue_token_locked(now, next_us - offset + period_us_, false);
                     return pacer_hr::false_;
                 }
                 return token_on_timeout ? pacer_hr::false_ : pacer_hr::timeout;

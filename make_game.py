@@ -71,6 +71,7 @@ TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import install_hint as mc_install_hint, mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
+from pe_inspect import PeFormatError, runtime_sidecars  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 from stale_build import newer_sources  # noqa: E402
@@ -845,12 +846,22 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
             "with CMake as described in README.md)")
 
 
+def runtime_files(build: str) -> tuple[str, ...]:
+    loader = os.path.join(build, "gta6rt.exe")
+    if not os.path.isfile(loader):
+        return RUNTIME_FILES
+    try:
+        return RUNTIME_FILES + runtime_sidecars(loader)
+    except (OSError, PeFormatError) as e:
+        fail(f"runtime: could not read imports from {loader}: {e}")
+
+
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
               emulate: bool = False, keep_emulated: bool = False,
               fallbacks: tuple[str, ...] = (), jobs: int = 1) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     if "runtime" in stages and runtime_build:
-        absent = [n for n in RUNTIME_FILES if not os.path.isfile(os.path.join(runtime_build, n))]
+        absent = [n for n in runtime_files(runtime_build) if not os.path.isfile(os.path.join(runtime_build, n))]
         if absent:
             fail(f"--runtime-build: {runtime_build} has no {' or '.join(absent)}")
     missing = []
@@ -1373,6 +1384,7 @@ def native_pso_hashes(dxbc: str, spirv: str) -> None:
 
 
 FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
+FSPX_BACKEND = "python"  # preserves dot4 half selects and the kind-0 wave mode
 # What the FSPX outputs come from, with TRANSLATION_SOURCES. fspx_unpack.py --disasm imports shader_disasm.py
 # (tools/fspx_unpack.py:205), which decodes through rdna2_decode.py, its tables and mc_command.py: the listings these
 # three produce are what rdna2spirv.py translates, so an edited decoder must rebuild the cache, not be reused from it.
@@ -1388,31 +1400,35 @@ def file_sha256(path: str) -> str:
 
 
 def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
-    """What the FSPX outputs depend on, as one line: the DLL, the unpacking and translating tools, llvm-mc, the
+    """What the FSPX outputs depend on, as one line: the DLL, the unpacking, decoding and translating tools, the
     wave64 mode and the fallback flags."""
     tools = hashlib.sha256()
     for name in FSPX_TOOLS:
         tools.update(f"{name}\0".encode() + bytes.fromhex(file_sha256(os.path.join(TOOLS, name))))
     return json.dumps({"dll": file_sha256(dll), "tools": tools.hexdigest(), "translator": translation_sources_digest(),
-                       "llvm_mc": mc_signature, "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)},
+                       "backend": FSPX_BACKEND, "llvm_mc": mc_signature,
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)},
                       sort_keys=True)
 
 
-def fspx_cache_complete(spirv: str) -> bool:
-    """Require a runtime-addressable compute program and all of the modules in the saved translation index."""
+def fspx_cache_complete(spirv: str, unpacked: str | None = None) -> bool:
+    """Require all named modules and, when supplied, the exact unpacked program inventory.
+    A non-empty translation index alone can still omit programs the translator refused."""
     try:
         index = json.loads(read_shader_setting(os.path.join(spirv, "index.json")))
     except ValueError:
         return False
-    if not isinstance(index, dict):
+    if not isinstance(index, dict) or not index or not all(
+            isinstance(meta, dict) and "error" not in meta
+            and os.path.isfile(os.path.join(spirv, name + ".spv")) for name, meta in index.items()):
         return False
-    # The translator can write a module with an error-only metadata row. Such a module has no runtime lookup key.
-    has_compute_key = any(
-        isinstance(meta, dict) and meta.get("stage") == "cs"
-        and isinstance(meta.get("fspx_code_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", meta["fspx_code_sha256"])
-        for meta in index.values()
-    )
-    return has_compute_key and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+    if unpacked is None:
+        return True
+    try:
+        expected = shader_stems(os.path.join(unpacked, "index.json"), "file", ".dxbc")
+    except (OSError, ValueError):
+        return False
+    return bool(expected) and set(index) == expected
 
 
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
@@ -1432,7 +1448,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
         log(f"shaders: no {FSPX_DLL} in the game folder, so no FSPX programs to translate")
         return
     settings = fspx_settings(dll, mc_signature, emulate, fallbacks)
-    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
+    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv, unpacked):
         return
     log(f"shaders: unpacking and translating the FSPX programs of {FSPX_DLL}")
     drop(translated, settings_file)
@@ -1443,10 +1459,14 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
                 for entry in entries:
                     if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
-    py("fspx_unpack.py", dll, "--out", unpacked, "--disasm")
+    py("fspx_unpack.py", dll, "--out", unpacked, "--disasm", "--backend", FSPX_BACKEND)
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
     py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
     verify_fspx_key_clash(spirv, translated, "FSPX")
+    if not fspx_cache_complete(spirv, unpacked):
+        drop(translated)
+        fail("shaders: FSPX translation did not produce one validated module for every unpacked program. "
+             "The incomplete index is not kept; inspect the translator's refusal counts before retrying.")
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
 
@@ -2408,12 +2428,14 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         destinations.append("shader_path.txt")
     if os.name != "nt":
         destinations.append("gta6rt.sh")
-    # Check the complete set before compiling or copying, so a later conflict leaves the old runtime usable.
-    for name in destinations:
-        destination = os.path.join(out, name)
-        if os.path.isdir(destination):
-            fail(f"runtime: {destination} is a directory and the runtime needs it as a file. "
-                 "Use another --out folder or move the directory before retrying.")
+    def check_destinations(names):
+        for name in names:
+            destination = os.path.join(out, name)
+            if os.path.isdir(destination):
+                fail(f"runtime: {destination} is a directory and the runtime needs it as a file. "
+                     "Use another --out folder or move the directory before retrying.")
+
+    check_destinations(destinations)
 
     if runtime_build:
         log(f"runtime: using the build in {runtime_build}")
@@ -2425,7 +2447,9 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         run([windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
              os.path.join(ROOT, "scripts", "build_runtime.ps1"), "-Jobs", str(jobs)])
         build = os.path.join(ROOT, "runtime", "build")
-    artifacts = [os.path.join(build, name) for name in RUNTIME_FILES]
+    files = runtime_files(build)
+    check_destinations(name for name in files if name not in RUNTIME_FILES)
+    artifacts = [os.path.join(build, name) for name in files]
     for built in artifacts:
         if not os.path.isfile(built):
             fail(f"runtime: {'build did not produce' if not runtime_build else 'no'} {built}")
@@ -2876,7 +2900,7 @@ def main() -> int:
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     ap.add_argument("--runtime-build", metavar="DIR", type=nonempty_path,
-                    help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
+                    help="a Windows build of runtime/ (gta6rt.exe and its runtime DLLs) for the runtime stage "
                          "instead of building it (off Windows: instead of the clang-cl + xwin cross-build); "
                          "on Windows, also use vk_pipeline_check.exe from DIR if present")
     ap.add_argument("--wave64-emulate", choices=WAVE64_MODES, default="auto",

@@ -146,19 +146,7 @@ bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<
     std::memcpy(&chunk_count, bytes + 28, sizeof(chunk_count));
     if (chunk_count == 0 || chunk_count > 16 || static_cast<size_t>(chunk_count) * 4 > size - 32) return false;
 
-    // Verify the incoming container hash before rewriting: a corrupted blob must reach the host deserializer
-    // unchanged so it is rejected, rather than getting a freshly forged valid hash. Host d3d12.dll accepts a
-    // matching DXBC checksum or an all-zero one and rejects any other with E_INVALIDARG, so an all-zero checksum
-    // is accepted here too and stays zero in the rewritten blob.
-    constexpr uint8_t kZeroHash[16] = {};
-    const bool zero_hash = std::memcmp(bytes + 4, kZeroHash, sizeof(kZeroHash)) == 0;
-    if (!zero_hash) {
-        uint32_t expected_hash[4];
-        dxbc_checksum(bytes, size, expected_hash);
-        if (std::memcmp(expected_hash, bytes + 4, sizeof(expected_hash)) != 0) return false;
-    }
-
-    // Fail closed on any malformed chunk-table entry (5c3487a94).
+    // Validate each chunk's declared range before changing the container.
     const size_t min_chunk_off = 32 + static_cast<size_t>(chunk_count) * 4;
     bool found_rts0 = false;
     uint32_t rts0_off = 0;
@@ -187,6 +175,15 @@ bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<
     const uint32_t cleared = static_cast<uint32_t>(clear_high_byte(
         static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags)));
     if (cleared == flags) return false;  // no Xbox high byte
+
+    // A flagged, structurally valid blob is the only path that needs its input hash checked.
+    constexpr uint8_t kZeroHash[16] = {};
+    const bool zero_hash = std::memcmp(bytes + 4, kZeroHash, sizeof(kZeroHash)) == 0;
+    if (!zero_hash) {
+        uint32_t expected_hash[4];
+        dxbc_checksum(bytes, size, expected_hash);
+        if (std::memcmp(expected_hash, bytes + 4, sizeof(expected_hash)) != 0) return false;
+    }
 
     out.assign(bytes, bytes + size);
     std::memcpy(out.data() + rts0_off + 8 + 20, &cleared, sizeof(cleared));

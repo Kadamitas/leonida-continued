@@ -31,6 +31,8 @@
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#include "input_user_bridge.h"
+
 namespace {
 
 // ---- Public GDK types (XUser.h, as the GDK reference documents them) ----
@@ -157,6 +159,7 @@ HRESULT CALLBACK add_provider(XAsyncOp op, const XAsyncProviderData* data) {
     case XAsyncOp::GetResult:
         if (data->bufferSize < sizeof(XUserHandle) || !data->buffer) return E_INVALIDARG;
         *static_cast<XUserHandle*>(data->buffer) = new_handle();
+        rt::input_user::added_to_title();
         return S_OK;
     default:
         return S_OK;
@@ -177,6 +180,7 @@ HRESULT CALLBACK add_by_id_provider(XAsyncOp op, const XAsyncProviderData* data)
     case XAsyncOp::GetResult:
         if (data->bufferSize < sizeof(XUserHandle) || !data->buffer) return E_INVALIDARG;
         *static_cast<XUserHandle*>(data->buffer) = new_handle();
+        rt::input_user::added_to_title();
         return S_OK;
     default:
         return S_OK;
@@ -221,7 +225,8 @@ HRESULT STDMETHODCALLTYPE user_get_local_id(void*, XUserHandle user, XUserLocalI
 HRESULT STDMETHODCALLTYPE user_find_by_local_id(void*, XUserLocalId id, XUserHandle* handle) {
     if (!handle) return E_POINTER;
     *handle = nullptr;
-    if (id.value != kOfflineLocalId) return E_GAMEUSER_USER_NOT_FOUND;
+    if (id.value != kOfflineLocalId || !rt::input_user::user_added.load(std::memory_order_acquire))
+        return E_GAMEUSER_USER_NOT_FOUND;
     *handle = new_handle();
     return S_OK;
 }
@@ -238,7 +243,8 @@ HRESULT STDMETHODCALLTYPE user_get_id(void*, XUserHandle user, uint64_t* id) {
 HRESULT STDMETHODCALLTYPE user_find_by_id(void*, uint64_t id, XUserHandle* handle) {
     if (!handle) return E_POINTER;
     *handle = nullptr;
-    if (id != kOfflineXuid) return E_GAMEUSER_USER_NOT_FOUND;
+    if (id != kOfflineXuid || !rt::input_user::user_added.load(std::memory_order_acquire))
+        return E_GAMEUSER_USER_NOT_FOUND;
     *handle = new_handle();
     return S_OK;
 }

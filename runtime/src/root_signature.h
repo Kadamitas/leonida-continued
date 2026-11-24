@@ -10,6 +10,8 @@
 // limit, root views (CBV/SRV/UAV) cost 2, 32-bit constants cost their count.
 #pragma once
 
+#include "root_signature_export.h"
+
 #include <array>
 #include <cstdint>
 #include <string>
@@ -51,6 +53,24 @@ struct DescriptorRange {
     uint32_t flags = 0;
     uint32_t offset_in_table = 0;  // OffsetInDescriptorsFromTableStart, or kRangeOffsetAppend
 };
+
+// The descriptor range type at one table slot, or UINT32_MAX for an absent, overlapping or
+// unrepresentable range. APPEND follows the previous range, including when offsets are out of order.
+inline uint32_t table_slot_type(const std::vector<DescriptorRange>& ranges, uint32_t slot) {
+    uint64_t next = 0;
+    constexpr uint64_t limit = uint64_t{1} << 32;
+    uint32_t type = UINT32_MAX;
+    for (const auto& range : ranges) {
+        const uint64_t start = range.offset_in_table == kRangeOffsetAppend ? next : range.offset_in_table;
+        if (!range.num_descriptors || start >= limit) return UINT32_MAX;
+        next = range.num_descriptors == UINT32_MAX ? limit : start + range.num_descriptors;
+        if (next > limit) return UINT32_MAX;
+        if (slot < start || slot >= next) continue;
+        if (type != UINT32_MAX || range.range_type > 3) return UINT32_MAX;
+        type = range.range_type;
+    }
+    return type;
+}
 
 // Static sampler: no user-SGPR dwords; registered in the hash table instead.
 struct StaticSampler {
@@ -115,7 +135,7 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 // Fails (ok == false) when the signature needs more than 32 user SGPRs
 // (spill layout unknown: refuse, do not guess) or exceeds the 64-dword
 // D3D12 cost limit, or holds more than 64 root parameters.
-[[nodiscard]] PackResult pack(const RootSignature& sig);
+[[nodiscard]] GTA6RT_ROOTSIG_API PackResult pack(const RootSignature& sig);
 
 // The console layout of root arguments in a stage's user SGPRs (docs/d3d12_vulkan.md section 3.5, D3D-448).
 //
@@ -176,7 +196,7 @@ struct StagePackResult {
 
 // Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, a
 // constant parameter of 0 values or the 64-dword cost limit, and on any parameter that would spill.
-[[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
+[[nodiscard]] GTA6RT_ROOTSIG_API StagePackResult pack_stage(const RootSignature& sig, Stage stage);
 
 // D3D12 cost of one parameter against the 64-dword limit.
 [[nodiscard]] constexpr uint32_t param_cost(ParamType type, uint32_t num_values) noexcept {
@@ -198,7 +218,7 @@ struct StagePackResult {
 // Static samplers carry their flags dword only in version 1.2 signatures, so
 // 1.0/1.1 encodings are unchanged. Codec version 2 stores all six range
 // fields (version 1 stored only type and count, and is no longer read).
-[[nodiscard]] std::vector<uint8_t> encode_canonical(const RootSignature& sig);
+[[nodiscard]] GTA6RT_ROOTSIG_API std::vector<uint8_t> encode_canonical(const RootSignature& sig);
 
 struct DecodeResult {
     bool ok = false;
@@ -206,7 +226,7 @@ struct DecodeResult {
     RootSignature sig;
 };
 
-[[nodiscard]] DecodeResult decode_canonical(const uint8_t* data, size_t size);
+[[nodiscard]] GTA6RT_ROOTSIG_API DecodeResult decode_canonical(const uint8_t* data, size_t size);
 
 // RTS0 chunk parser (payload layout per the maintainer: offset table).
 //
@@ -225,6 +245,6 @@ struct DecodeResult {
 // A range record follows D3D12_DESCRIPTOR_RANGE1 order: type, count, base
 // register, space, then Flags (1.1/1.2 only) BEFORE the table offset.
 // Returns ok == false with a reason for unknown versions or truncation.
-[[nodiscard]] DecodeResult parse_rts0(const uint8_t* data, size_t size);
+[[nodiscard]] GTA6RT_ROOTSIG_API DecodeResult parse_rts0(const uint8_t* data, size_t size);
 
 }  // namespace rt::rootsig

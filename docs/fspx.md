@@ -253,6 +253,24 @@ it is now refused (`fall-through into undecodable words`): programs 04, 05, 06, 
 26 of 29 translated and passed before the change, **20 of 29** after it; the 20 kept give byte-identical SPIR-V, and
 8 of the 9 refused stop at a fall-through into undecodable words.
 
+## Current FSPX build decoding
+
+The builder now selects the pure-Python RDNA2 decoder for these auxiliary programs, using the FSPX backend
+integration from [#2323](https://github.com/ItsNotRexed/Leonida/pull/2323) on top of the decoder already present from
+[#2038](https://github.com/ItsNotRexed/Leonida/pull/2038). This preserves the signed-byte dot4 half-select words that
+LLVM omits, and passes each program's kind-0 wave mode into operand decoding. The translator still rejects a reachable
+gap; no instruction is skipped to make a program translate.
+
+A whole-set CPU recount gives **29/29 decoded, translated and `spirv-val`-valid programs**, versus 21/29 with the LLVM
+listings. Nineteen of the previous modules are byte-identical. Two wave64 modules differ because the old LLVM
+invocation printed wave32 mask operands, while the Python backend decodes the kind-0 wave64 register widths.
+These are translation and validation results, not GPU execution results. Synthetic binary dot4 tests retain the
+following export and reproduce the existing hardware-measured words in the SPIR-V interpreter.
+
+Completion now requires a validated module for every name in the unpacked inventory. A nonempty partial index fails
+the stage, is removed, and receives no build marker. Decoder source changes also invalidate the FSPX cache without
+invalidating the main shader corpus.
+
 ## Unknown
 
 - Kind 0 words 0 and 1.

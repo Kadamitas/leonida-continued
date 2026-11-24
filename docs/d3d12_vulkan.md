@@ -92,9 +92,39 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   start handles returned in RAX at heap slots 9/10. Implement the public chain plus those measured overrides
   explicitly; do not assume every slot. Device 11 adds `CreateSampler2`; command list 8 adds
   `OMSetFrontAndBackStencilRef` (public SDK).
+- **Higher device routes.** The local integration of [#7201](https://github.com/ItsNotRexed/Leonida/pull/7201)
+  (source `8e765684ce6a4c9a8c511d0662ec939c4b50e850`) routes console86/101/108 to PC Device2/5/8's
+  CreatePipelineState/CreateStateObject/GetResourceAllocationInfo2 (PC47/62/68). Each call acquires the actual
+  queried interface and balances its reference; COM does not require that its pointer equal the base device.
+  Slot108 accepts the PR's packed56-byte descriptor representation with either hidden-return pointer order and
+  expands to zeroed DESC1 entries. This integration deliberately refuses unknown console flags/layouts, rather
+  than masking bits or replacing tiling with UNKNOWN. Known flags, including tight alignment0x400, are preserved
+  for the backend's validation. Unsupported calls return SizeInBytes=UINT64_MAX in the caller's result buffer;
+  per-resource details remain untouched. No additional device capability or interface is advertised. The packed
+  representation is upstream evidence, not a claim that arbitrary native64-byte DESC1 arrays are accepted.
+  Synthetic mocks prove distinct queried-interface receivers, all interface levels, both return orders, a
+  multi-element56-byte stride, allocation failure and strict refusal; WARP compares real allocation sizes/offsets
+  and creates a synthetic compute-stream PSO. These checks do not establish console layout equivalence or a game
+  frame. See Microsoft's [QueryInterface contract](https://learn.microsoft.com/en-us/windows/win32/api/unknwn/nf-unknwn-iunknown-queryinterface%28refiid_void%29)
+  and [allocation-info error contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-getresourceallocationinfo%28uint_uint_constd3d12_resource_desc%29).
+  Hidden-return dispatch for slots26 and108 identifies live proxy addresses through an allocation-free synchronized registry, never
+  through the result buffer's previous first word. It pins a nonzero proxy reference before releasing the registry
+  lock, unlinks before deletion, and runs teardown outside that lock. Both-order canary tests use a result buffer
+  initially containing the exact proxy-vtable address; a reentrant last external Release and a stale-address test
+  check that the pin lasts through the backend call and cannot resurrect the released device. Slot26 independently
+  checks both argument orders with an old first word equal to the proxy vtable, preserves the surrounding canaries,
+  and refuses null output or two-live-device ambiguity without writing either device.
 - **Unknown IIDs and slots.** `QueryInterface` must log the IID and return `E_NOINTERFACE` if it is not in the
   public chain. If the game then fails, the IID and the call site identify the Xbox-specific interface to reverse.
   Do not invent a vtable for an unknown IID: a wrong slot is worse than a clean failure.
+  `LEONIDA_UNIMPLEMENTED=stop` also stops before unmodelled list effects (including131/132), queue compatibility
+  no-ops, a missing PresentX presenter, and the observed console device49 call. Its shared registry diagnostic
+  records object kind, slot, caller module/RVA and rawRCX/RDX/R8/R9 in an `unimplemented_proxy_call` startup event,
+  flushes it, and terminates with exit3. A continued debugger still terminates: an unknown effect has no return
+  class to invent. The legacy log/fail modes retain unknown-effect compatibility returns for existing synthetic
+  callers; those returns establish no implementation. Missing PresentX has a known HRESULT contract and returns
+  E_NOTIMPL in every mode. Fresh child-process tests check untouched output canaries, zero backend calls, exact
+  raw-register tracing, both queue layouts and a genuine forwarded Signal positive control.
 - **No host D3D12 or DXGI.** The PE loader currently lets unknown system DLLs bind to the host. `dxgi.dll` and
   `d3d12.dll` must be shimmed, not resolved from System32. Host DXGI would hand the game a desktop adapter and
   swapchain that cannot see our Vulkan device, and host D3D12 would create a second, unrelated device. This is an
@@ -450,9 +480,22 @@ What is implemented (all of it testable without the game):
     enables BC texture compression, and `D3D12_OPTIONS12` reports `RelaxedFormatCastingSupported = TRUE`, so a
     committed or placed texture accepts a castable-format list. Other queries (including `OPTIONS6` and `OPTIONS10`)
     are logged and refused until the trace shows what the game asks (question 11);
-  - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
+  - Single-sampled `A8_UNORM` 1D, 2D and 3D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
     (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
-    image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
+    image supports multiple levels. Where the GPU has `VK_FORMAT_A8_UNORM_KHR` (`VK_KHR_maintenance5`) and can
+    sample, copy and blend it as a colour attachment, a 2D texture created with `ALLOW_RENDER_TARGET` is stored in that
+    format instead: its RTVs, PSO `RTVFormats` and clears use the alpha channel, its SRVs view it in the same format
+    (the T# names its one channel X, gfx10's `channels_a`), and format support adds `RENDER_TARGET` and
+    `BLENDABLE`. This adapts [PR #7403](https://github.com/ItsNotRexed/Leonida/pull/7403), pinned head
+    `14a459bacb4179fda67d0b373c2160d06012b1cd`, including its header, castable-format and descriptor-parser fixes.
+    Vulkan puts A8 in a compatibility class of its own, so the two kinds of A8 texture cannot share an image or
+    use `vkCmdCopyImage` between their R8/native-A8 backing. `CopyResource` and image-to-image `CopyTextureRegion`
+    preserve the bytes through retained transfer scratch (image to buffer, transfer-write/read barrier, then
+    buffer to image), with checked mip/layer byte sizes and aligned ranges. Ordinary non-RT A8 1D/2D/3D storage
+    remains R8. A castable-format list naming `A8_UNORM` itself is a no-op; any other format in it is refused with
+    `E_INVALIDARG` for such a render target, since no other format can view its image. Without that format,
+    render targets are refused as before; depth-stencil and UAV creation are
+    unsupported for this format.
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
@@ -469,8 +512,19 @@ What is implemented (all of it testable without the game):
     and the initial state or `D3D12_BARRIER_LAYOUT` is not used, because new textures start `UNDEFINED` and move
     on first use. The newer arguments are answered as the PC runtime answers them. `d3d12_method_variants_test`
     compares each answer below with the host runtime live, measured on an RTX 4090 (driver 621.14):
-  - `CreateCommandSignature` (`ID3D12CommandSignature`) and `ID3D12GraphicsCommandList::ExecuteIndirect` (including
-    GPU-written `CountBuffer` via Vulkan 1.2 core `vkCmdDrawIndirectCount` / `vkCmdDrawIndexedIndirectCount`).
+  - `CreateCommandSignature` (`ID3D12CommandSignature`) and `ID3D12GraphicsCommandList::ExecuteIndirect`.
+    Ordinary DRAW/DRAW_INDEXED commands capture the same immutable graphics state as direct draws and use the
+    shared attachment, pipeline, root-data, vertex/index, viewport and dynamic-state replay path. This adapts the
+    narrow state/render idea from [PR #1865](https://github.com/ItsNotRexed/Leonida/pull/1865), head
+    `919e087ad7d51f8597423c4d1782cc4e11ae9450`; its unrelated M5 changes are not required here. Each non-count record
+    uses one Vulkan draw call, so padded strides need no `multiDrawIndirect` capability. GPU-written firstInstance
+    requires an actually enabled `drawIndirectFirstInstance`; without it, or with a vertex divisor above one, the
+    entire submission is refused before GPU emission. Divisor non-zero-firstInstance properties remain unmodelled.
+    Production count-buffer DRAW/indexed commands are refused until a GPU clamp can guarantee Vulkan's stored-count
+    limit (`maxDrawIndirectCount`), including when D3D12's MaxCommandCount is one. An explicit raw replay-test flag
+    preserves the lower-level native-count fixture; COM recording never opts into external rendering state.
+    Incomplete graphics state retains PC recording/Close parity and fails during queue preparation. Empty viewports
+    use a legal 1x1 viewport with an empty scissor, preserving vertex shader/UAV execution.
   - Optional `VK_KHR_acceleration_structure` + `VK_KHR_deferred_host_operations` + `VK_KHR_ray_query`:
     `ID3D12Device5::GetRaytracingAccelerationStructurePrebuildInfo`, `ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure`
     (BLAS + TLAS), `vkGetBufferDeviceAddress` in `ID3D12Resource::GetGPUVirtualAddress()`, and RT-aware `UAV`
@@ -580,8 +634,14 @@ What is implemented (all of it testable without the game):
   part of one zero-fills it (D3D12 committed resources start zeroed; `CREATE_NOT_ZEROED` skips this) and moves it
   to the layout that command expects, so creation needs no submission. Block-compressed textures are not
   zero-filled, because Vulkan cannot clear them; they start undefined until the application uploads them. Each
-  submission ends with a barrier to the host, so a readback buffer holds the GPU's writes once the fence wait
-  returns. Children hold a reference to the proxy, not
+  submission that writes a readback buffer ends with a barrier to the host. Draw, dispatch, indirect execution
+  and acceleration-structure writes also request this barrier: shader descriptors and device addresses can reach
+  CPU-visible memory without an explicit readback copy. Their source scope is `ALL_COMMANDS` / `MEMORY_WRITE`,
+  including when a transfer write shares the submission; transfer-only readbacks keep their narrower scope.
+  This supplies the device-to-host memory dependency; the caller still waits for completion before reading, and
+  non-coherent memory would also require invalidation. Fence completion alone does not supply host visibility
+  ([Vulkan synchronization](https://docs.vulkan.org/spec/latest/chapters/synchronization.html)).
+  Children hold a reference to the proxy, not
   the inner device, so `GetDevice` always returns the Xbox-ABI object. Each live D3D12 queue leases a distinct
   `VkQueue` while one is free (its own type's family first, then the graphics family); the standalone device
   requests up to 16 per family. The queues still share a submit lock for
@@ -1164,11 +1224,23 @@ and any validation error fails them.
   `IDXGIFactory4::CreateSwapChainForHwnd`, `IDXGISwapChain3::GetCurrentBackBufferIndex`, `GetBuffer` + `GetDesc()`,
   backbuffer `CreateRenderTargetView` + clear + readback verification + `Present`, and `ResizeBuffers` with 0
   validation errors.
-- `d3d12_indirect_rt_test`: validates `ID3D12Device::CreateCommandSignature` + `ExecuteIndirect` with a GPU
-  `CountBuffer` (`vkCmdDrawIndirectCount`, `count = 0` skipped and `count = 1` rendered) and optional
+- `d3d12_indirect_rt_test`: validates signature/COM recording and the explicit low-level replay-test path with a GPU
+  `CountBuffer` (the fixture supplies rendering/bindings; `count = 0` skipped and `count = 1` rendered), and optional
   `VK_KHR_acceleration_structure` + `VK_KHR_ray_query` (`GetRaytracingAccelerationStructurePrebuildInfo`, BLAS + TLAS
   `BuildRaytracingAccelerationStructure`, and a `RayQueryKHR` compute shader verifying hit vs. miss; clean SKIP on
   GPUs without RT).
+- `d3d12_indirect_draw_state_test`: full COM-to-queue DRAW/indexed rendering, with no external Vulkan bindings.
+  Three workloads match native WARP pixel/vertex-marker readbacks, including zero-width/height viewports that
+  still write the VS UAV. Intervening pipeline/root/RTV/DSV/vertex/index/topology changes cannot alter recorded
+  draws. Padded GPU-copied records, nonzero firstInstance/startVertex/startIndex/baseVertex, MaxCommandCount zero,
+  and six whole-submission refusals preserve prefix-copy/clear canaries. Checked on RTX 5080 with Khronos
+  validation: no validation errors; the surrounding nine indirect/draw/mesh/parity tests pass.
+- `d3d12_a8_cross_copy_test`: logical A8 copies between ordinary R8 storage and a native alpha render target,
+  in both directions. Whole-resource copies cover four mips and three array layers; three partial boxes use
+  different subresources and nonzero offsets, with exact source and untouched-texel checks. An invalid batch
+  preserves an earlier destructive prefix, and a feature-off device refuses native RT creation/sizing while
+  ordinary A8 copies work. Checked on RTX 5080 with Khronos validation: all twelve focused A8/descriptor/clear/
+  draw/copy/host-import tests pass without validation errors; the Python GFX10 table checks pass too.
 - `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` surface: `QueryInterface` for its IID,
   `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
   creates only an allocator and a list, so it needs no GPU or Vulkan loader.
@@ -2128,9 +2200,18 @@ The trace will enumerate them.
   - **Recording errors** (`Close` returns `E_INVALIDARG`): a grid above 65535 per count or 2^22 groups.
   - **Not recorded:** an empty grid.
   - **Execution error** (`ReplayResult::invalid_draw`): a mesh draw with a VS pipeline, or the reverse.
-- **Tests:** `d3d12_mesh_test` checks the refusals and three draws pixel by pixel on an RX 9060 XT (RADV, under
-  Wine), validation-clean.
-  - **The three draws:** a 2×2×1 and a 1×1×2 mesh grid, plus a VS PSO from a stream.
+- **Indirect mesh dispatch:** a single `D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH` argument is implemented with
+  captured graphics state and a rendering scope. Signatures that mutate root arguments remain `E_NOTIMPL`.
+  Padded records are read by `vkCmdDrawMeshTasksIndirectEXT`, one record per call; GPU count buffers use the
+  three-DWORD count prepass to zero records beyond `min(count, MaxCommandCount)`. This avoids host count reads
+  and does not require Vulkan multi-draw/count features. Empty viewports use a captured 1×1 viewport and empty
+  scissor, so mesh/UAV work runs while rasterization produces no samples. Xbox argument type `0x69` remains
+  unresolved; accepting the standard mesh type does not establish a conversion for it.
+- **Tests:** `d3d12_mesh_test` compares the three-draw image pixel by pixel and checks GPU-only argument/count
+  buffers, padded strides, count 0/1/3/UINT_MAX, zero maximum, wrong-pipeline refusal, buffer bounds and missing mesh
+  support. A mesh-shader atomic proves zero-width/height viewports still execute all four workgroups. Run with
+  `LEONIDA_VK_VALIDATION=1` to check synchronization and Vulkan usage.
+  - **The three draws:** indirect 2×2×1 and GPU-counted 1×1×2 mesh grids, plus a VS PSO from a stream.
   - **What it doesn't cover:** whether the console flattens a 3D `DispatchMesh` grid the same way. That is an open
     question in `docs/design.md`, "Mesh shaders"; the test shader reads the workgroup ID directly.
 
@@ -3319,36 +3400,14 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   results still match and all 11 statistics counters are zero. Without a statistics pool (single-list `replay()` or
   a queue without the summation helper), these three commands are refused before helper scratch allocation or
   recording. The resolve fallback is unchanged: only resolves needing dispatches are refused there.
-- **Mesh draws during a pipeline-statistics query** (D3D-291). D3D12 allows `DispatchMesh` inside a statistics query
-  and reads its input-assembly, vertex, geometry and tessellation fields as 0. Vulkan forbids `vkCmdDrawMeshTasksEXT`
-  while a query with the input-assembly, vertex, geometry, tessellation or clipping counters is active
-  (`VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076`), and the heap's pool has all eleven. So a statistics query
-  that holds a mesh draw is split as above, and a split before a draw stays outside its rendering scope. A segment's first draw decides its pool: the submission's full pool, or a second pool
-  with only the fragment and compute invocations, the two the VUID leaves allowed. A later draw of the other kind ends
-  the segment and begins one of its own kind; dispatches and segments without draws use the full pool, and
-  `ExecuteIndirect` draws count as vertex draws. The sum copies a mesh segment's two counters into fields 7 and 8 of
-  its record, and `statistics_sum.comp` adds them as `PSInvocations` and `CSInvocations`, so the other fields get
-  nothing from it. D3D12 counts the clipping invocations and primitives of a mesh pipeline, but Vulkan has no counter
-  for them during a mesh draw, so `CInvocations` and `CPrimitives` read 0 for a mesh segment. A query that holds only
-  mesh draws is one mesh segment, resolved through the same sum. Without the compute helper there is no segment pool
-  and such a list is refused (`unsupported`) rather than run unsplit; so is one on the single-list `replay()` (D3D-399),
-  whose `create_segment_pool` gives no mesh pool. Overlapping statistics queries (D3D-252) split the same way inside
-  their shared segments: a draw of the other kind than the open segment's opens a new one, so every query that segment
-  belongs to sums both kinds. `replay_query_predication_test` (cases 15 to 17) checks the split points, the segment
-  kinds, the resolve plan and the counters the mesh pool may enable on the CPU. `d3d12_mesh_test` resolves a query
-  around a vertex, two mesh and a vertex draw, one around a mesh draw and one around the two vertex draws: the vertex
-  fields count only the two triangles, the mixed query has the same clipping count as the vertex-only one and more
-  pixel-shader invocations, and the mesh-only query has no clipping count without the mesh-primitives query below.
-- **The clipping invocations of a mesh segment** (D3D-MESH-CLIPPING-COUNTER). D3D-291 leaves `CInvocations` and
-  `CPrimitives` of a mesh segment at 0, because Vulkan has no clipping counter during a mesh draw. Where the device
-  has the `meshShaderQueries` feature of `VK_EXT_mesh_shader`, the number of primitives the mesh shader emitted
-  comes from a `VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT` query instead: a third pool of the submission, begun
-  and ended with each mesh segment, next to the two the statistics split needs. Its count is copied to field 5 of the
-  segment's record and `statistics_sum.comp` adds it as `CInvocations`; `CPrimitives` stays 0, because Vulkan has
-  no clipped-primitive counter and D3D12's `CPrimitives` is the clipper's output (0 when a triangle is dropped, 2
-  when it is split). The count is not D3D12's number: Vulkan counts a primitive the mesh shader culled with
-  `gl_CullPrimitiveEXT`, which D3D12 does not count, so a mesh segment's `CInvocations` can be higher than D3D12's.
-  Without the feature the field reads 0, as in D3D-291.
+- **Mesh draws during a legacy pipeline-statistics query.** The Vulkan submission is refused before emission.
+  [Vulkan 07076](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdDrawMeshTasksIndirectEXT.html)
+  forbids clipping counters as well as the legacy vertex/geometry counters during mesh work. The previous second
+  pool incorrectly retained clipping counters. A native RTX 5080 D3D12 comparison with debug validation measured
+  `CInvocations/CPrimitives` as 4/4 inside, 4/0 outside and 0/0 when explicitly culled, while `MSPrimitives` stayed 4;
+  direct and indirect results matched. Zeroes or a mesh-output counter therefore cannot stand in for the old fields.
+  The segment planner still identifies direct and indirect mesh work, but the Vulkan backend does not create an
+  invalid mesh statistics pool. `d3d12_mesh_test` checks refusal and then executes further draws with validation on.
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 - **Timestamp resolves on MoltenVK.** On Apple GPUs, MoltenVK delays every `vkCmdWriteTimestamp` to the end of
@@ -4252,8 +4311,9 @@ on a PC device behind the Xbox-ABI proxy). Measured:
 
 - `amd_fidelityfx_loader_xbox.dll`, `Bink2Scarlett.dll`, `libHttpClient.GDK.dll`, `XCurl.dll`: no `d3d12_xs`
   imports.
-- The package layout XML, chunk 1001, lists `game_scarlett_master.exe`; the file is absent from the folder. No
-  claim in this document depends on the executable's contents.
+- The package layout XML, chunk 1001, lists `game_scarlett_master.exe`; the file is absent from the folder. One
+  claim in this document comes from running the executable from a player's own copy: how it calls device slot 26
+  (section 4.1; register roles and argument values only). No other claim depends on the executable's contents.
 - The repository's existing import survey (`docs/design.md`, "Baseline already recorded") records that the 16
   bundled DLLs need only `xmem` and the two `d3d12_xs` root-signature calls; our scan of the six non-CRT DLLs is
   consistent.

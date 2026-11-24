@@ -1,6 +1,5 @@
 #version 460
-// Synthetic translated-shader stand-in: root UAV s4:s5 (the first two of the console compute layout's user SGPRs,
-// which start at s4), plus the 144-byte user-data contract.
+// Synthetic translated-shader stand-in: first compute root UAV s4:s5 (s0..s3 are driver-reserved), 144-byte contract.
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 layout(local_size_x = 1) in;

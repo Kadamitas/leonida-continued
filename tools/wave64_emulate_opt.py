@@ -82,7 +82,7 @@ _SCC_UNCONDITIONAL_WRITES = _ALL_SAVEEXEC_WREXEC | frozenset({
 _MASK_WORD_READERS = frozenset({
     "s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
     "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64",
-    "s_flbit_i32_b32", "s_flbit_i32",
+    "s_flbit_i32_b32", "s_flbit_i32_b64", "s_flbit_i32",
 })
 
 # Mask ops that emit a cross-lane vote in --wave64-emulate when SCC is live.
@@ -150,7 +150,7 @@ _SCALAR_NO_SCC_PREFIXES = (
     "s_mov", "s_cselect", "s_load", "s_buffer_load", "s_getpc",
     "s_nop", "s_waitcnt", "s_clause", "s_inst_prefetch", "s_pack",
     "s_mul_i32", "s_mul_hi", "s_mulk", "s_ff", "s_flbit", "s_bfm",
-    "s_get_waveid",
+    "s_get_waveid", "s_bitreplicate_b64_b32",
 )
 
 # Bounded caches for opcode normalization and static per-opcode classification.
@@ -911,6 +911,9 @@ def _write_preserves_zero(op, a, zero_pairs, *, for_exec):
             return len(a) >= 2 and _is_zero_val(a[1], zero_pairs)
         if not a or not _is_exec_op_arg(a[0]):
             return False  # partial exec_lo/exec_hi or unknown EXEC write
+        if op == "s_bitreplicate_b64_b32" and len(a) == 2:
+            # A non-zero immediate replaces EXEC and can reactivate lanes; it cannot stay inside a local fold.
+            return a[1].get("k") == "imm" and (a[1]["v"] & 0xFFFFFFFF) == 0
     else:
         if op.endswith("_saveexec_b64") or op == "s_andn1_wrexec_b64":
             return True  # saves old EXEC (or ~S0 & EXEC), both 0 when EXEC == 0

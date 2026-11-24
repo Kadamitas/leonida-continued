@@ -35,6 +35,8 @@
 
 #include <SDL3/SDL.h>
 
+#include "input_user_bridge.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -50,12 +52,15 @@
 #include <vector>
 
 #include "gameinput.h"
+#include "process_gamepad.h"
 #include "gameinput_abi.h"
 #include "shims.h"
 
 using namespace gi;
 
 namespace {
+
+std::atomic<std::uint64_t> g_device_generation{0};
 
 constexpr uint32_t kBaseKinds =
     GameInputKindControllerAxis | GameInputKindControllerButton | GameInputKindGamepad | GameInputKindUiNavigation;
@@ -168,7 +173,8 @@ rt::gameinput::Config read_config() {
     if (env("LEONIDA_RUMBLE") == "0") c.rumble = false;
     if (env("LEONIDA_GAMEINPUT_THREAD") == "0") c.background_thread = false;
     const std::string k = env("LEONIDA_KEYBOARD_PAD");
-    if (k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
+    if (env("LEONIDA_ISOLATED_PAD") == "1") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Isolated;
+    else if (k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
     else if (k == "always") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Always;
     else if (!k.empty() && k != "0" && k != "off")
         std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_PAD=%s unknown (1, always or off), keyboard pad off\n",
@@ -217,6 +223,20 @@ struct Snapshot {
     }
 };
 
+// Diagnostic for the process-local controller. Record the first neutral and pressed
+// reading actually consumed by the title through each supported button interface.
+void trace_isolated_button(unsigned api, const char* name, uint32_t buttons, uint64_t sequence) {
+    static const bool enabled = env("LEONIDA_ISOLATED_PAD") == "1" && env("LEONIDA_TRACE_PAD") == "1";
+    if (!enabled) return;
+    static std::atomic<unsigned> seen{0};
+    const bool pressed = (buttons & GameInputGamepadA) != 0;
+    const unsigned bit = 1u << (api * 2 + unsigned(pressed));
+    if (!(seen.load(std::memory_order_relaxed) & bit) &&
+        !(seen.fetch_or(bit, std::memory_order_relaxed) & bit))
+        std::fprintf(stderr, "[rt] GameInput: title read %s A=%d sequence=%llu\n", name, int(pressed),
+                     static_cast<unsigned long long>(sequence));
+}
+
 class Reading final : public IGameInputReading {
 public:
     Reading(Device* device, const Snapshot& s, uint64_t seq, uint64_t ts, uint64_t order);
@@ -256,6 +276,7 @@ public:
     uint32_t STDMETHODCALLTYPE GetControllerButtonCount() override { return kButtonCount; }
     uint32_t STDMETHODCALLTYPE GetControllerButtonState(uint32_t count, bool* out) override {
         const uint32_t n = out ? std::min(count, kButtonCount) : 0;
+        if (n) trace_isolated_button(0, "controller buttons", s_.gamepad.buttons, seq_);
         std::memcpy(out, s_.buttons, n * sizeof(bool));
         return n;
     }
@@ -275,12 +296,14 @@ public:
     bool STDMETHODCALLTYPE GetFlightStickState(void*) override { return false; }
     bool STDMETHODCALLTYPE GetGamepadState(GameInputGamepadState* state) override {
         if (!state) return false;
+        trace_isolated_button(1, "gamepad", s_.gamepad.buttons, seq_);
         *state = s_.gamepad;
         return true;
     }
     bool STDMETHODCALLTYPE GetRacingWheelState(void*) override { return false; }
     bool STDMETHODCALLTYPE GetUiNavigationState(GameInputUiNavigationState* state) override {
         if (!state) return false;
+        trace_isolated_button(2, "UI navigation", s_.gamepad.buttons, seq_);
         state->buttons = s_.ui;
         return true;
     }
@@ -960,12 +983,14 @@ float axis(SDL_Gamepad* p, SDL_GamepadAxis a) { return std::max(-1.0f, SDL_GetGa
 float norm(float v, float max) { return std::clamp(v / max, -1.0f, 1.0f); }
 
 bool is_keyboard_pad(SDL_JoystickID jid);  // with the keyboard pad below
+bool is_isolated_pad(SDL_JoystickID jid);
 
 // What kind of device a pad really is, for active_input(): SDL's gamepad type, which it takes from the vendor and
 // product id. Anything SDL does not place (a generic or unknown pad, a GameCube adapter) counts as Xbox, the layout
 // GameInput itself describes.
 leonida::InputFamily family_of(SDL_JoystickID jid, SDL_Gamepad* p) {
     using leonida::InputFamily;
+    if (is_isolated_pad(jid)) return InputFamily::Xbox;
     if (is_keyboard_pad(jid)) return InputFamily::Keyboard;
     switch (SDL_GetGamepadType(p)) {
     case SDL_GAMEPAD_TYPE_PS5: return InputFamily::PlayStation5;
@@ -1032,12 +1057,8 @@ void apply_prompt_config() {
                      leonida::input_family_name(g_tracker.active()));
 }
 
-Snapshot read_pad(Device* d) {
-    SDL_Gamepad* p = d->pad;
-    Snapshot s;
-    auto down = [p](SDL_GamepadButton b) { return SDL_GetGamepadButton(p, b); };
-    struct Map { SDL_GamepadButton sdl; uint32_t gi; };
-    static const Map kMap[] = {
+struct ButtonMapping { SDL_GamepadButton sdl; uint32_t gi; };
+constexpr ButtonMapping kPadButtons[] = {
         {SDL_GAMEPAD_BUTTON_START, GameInputGamepadMenu},
         {SDL_GAMEPAD_BUTTON_BACK, GameInputGamepadView},
         {SDL_GAMEPAD_BUTTON_SOUTH, GameInputGamepadA},
@@ -1052,8 +1073,13 @@ Snapshot read_pad(Device* d) {
         {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, GameInputGamepadRightShoulder},
         {SDL_GAMEPAD_BUTTON_LEFT_STICK, GameInputGamepadLeftThumbstick},
         {SDL_GAMEPAD_BUTTON_RIGHT_STICK, GameInputGamepadRightThumbstick},
-    };
-    for (const Map& m : kMap)
+};
+
+Snapshot read_pad(Device* d) {
+    SDL_Gamepad* p = d->pad;
+    Snapshot s;
+    auto down = [p](SDL_GamepadButton b) { return SDL_GetGamepadButton(p, b); };
+    for (const auto& m : kPadButtons)
         if (down(m.sdl)) s.gamepad.buttons |= m.gi;
     // GameInput: sticks in -1..1 with +Y up, triggers in 0..1. SDL: +Y down, -32768..32767, triggers 0..32767.
     s.gamepad.leftThumbstickX = axis(p, SDL_GAMEPAD_AXIS_LEFTX);
@@ -1454,7 +1480,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->motors_sent_at = d->triggers_sent_at = d->battery_at = 0;
     d->wanted = {};
     fill_info(d, p, id);
-    open_raw(d, path);
+    if (!is_isolated_pad(jid)) open_raw(d, path);
 
     // Player LEDs and SDL's default lightbar colour follow the slot: the lowest one not in use.
     int player = 0;
@@ -1473,6 +1499,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     if (d->hid) status |= GameInputDeviceRawIoEnabled;
     d->status = status;
     s.connected.push_back(d);
+    g_device_generation.fetch_add(1, std::memory_order_release);
 
     const Snapshot snap = read_pad(d);
     d->last_snap = snap;
@@ -1510,6 +1537,7 @@ void close_pad(Device* d, uint64_t ts) {
     for (Reading* r : d->history) r->Release();
     d->history.clear();
     s.connected.erase(std::remove(s.connected.begin(), s.connected.end(), d), s.connected.end());
+    g_device_generation.fetch_add(1, std::memory_order_release);
     queue_event({CbType::Device, d, nullptr, ts, GameInputDeviceNoStatus, old, false, 0});
     std::fprintf(stderr, "[rt] gameinput: disconnected %s\n", d->name.c_str());
 }
@@ -1749,7 +1777,7 @@ void start_raw_mouse() {
 }
 
 bool system_cursor_pos(int* x, int* y) {
-    if (g_raw_ready) {  // the edgeless total; it wraps only after ±2^31 counts, and the poll uses differences
+    if (g_raw_ready) {  // the edgeless total; it wraps only after Â±2^31 counts, and the poll uses differences
         *x = static_cast<int>(g_raw_x.load());
         *y = static_cast<int>(g_raw_y.load());
         return true;
@@ -1775,15 +1803,19 @@ struct KeyboardPad {
     SDL_JoystickID id = 0;
     SDL_Joystick* js = nullptr;
     bool failed = false;  // attaching failed once; not retried every 2 ms
+    bool isolated = false;
     int right_x = 0, right_y = 0;    // the mouse's right stick, SDL axis units (+Y down)
     int cursor_x = 0, cursor_y = 0;  // the cursor at the last poll
     bool have_cursor = false;        // cursor_x/y are valid; false after focus loss, so the first poll moves nothing
 };
 KeyboardPad g_keyboard;
+rt::gameinput::ProcessGamepad g_process_pad;
 
 bool is_keyboard_pad(SDL_JoystickID jid) { return jid != 0 && jid == g_keyboard.id; }
+bool is_isolated_pad(SDL_JoystickID jid) { return is_keyboard_pad(jid) && g_keyboard.isolated; }
 
 void detach_keyboard_pad() {
+    if (g_keyboard.isolated) g_process_pad.close();
     if (g_keyboard.js) SDL_CloseJoystick(g_keyboard.js);
     if (g_keyboard.id) SDL_DetachVirtualJoystick(g_keyboard.id);
     if (g_keyboard.id) std::fprintf(stderr, "[rt] gameinput: keyboard pad removed\n");
@@ -1817,7 +1849,13 @@ void clip_cursor(bool want) {
     }
 }
 
-bool attach_keyboard_pad() {
+bool attach_keyboard_pad(bool isolated) {
+    g_keyboard.isolated = isolated;
+    if (isolated && !g_process_pad.open()) {
+        std::fprintf(stderr, "[rt] gameinput: isolated pad channel unavailable\n");
+        g_keyboard.failed = true;
+        return false;
+    }
     SDL_VirtualJoystickDesc d;
     SDL_INIT_INTERFACE(&d);
     d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
@@ -1825,7 +1863,7 @@ bool attach_keyboard_pad() {
     d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
     d.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1;
     d.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
-    d.name = "Keyboard pad (Leonida)";
+    d.name = isolated ? "Xbox pad (Leonida process)" : "Keyboard pad (Leonida)";
     g_keyboard.id = SDL_AttachVirtualJoystick(&d);
     g_keyboard.js = g_keyboard.id ? SDL_OpenJoystick(g_keyboard.id) : nullptr;
     if (!g_keyboard.js) {
@@ -1833,6 +1871,10 @@ bool attach_keyboard_pad() {
         detach_keyboard_pad();
         g_keyboard.failed = true;
         return false;
+    }
+    if (isolated) {
+        std::fprintf(stderr, "[rt] gameinput: isolated process pad attached, pid=%lu\n", GetCurrentProcessId());
+        return true;
     }
     std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
                          "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
@@ -1856,7 +1898,16 @@ void update_keyboard_pad() {
         g_keyboard.failed = false;
         return;
     }
-    if (!g_keyboard.js && (g_keyboard.failed || !attach_keyboard_pad())) return;
+    const bool isolated = mode == rt::gameinput::KeyboardPadMode::Isolated;
+    if (g_keyboard.js && g_keyboard.isolated != isolated) detach_keyboard_pad();
+    if (!g_keyboard.js && (g_keyboard.failed || !attach_keyboard_pad(isolated))) return;
+    if (isolated) {
+        const uint32_t buttons = g_process_pad.buttons();
+        for (const auto& m : kPadButtons) SDL_SetJoystickVirtualButton(g_keyboard.js, m.sdl, (buttons & m.gi) != 0);
+        SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, -32768);
+        SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -32768);
+        return;
+    }
 
     bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
     int lx = 0, ly = 0;
@@ -1900,10 +1951,18 @@ void update_keyboard_pad() {
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, fire ? 32767 : -32768);
 }
 
-bool init_sdl() {
+bool init_sdl(bool isolated) {
     State& s = g();
     if (s.sdl_ready) return true;
     if (s.sdl_failed) return false;
+    if (isolated) {
+        // The virtual driver needs no physical controller driver. Leave keyboard, mouse, USB and
+        // real gamepad ownership to the foreground application.
+        for (const char* hint : {SDL_HINT_JOYSTICK_DIRECTINPUT, SDL_HINT_JOYSTICK_GAMEINPUT,
+                SDL_HINT_JOYSTICK_GAMEINPUT_RAW, SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT,
+                SDL_HINT_JOYSTICK_WGI, SDL_HINT_XINPUT_ENABLED})
+            SDL_SetHintWithPriority(hint, "0", SDL_HINT_OVERRIDE);
+    }
     // No window: keep reading pads when another application has focus.
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     // Never read pads through the host's GameInput underneath this GameInput shim (SDL's default is already off
@@ -1928,16 +1987,26 @@ bool init_sdl() {
 void poll_once() {
     State& s = g();
     std::lock_guard pl(s.poll_mu);
-    if (!init_sdl()) return;
+    bool isolated;
+    {
+        std::lock_guard lock(s.mu);
+        isolated = s.config.keyboard_pad == rt::gameinput::KeyboardPadMode::Isolated;
+    }
+    if (!init_sdl(isolated)) return;
     apply_prompt_config();
     update_keyboard_pad();
     SDL_UpdateGamepads();
     const uint64_t now = now_us();
 
     int count = 0;
-    SDL_JoystickID* ids = SDL_GetGamepads(&count);
-    std::vector<SDL_JoystickID> present(ids, ids + (ids ? count : 0));
-    SDL_free(ids);
+    std::vector<SDL_JoystickID> present;
+    if (isolated) {
+        if (g_keyboard.id) present.push_back(g_keyboard.id);
+    } else {
+        SDL_JoystickID* ids = SDL_GetGamepads(&count);
+        if (ids) present.assign(ids, ids + count);
+        SDL_free(ids);
+    }
 
     std::vector<Device*> connected;
     {
@@ -1992,8 +2061,26 @@ void poll_once() {
     }
 }
 
+rt::input_user::DeviceSnapshot connected_device_ids() {
+    rt::input_user::DeviceSnapshot ids;
+    std::lock_guard lock(g().mu);
+    ids.reserve(g().connected.size());
+    for (const Device* device : g().connected) {
+        rt::input_user::DeviceId id;
+        std::memcpy(id.data(), device->info.deviceRootId.value, id.size());
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+    }
+    return ids;
+}
+
 void poll_and_deliver() {
     poll_once();
+    static std::atomic<std::uint64_t> published_generation{0};
+    const auto generation = g_device_generation.load(std::memory_order_acquire);
+    if (published_generation.exchange(generation, std::memory_order_acq_rel) != generation)
+        rt::input_user::notify_changed();
+    else
+        rt::input_user::retry_changes();  // failed allocation/submission must not lose the only add/connect event
     State& s = g();
     bool dispatch;
     bool pending;
@@ -2598,6 +2685,7 @@ GameInput& instance() {
 // HRESULT GameInputCreate(IGameInput** gameInput). One instance per process; each call adds a reference.
 HRESULT WINAPI GameInputCreate(IGameInput** out) {
     if (!out) return E_POINTER;
+    rt::input_user::device_provider.store(connected_device_ids, std::memory_order_release);
     ensure_started();
     GameInput& gi = instance();
     gi.AddRef();

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "dstorage_xs_abi.h"
+#include "bcpack_fixture.h"
 #include "file_system.h"
 #include "shims.h"
 
@@ -403,8 +404,8 @@ void test_reads_and_errors(Env& env) {
         r.Options.ZlibDecompress = 1;
         cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "zlib with DestinationSize equal to SourceSize"});
         r = file_request(b, 0, few.data(), 8);
-        r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC1;
-        cases.push_back({r, E_NOTIMPL, "BCPack is not implemented yet"});
+        r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC2;
+        cases.push_back({r, E_NOTIMPL, "BC2 BCPack remains unsupported"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.SwizzleMode = DSTORAGE_SWIZZLE_MODE_4K_4K_8K;
         cases.push_back({r, E_NOTIMPL, "swizzle is not implemented yet"});
@@ -418,8 +419,8 @@ void test_reads_and_errors(Env& env) {
         r.Options.Reserved = 1;
         cases.push_back({r, E_DSTORAGE_RESERVED_FIELDS, "a reserved option bit"});
         r = file_request(b, 0, few.data(), 8);
-        r.Options.DestinationIsPhysicalPages = 1;
-        cases.push_back({r, E_NOTIMPL, "physical pages are not implemented yet"});
+        r.Options.SourceIsPhysicalPages = 1;
+        cases.push_back({r, E_DSTORAGE_INVALID_SOURCE_TYPE, "a FILE queue cannot use physical-page sources"});
         r = file_request(b, 0, few.data(), 8);
         r.IntermediateSize = 4;
         cases.push_back({r, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, "IntermediateSize without zlib and BCPack"});
@@ -1059,6 +1060,214 @@ std::vector<uint8_t> stored_stream(const std::vector<uint8_t>& stored, const uin
     return z;
 }
 
+// ---- DestinationIsPhysicalPages -------------------------------------------------------------------------------------
+
+// The xmem shim's exports, resolved through the registry as a title's imports are (shims/xmem.cpp has the shapes).
+using AllocatePagesFn = BOOL(WINAPI*)(uint64_t attributes, uint64_t* page_count, uint64_t* page_array);
+using FreePagesFn = BOOL(WINAPI*)(uint64_t page_count, const uint64_t* page_array);
+using XMemVirtualAllocFn = void*(WINAPI*)(void* address, SIZE_T size, DWORD type, ULONGLONG attributes, DWORD protect);
+using MapPagesFn = void*(WINAPI*)(void* address, uint64_t page_count, const uint64_t* page_array);
+
+constexpr size_t kPage = 0x10000;
+constexpr DWORD kReserve64kWindow = MEM_RESERVE | 0x20400000;  // reserve only, 64 KiB pages: a physical-page window
+
+PULONG_PTR page_array(const uint64_t* pages) { return reinterpret_cast<PULONG_PTR>(const_cast<uint64_t*>(pages)); }
+
+// A destination given as 64 KiB page numbers and an offset into the first one. Every result is read back through a
+// window the pages are mapped into, so the check is on the memory a title sees, not on the shim's own bookkeeping.
+void test_destination_pages(Env& env) {
+    const auto allocate = reinterpret_cast<AllocatePagesFn>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto free_pages = reinterpret_cast<FreePagesFn>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    const auto reserve = reinterpret_cast<XMemVirtualAllocFn>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto map_pages = reinterpret_cast<MapPagesFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    using FreeWindowFn = BOOL(WINAPI*)(void*, SIZE_T, DWORD);
+    const auto free_window = reinterpret_cast<FreeWindowFn>(rt::shims::find("kernel32.dll", "VirtualFree"));
+    check(allocate && free_pages && reserve && map_pages && free_window, "the xmem page exports are registered");
+    if (!allocate || !free_pages || !reserve || !map_pages || !free_window) return;
+
+    // Two allocations, deliberately read out of page order. Small allocations may share a backing chunk;
+    // the separate 513-page request below necessarily spans multiple chunks in this page store.
+    uint64_t a[4] = {}, b[2] = {};
+    uint64_t count_a = 4, count_b = 2;
+    check(allocate(0x280, &count_a, a) && count_a == 4, "allocate four pages");
+    check(allocate(0x280, &count_b, b) && count_b == 2, "allocate two more pages");
+    const uint64_t all[6] = {a[0], a[1], a[2], a[3], b[0], b[1]};
+    auto* const window = static_cast<uint8_t*>(reserve(nullptr, 6 * kPage, kReserve64kWindow, 1, PAGE_READWRITE));
+    check(window != nullptr, "reserve a six-page window");
+    if (!window) return;
+    // Only the first three are mapped while the requests run: a page needs no mapping to be a destination.
+    check(map_pages(window, 3, all) == window, "map the first three pages before the requests");
+    std::vector<uint8_t> want(6 * kPage, 0);  // what the window must hold, page i of `all` at i * 64 KiB
+    auto in_window = [&](uint64_t page) {
+        return static_cast<size_t>(std::find(std::begin(all), std::end(all), page) - std::begin(all)) * kPage;
+    };
+
+    IDStorageFileX* big = open(env, L"GAME:\\data\\big.bin");
+    IDStorageQueueX2* q = make_queue(env, 0x80, false);
+    IDStorageQueueX2* mq =
+        make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    IDStorageStatusArrayX* s = make_status(env, 16);
+
+    // 0: a file read that starts 0xF000 bytes into a[1] and runs through a[2], b[0] and into a[3].
+    const uint64_t file_pages[4] = {a[1], a[2], b[0], a[3]};
+    constexpr uint32_t kFileBytes = 0x24000;
+    constexpr uint16_t kFileOffset = 0xF000;
+    DSTORAGE_REQUEST file = file_request(big, 12345, nullptr, kFileBytes);
+    file.Options.DestinationIsPhysicalPages = 1;
+    file.DestinationPageArray = page_array(file_pages);
+    file.DestinationPageOffset = kFileOffset;
+    q->EnqueueRequest(&file);
+    q->EnqueueStatus(s, 0);
+    {
+        size_t done = 0, at = kFileOffset;
+        for (const uint64_t page : file_pages) {
+            const size_t n = (std::min)(kPage - at, kFileBytes - done);
+            std::memcpy(want.data() + in_window(page) + at, env.big.data() + 12345 + done, n);
+            done += n;
+            at = 0;
+        }
+    }
+
+    // 1: a page number that is not a live page (the second entry). Nothing may be written, the first page included.
+    const uint64_t with_dead_page[2] = {a[0], a[3] + 16 * 1000};
+    DSTORAGE_REQUEST dead = file_request(big, 0, nullptr, static_cast<uint32_t>(kPage));
+    dead.Options.DestinationIsPhysicalPages = 1;
+    dead.DestinationPageArray = page_array(with_dead_page);
+    dead.DestinationPageOffset = 0x8000;
+    q->EnqueueRequest(&dead);
+    q->EnqueueStatus(s, 1);
+
+    // 2: page number 0, which the map calls read as "unmap": not a destination.
+    const uint64_t zero_page[1] = {0};
+    DSTORAGE_REQUEST zero = file_request(big, 0, nullptr, 16);
+    zero.Options.DestinationIsPhysicalPages = 1;
+    zero.DestinationPageArray = page_array(zero_page);
+    q->EnqueueRequest(&zero);
+    q->EnqueueStatus(s, 2);
+
+    // 3: a page array the process cannot read.
+    void* unreadable = VirtualAlloc(nullptr, kPage, MEM_RESERVE, PAGE_READWRITE);
+    DSTORAGE_REQUEST bad_array = file_request(big, 0, nullptr, 16);
+    bad_array.Options.DestinationIsPhysicalPages = 1;
+    bad_array.DestinationPageArray = static_cast<PULONG_PTR>(unreadable);
+    q->EnqueueRequest(&bad_array);
+    q->EnqueueStatus(s, 3);
+
+    // 4: a zero-size request succeeds whatever its page array holds, like a zero-size read to an address.
+    DSTORAGE_REQUEST empty = file_request(big, 0, nullptr, 0);
+    empty.Options.DestinationIsPhysicalPages = 1;
+    empty.DestinationPageArray = page_array(zero_page);
+    q->EnqueueRequest(&empty);
+    q->EnqueueStatus(s, 4);
+    q->Submit();
+
+    // 5: zlib from memory into b[1], ending in a[0]: the inflated bytes, not the stream, reach the pages.
+    const std::vector<uint8_t> plain = zlib_text(64);
+    const uint64_t zlib_pages[2] = {b[1], a[0]};
+    constexpr uint16_t kZlibOffset = 0xF800;
+    DSTORAGE_REQUEST inflate{};
+    inflate.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+    inflate.Options.ZlibDecompress = 1;
+    inflate.Options.DestinationIsPhysicalPages = 1;
+    inflate.Source = kZlibDynamic;
+    inflate.SourceSize = static_cast<uint32_t>(sizeof kZlibDynamic);
+    inflate.DestinationPageArray = page_array(zlib_pages);
+    inflate.DestinationPageOffset = kZlibOffset;
+    inflate.DestinationSize = static_cast<uint32_t>(plain.size());
+    mq->EnqueueRequest(&inflate);
+    mq->EnqueueStatus(s, 5);
+    check(kZlibOffset + plain.size() > kPage, "the inflated text crosses into the second page");
+    std::memcpy(want.data() + in_window(b[1]) + kZlibOffset, plain.data(), kPage - kZlibOffset);
+    std::memcpy(want.data() + in_window(a[0]), plain.data() + (kPage - kZlibOffset),
+                plain.size() - (kPage - kZlibOffset));
+
+    // 6: a memory copy into a[3], after what request 0 left at its start.
+    const std::vector<uint8_t> tail = pattern(0x700, 31);
+    const uint64_t tail_page[1] = {a[3]};
+    DSTORAGE_REQUEST copy{};
+    copy.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+    copy.Options.DestinationIsPhysicalPages = 1;
+    copy.Source = tail.data();
+    copy.SourceSize = copy.DestinationSize = static_cast<uint32_t>(tail.size());
+    copy.DestinationPageArray = page_array(tail_page);
+    copy.DestinationPageOffset = 0xF900;  // ends exactly at the end of the page
+    mq->EnqueueRequest(&copy);
+    mq->EnqueueStatus(s, 6);
+    std::memcpy(want.data() + in_window(a[3]) + 0xF900, tail.data(), tail.size());
+    mq->Submit();
+
+    check(wait_complete(s, 4) && wait_complete(s, 6), "physical-page requests complete");
+    check_hr(s->GetHResult(0), S_OK, "a file read into four physical pages from two allocations");
+    check_hr(s->GetHResult(1), E_DSTORAGE_ACCESS_VIOLATION, "a page number that is not a live page");
+    check_hr(s->GetHResult(2), E_DSTORAGE_ACCESS_VIOLATION, "page number 0 as a destination");
+    check_hr(s->GetHResult(3), E_DSTORAGE_ACCESS_VIOLATION, "an unreadable page array");
+    check_hr(s->GetHResult(4), S_OK, "a zero-size physical-page request");
+    check_hr(s->GetHResult(5), S_OK, "zlib from memory into two physical pages");
+    check_hr(s->GetHResult(6), S_OK, "a memory copy that ends at the end of a page");
+
+    // The three pages that were mapped all along already show their bytes; the others are mapped now.
+    check(std::memcmp(window, want.data(), 3 * kPage) == 0, "pages mapped during the requests hold the data");
+    check(map_pages(window + 3 * kPage, 3, all + 3) == window + 3 * kPage, "map the other three pages");
+    check(std::memcmp(window, want.data(), want.size()) == 0,
+          "all six pages hold exactly the requests' bytes, zero elsewhere");
+
+    VirtualFree(unreadable, 0, MEM_RELEASE);
+    check(map_pages(window, 6, nullptr) == window, "unmap the window");
+    check(free_pages(4, a) && free_pages(2, b), "free the pages");
+    // A freed page is no longer a destination.
+    IDStorageStatusArrayX* after = make_status(env, 1);
+    DSTORAGE_REQUEST stale = file_request(big, 0, nullptr, 16);
+    stale.Options.DestinationIsPhysicalPages = 1;
+    stale.DestinationPageArray = page_array(tail_page);
+    q->EnqueueRequest(&stale);
+    q->EnqueueStatus(after, 0);
+    q->Submit();
+    check(wait_complete(after, 0), "the request on a freed page completes");
+    check_hr(after->GetHResult(0), E_DSTORAGE_ACCESS_VIOLATION, "a freed page as a destination");
+
+    // Over 32 MiB: a FILE source needs no memory-buffer page proof; its destination names actual 64 KiB pages.
+    constexpr uint32_t kOver32MiB = (32u << 20) + 1;
+    constexpr uint64_t kBigPages = (kOver32MiB + kPage - 1) / kPage;
+    std::vector<uint64_t> big_pages(kBigPages);
+    uint64_t big_count = kBigPages;
+    const bool have_big = allocate(0x280, &big_count, big_pages.data()) && big_count == kBigPages;
+    check(have_big, "allocate the pages of the large request");
+    if (have_big) {
+        const std::vector<uint8_t> source = pattern(kOver32MiB, 32);
+        write_file(env.game / L"data" / L"large-page-destination.bin", source);
+        IDStorageFileX* large_file = open(env, L"GAME:\\data\\large-page-destination.bin");
+        DSTORAGE_REQUEST over = file_request(large_file, 0, nullptr, kOver32MiB);
+        over.Options.DestinationIsPhysicalPages = 1;
+        over.DestinationPageArray = page_array(big_pages.data());
+        IDStorageStatusArrayX* big_status = make_status(env, 1);
+        q->EnqueueRequest(&over);
+        q->EnqueueStatus(big_status, 0);
+        q->Submit();
+        check(wait_complete(big_status, 0, 60000), "the request over 32 MiB completes");
+        check_hr(big_status->GetHResult(0), S_OK, "over 32 MiB into physical pages");
+        auto* const wide =
+            static_cast<uint8_t*>(reserve(nullptr, kBigPages * kPage, kReserve64kWindow, 1, PAGE_READWRITE));
+        const bool mapped = wide != nullptr && map_pages(wide, kBigPages, big_pages.data()) == wide;
+        check(mapped, "map the large range");
+        if (mapped) {
+            check(std::memcmp(wide, source.data(), kOver32MiB) == 0, "every byte of the large copy is in the pages");
+            check(wide[kOver32MiB] == 0, "the byte after the large copy is untouched");
+            map_pages(wide, kBigPages, nullptr);
+        }
+        if (wide) check(free_window(wide, 0, MEM_RELEASE) != FALSE, "release the complete large physical window");
+        free_pages(kBigPages, big_pages.data());
+        big_status->Release();
+        large_file->Release();
+    }
+
+    check(free_window(window, 0, MEM_RELEASE) != FALSE, "release the complete six-page physical window");
+    after->Release();
+    s->Release();
+    mq->Release();
+    q->Release();
+    big->Release();
+}
+
 void test_zlib(Env& env) {
     const std::vector<uint8_t> dynamic(std::begin(kZlibDynamic), std::end(kZlibDynamic));
     const std::vector<uint8_t> fixed(std::begin(kZlibFixed), std::end(kZlibFixed));
@@ -1122,8 +1331,8 @@ void test_zlib(Env& env) {
         {file.size() - 16, 32, 64, E_DSTORAGE_END_OF_FILE, nullptr, "a zlib source past the end of the file"},
         {at_dynamic, z, 3191, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, nullptr, "zlib with an IntermediateSize", 0,
          16},
-        {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and BCPack is not implemented yet",
-         static_cast<uint64_t>(DSTORAGE_BCPACK_MODE_BC1) << options::kBcpackShift, 64},
+        {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and BC2 BCPack remain unsupported",
+         static_cast<uint64_t>(DSTORAGE_BCPACK_MODE_BC2) << options::kBcpackShift, 64},
         {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and swizzle is not implemented yet",
          static_cast<uint64_t>(DSTORAGE_SWIZZLE_MODE_4K_4K_8K) << options::kSwizzleShift},
     };
@@ -1217,6 +1426,531 @@ void test_zlib(Env& env) {
     check(after.PendingDecompressionRequestCount == 0, "no decompression is pending afterwards");
 }
 
+// Strict native BCPack through the actual queue, with synthetic encoder-built data only. These tests run after
+// the older aggregate-stat checks so new successful decompression requests cannot change their baselines.
+void test_bcpack(Env& env) {
+    using namespace dstorage_bcpack_fixture;
+    const std::vector<uint8_t> packed(std::begin(kBc1), std::end(kBc1));
+    const std::vector<uint8_t> compressed(std::begin(kZlibBc1), std::end(kZlibBc1));
+    const auto stored = stored_stream(packed);
+    std::vector<uint8_t> expected(kDecodedBytes);
+    for (size_t at = 0; at < expected.size(); at += sizeof(kBlock))
+        std::memcpy(expected.data() + at, kBlock, sizeof(kBlock));
+    check(packed.size() < expected.size(), "the 512-block synthetic BC1 stream is smaller than its decoded output");
+    check(stored.size() > packed.size(), "stored zlib plus BCPack has IntermediateSize smaller than SourceSize");
+
+    std::vector<uint8_t> file_bytes(16, 0x5b);
+    const auto append = [&](const std::vector<uint8_t>& bytes) {
+        while (file_bytes.size() % 16) file_bytes.push_back(0x5b);
+        const uint64_t offset = file_bytes.size();
+        file_bytes.insert(file_bytes.end(), bytes.begin(), bytes.end());
+        return offset;
+    };
+    const uint64_t at_packed = append(packed), at_compressed = append(compressed), at_stored = append(stored);
+    write_file(env.game / L"data" / L"bcpack-synthetic.bin", file_bytes);
+    IDStorageFileX* file = open(env, L"GAME:\\data\\bcpack-synthetic.bin");
+    IDStorageQueueX2* fq = make_queue(env, 0x80, false);
+    IDStorageQueueX2* mq = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    IDStorageStatusArrayX* status = make_status(env, 96);
+    if (!file || !fq || !mq || !status) return;
+    DSTORAGE_STATS before{};
+    env.factory->GetStats(&before);
+    UINT32 slot = 0, starts = 0, decode_errors = 0, file_requests = 0, memory_requests = 0;
+    UINT64 file_source_bytes = 0, file_destination_bytes = 0, memory_source_bytes = 0, memory_destination_bytes = 0;
+    const auto run = [&](IDStorageQueueX2* q, const DSTORAGE_REQUEST& r, HRESULT want, const char* label,
+                         bool starts_decode = true, bool decode_error = false) {
+        const UINT32 index = slot++;
+        check(index < 96, "BCPack status capacity covers every case");
+        if (index >= 96) return;
+        q->EnqueueRequest(&r);
+        q->EnqueueStatus(status, index);
+        q->Submit();
+        check(wait_complete(status, index), label);
+        check_hr(status->GetHResult(index), want, label);
+        starts += starts_decode;
+        decode_errors += decode_error;
+        if (q == fq) {
+            ++file_requests; file_source_bytes += r.SourceSize; file_destination_bytes += r.DestinationSize;
+        } else {
+            ++memory_requests; memory_source_bytes += r.SourceSize; memory_destination_bytes += r.DestinationSize;
+        }
+        DSTORAGE_STATS now{};
+        env.factory->GetStats(&now);
+        check(now.PendingDecompressionRequestCount == before.PendingDecompressionRequestCount,
+              "BCPack completion balances the pending decompression count on every path");
+    };
+    const auto memory = [&](const void* source, size_t n, void* destination, bool zlib = false) {
+        DSTORAGE_REQUEST r{};
+        r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+        r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC1;
+        r.Options.ZlibDecompress = zlib;
+        r.Source = source; r.SourceSize = static_cast<uint32_t>(n);
+        r.Destination = destination; r.DestinationSize = kDecodedBytes;
+        r.IntermediateSize = zlib ? static_cast<uint32_t>(packed.size()) : 0;
+        return r;
+    };
+    const auto from_file = [&](uint64_t offset, size_t n, void* destination, bool zlib = false) {
+        auto r = file_request(file, offset, destination, kDecodedBytes);
+        r.SourceSize = static_cast<uint32_t>(n);
+        r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC1;
+        r.Options.ZlibDecompress = zlib;
+        r.IntermediateSize = zlib ? static_cast<uint32_t>(packed.size()) : 0;
+        return r;
+    };
+    std::vector<uint8_t> output(kDecodedBytes, 0xee);
+    for (const auto& r : {from_file(at_packed, packed.size(), output.data()),
+                          from_file(at_compressed, compressed.size(), output.data(), true),
+                          from_file(at_stored, stored.size(), output.data(), true)}) {
+        std::fill(output.begin(), output.end(), uint8_t{0xee});
+        run(fq, r, S_OK, "file BCPack or zlib-plus-BCPack request succeeds");
+        check(output == expected, "file BCPack returns all 512 expected BC1 blocks");
+    }
+    for (const auto& r : {memory(packed.data(), packed.size(), output.data()),
+                          memory(compressed.data(), compressed.size(), output.data(), true),
+                          memory(stored.data(), stored.size(), output.data(), true)}) {
+        std::fill(output.begin(), output.end(), uint8_t{0xee});
+        run(mq, r, S_OK, "memory BCPack or zlib-plus-BCPack request succeeds");
+        check(output == expected, "memory BCPack returns all 512 expected BC1 blocks");
+    }
+    for (bool zlib : {false, true}) {
+        const auto& source = zlib ? compressed : packed;
+        std::vector<uint8_t> in_place(kDecodedBytes, 0xee);
+        std::memcpy(in_place.data() + 128, source.data(), source.size());
+        auto r = memory(in_place.data() + 128, source.size(), in_place.data(), zlib);
+        run(mq, r, S_OK, "overlapping BCPack source and destination succeed through staging");
+        check(in_place == expected, "in-place BCPack has every expected byte");
+    }
+    const auto reject = [&](DSTORAGE_REQUEST r, HRESULT want, const char* label, bool started, bool decode_error) {
+        std::vector<uint8_t> destination((std::max)(r.DestinationSize, kDecodedBytes), 0xe9);
+        r.Destination = destination.data();
+        run(r.Options.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY ? mq : fq, r, want, label, started, decode_error);
+        check(destination == std::vector<uint8_t>(destination.size(), 0xe9),
+              "a refused BCPack request preserves the entire destination");
+    };
+    auto r = memory(packed.data(), 1, nullptr);
+    reject(r, E_DSTORAGE_DECOMPRESSION_ERROR, "truncated BCPack entropy is a decompression error", true, true);
+    r = memory(kProvisional, sizeof(kProvisional), nullptr);
+    reject(r, E_NOTIMPL, "unconfirmed BC1 history is refused without approximate output", true, true);
+    r = memory(kUnknownBc4, sizeof(kUnknownBc4), nullptr); r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC4;
+    reject(r, E_NOTIMPL, "unknown BC4 history is refused without approximate output", true, true);
+    r = memory(packed.data(), packed.size(), nullptr); r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC2;
+    reject(r, E_NOTIMPL, "BC2 remains unsupported", false, false);
+    r = memory(packed.data(), packed.size(), nullptr); r.Options.SwizzleMode = DSTORAGE_SWIZZLE_MODE_4K_4K_8K;
+    reject(r, E_NOTIMPL, "BCPack plus swizzle remains unsupported", false, false);
+    r = from_file(at_packed + 1, packed.size(), nullptr);
+    reject(r, E_DSTORAGE_INVALID_FILE_OFFSET, "BCPack file offsets must satisfy compressed-read alignment", false, false);
+    r = memory(packed.data(), packed.size(), nullptr); r.IntermediateSize = 1;
+    reject(r, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, "BCPack alone does not use IntermediateSize", false, false);
+    r = memory(compressed.data(), compressed.size(), nullptr, true); r.IntermediateSize = 0;
+    reject(r, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, "zlib-plus-BCPack requires an IntermediateSize", false, false);
+    r = memory(compressed.data(), compressed.size(), nullptr, true); r.IntermediateSize = kMaxBcpackIntermediateSize + 1;
+    reject(r, E_DSTORAGE_REQUEST_TOO_LARGE, "zlib-plus-BCPack honors the explicit intermediate staging limit", false, false);
+    r = memory(compressed.data(), compressed.size(), nullptr, true); ++r.IntermediateSize;
+    reject(r, E_DSTORAGE_DECOMPRESSION_ERROR, "zlib-plus-BCPack must produce exactly IntermediateSize", true, true);
+    r = memory(packed.data(), packed.size(), nullptr); r.DestinationSize += sizeof(kBlock);
+    reject(r, E_DSTORAGE_DECOMPRESSION_ERROR, "BCPack must produce exactly the declared destination size", true, true);
+    void* unreadable = VirtualAlloc(nullptr, kPage, MEM_RESERVE, PAGE_READWRITE);
+    check(unreadable != nullptr, "reserve an unreadable BCPack span");
+    r = memory(unreadable, packed.size(), nullptr);
+    reject(r, E_DSTORAGE_ACCESS_VIOLATION, "unreadable BCPack source is refused before decode", false, false);
+    r = memory(packed.data(), packed.size(), unreadable);
+    run(mq, r, E_DSTORAGE_ACCESS_VIOLATION, "unwritable BCPack destination is refused after decode", true, false);
+
+    auto* mixed = static_cast<uint8_t*>(VirtualAlloc(nullptr, 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    check(mixed != nullptr, "allocate mixed-protection BCPack destination");
+    if (mixed) {
+        std::memset(mixed, 0xd7, 8192);
+        DWORD previous = 0;
+        check(VirtualProtect(mixed + 4096, 4096, PAGE_NOACCESS, &previous) != FALSE, "protect the destination's second page");
+        r = memory(packed.data(), packed.size(), mixed + 2048);
+        run(mq, r, E_DSTORAGE_ACCESS_VIOLATION, "BCPack preflights the whole destination before writing its prefix", true, false);
+        check(VirtualProtect(mixed + 4096, 4096, PAGE_READWRITE, &previous) != FALSE, "restore destination protection");
+        check(std::all_of(mixed, mixed + 8192, [](uint8_t byte) { return byte == 0xd7; }),
+              "mixed-protection failure preserves writable prefix and both-page canaries");
+        VirtualFree(mixed, 0, MEM_RELEASE);
+    }
+
+#ifdef LEONIDA_DSTORAGE_TEST_HOOKS
+    for (bool length_error : {false, true}) {
+        for (const auto stage : {test::AllocationStage::source, test::AllocationStage::inflate, test::AllocationStage::bcpack}) {
+            const bool inflate = stage == test::AllocationStage::inflate;
+            r = memory(inflate ? compressed.data() : packed.data(), inflate ? compressed.size() : packed.size(), nullptr, inflate);
+            test::fail_next_allocation(stage, length_error);
+            const bool started = stage != test::AllocationStage::source;
+            reject(r, E_OUTOFMEMORY, "BCPack allocation failure has an exact error and preserves destination", started, started);
+        }
+        // The pre-existing zlib-only path must balance the same guards when
+        // staging or inflation allocation fails, not only the new combined path.
+        for (const auto stage : {test::AllocationStage::source, test::AllocationStage::inflate}) {
+            r = memory(compressed.data(), compressed.size(), nullptr, true);
+            r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_NONE;
+            r.IntermediateSize = 0;
+            r.DestinationSize = static_cast<uint32_t>(packed.size());
+            test::fail_next_allocation(stage, length_error);
+            const bool started = stage != test::AllocationStage::source;
+            reject(r, E_OUTOFMEMORY, "zlib-only allocation failure balances stats and preserves destination", started, started);
+        }
+    }
+#endif
+
+    const auto allocate = reinterpret_cast<AllocatePagesFn>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto free_pages = reinterpret_cast<FreePagesFn>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    const auto reserve = reinterpret_cast<XMemVirtualAllocFn>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto map_pages = reinterpret_cast<MapPagesFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    using FreeWindowFn = BOOL(WINAPI*)(void*, SIZE_T, DWORD);
+    const auto free_window = reinterpret_cast<FreeWindowFn>(rt::shims::find("kernel32.dll", "VirtualFree"));
+    uint64_t pages[2]{}, count = 2;
+    const bool allocated = allocate && free_pages && reserve && map_pages && free_window && allocate(0x280, &count, pages) && count == 2;
+    check(allocated, "allocate BCPack physical destination pages");
+    auto* window = allocated ? static_cast<uint8_t*>(reserve(nullptr, 2 * kPage, kReserve64kWindow, 1, PAGE_READWRITE)) : nullptr;
+    const bool mapped = window && map_pages(window, 2, pages) == window;
+    check(mapped, "map the BCPack destination into a real CPU window");
+    if (mapped) {
+        constexpr uint16_t offset = 0xf800;
+        const auto physical = [&](DSTORAGE_REQUEST request, const uint64_t* ids = nullptr) {
+            request.Options.DestinationIsPhysicalPages = 1;
+            request.DestinationPageArray = page_array(ids ? ids : pages);
+            request.DestinationPageOffset = offset;
+            return request;
+        };
+        for (auto request : {physical(from_file(at_packed, packed.size(), nullptr)),
+                              physical(memory(packed.data(), packed.size(), nullptr)),
+                              physical(memory(stored.data(), stored.size(), nullptr, true))}) {
+            std::memset(window, 0xc6, 2 * kPage);
+            run(request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY ? mq : fq, request, S_OK,
+                "BCPack decoded bytes cross a physical-page boundary");
+            std::vector<uint8_t> want(2 * kPage, 0xc6);
+            std::memcpy(want.data() + offset, expected.data(), expected.size());
+            check(std::memcmp(window, want.data(), want.size()) == 0, "physical BCPack writes decoded bytes and preserves surrounding pages");
+        }
+        const uint64_t bad_pages[2]{pages[0], 0};
+        std::memset(window, 0xc6, 2 * kPage);
+        r = physical(memory(packed.data(), packed.size(), nullptr), bad_pages);
+        run(mq, r, E_DSTORAGE_ACCESS_VIOLATION, "BCPack dead second physical page preserves the first", true, false);
+        check(std::all_of(window, window + 2 * kPage, [](uint8_t byte) { return byte == 0xc6; }), "bad BCPack page array causes no partial write");
+        r = physical(memory(packed.data(), packed.size(), nullptr));
+        r.DestinationPageArray = static_cast<PULONG_PTR>(unreadable);
+        run(mq, r, E_DSTORAGE_ACCESS_VIOLATION, "BCPack unreadable physical-page array is refused", true, false);
+        check(std::all_of(window, window + 2 * kPage, [](uint8_t byte) { return byte == 0xc6; }),
+              "an unreadable BCPack page array preserves both destination pages");
+#ifdef LEONIDA_DSTORAGE_TEST_HOOKS
+        for (bool length_error : {false, true}) {
+            r = physical(memory(packed.data(), packed.size(), nullptr));
+            test::fail_next_allocation(test::AllocationStage::physical_page_array, length_error);
+            run(mq, r, E_OUTOFMEMORY, "physical BCPack allocation failure balances pending statistics", true, false);
+            check(std::all_of(window, window + 2 * kPage, [](uint8_t byte) { return byte == 0xc6; }), "physical BCPack allocation failure preserves every page");
+        }
+#endif
+        map_pages(window, 2, nullptr);
+    }
+    if (window) check(free_window(window, 0, MEM_RELEASE) != FALSE, "release BCPack physical window");
+    if (allocated) check(free_pages(2, pages) != FALSE, "free BCPack physical pages");
+    if (unreadable) VirtualFree(unreadable, 0, MEM_RELEASE);
+    DSTORAGE_STATS after{};
+    env.factory->GetStats(&after);
+    check(after.TotalDecompressionRequestCount - before.TotalDecompressionRequestCount == starts,
+          "BCPack counts each decode request once, including zlib-plus-BCPack");
+    check(after.DecompressionErrors - before.DecompressionErrors == decode_errors,
+          "BCPack decompression errors exclude validation, source-read and final-write failures");
+    check(after.PendingDecompressionRequestCount == before.PendingDecompressionRequestCount,
+          "no BCPack decompression remains pending after success, malformed input and allocation failures");
+    const auto compare_priority = [&](const DSTORAGE_PRIORITY_STATS& a, const DSTORAGE_PRIORITY_STATS& b,
+                                      UINT32 requests, UINT64 source, UINT64 destination) {
+        return a.TotalRequestCount - b.TotalRequestCount == requests &&
+               a.TotalRequestSourceByteCount - b.TotalRequestSourceByteCount == source &&
+               a.TotalRequestDestinationByteCount - b.TotalRequestDestinationByteCount == destination &&
+               a.PendingRequestCount == b.PendingRequestCount;
+    };
+    check(compare_priority(after.NormalPriorityStats, before.NormalPriorityStats, file_requests, file_source_bytes, file_destination_bytes),
+          "BCPack file queue accounts submitted request sizes and balances pending count");
+    check(compare_priority(after.RealtimePriorityStats, before.RealtimePriorityStats, memory_requests, memory_source_bytes, memory_destination_bytes),
+          "BCPack memory queue accounts submitted request sizes and balances pending count");
+    status->Release(); mq->Release(); fq->Release(); file->Release();
+}
+
+// Physical sources are read from the persistent xmem backing, rather than by finding a current CPU mapping.
+// All data below is synthetic. Requests and status markers go through the registered queue implementation.
+void test_source_pages(Env& env) {
+    using namespace dstorage_bcpack_fixture;
+    const auto allocate = reinterpret_cast<AllocatePagesFn>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto free_pages = reinterpret_cast<FreePagesFn>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    const auto reserve = reinterpret_cast<XMemVirtualAllocFn>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto map_pages = reinterpret_cast<MapPagesFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    using FreeWindowFn = BOOL(WINAPI*)(void*, SIZE_T, DWORD);
+    const auto free_window = reinterpret_cast<FreeWindowFn>(rt::shims::find("kernel32.dll", "VirtualFree"));
+    check(allocate && free_pages && reserve && map_pages && free_window, "physical source exports are registered");
+    if (!allocate || !free_pages || !reserve || !map_pages || !free_window) return;
+
+    uint64_t pages[6]{}, count = 6;
+    const bool allocated = allocate(0x280, &count, pages) && count == 6;
+    check(allocated, "allocate six physical source pages");
+    if (!allocated) return;
+    auto* window = static_cast<uint8_t*>(reserve(nullptr, 6 * kPage, kReserve64kWindow, 1, PAGE_READWRITE));
+    auto* alias = static_cast<uint8_t*>(reserve(nullptr, 6 * kPage, kReserve64kWindow, 1, PAGE_READWRITE));
+    const bool mapped = window && map_pages(window, 6, pages) == window;
+    const bool alias_mapped = alias && map_pages(alias, 6, pages) == alias;
+    check(mapped && alias_mapped, "map two CPU aliases of the same physical source pages");
+    if (!mapped || !alias_mapped) {
+        if (mapped) map_pages(window, 6, nullptr);
+        if (alias_mapped) map_pages(alias, 6, nullptr);
+        if (window) free_window(window, 0, MEM_RELEASE);
+        if (alias) free_window(alias, 0, MEM_RELEASE);
+        free_pages(6, pages);
+        return;
+    }
+    IDStorageQueueX2* mq = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    IDStorageStatusArrayX* status = make_status(env, 96);
+    DSTORAGE_STATS before{};
+    env.factory->GetStats(&before);
+    UINT32 slot = 0, starts = 0, decode_errors = 0;
+    UINT64 source_bytes = 0, destination_bytes = 0;
+    const auto run = [&](const DSTORAGE_REQUEST& r, HRESULT want, const char* label,
+                         bool starts_decode = false, bool decode_error = false) {
+        const UINT32 index = slot++;
+        check(index < 96, "physical source status capacity covers every case");
+        if (index >= 96) return;
+        mq->EnqueueRequest(&r);
+        mq->EnqueueStatus(status, index);
+        mq->Submit();
+        check(wait_complete(status, index, 60000), label);
+        check_hr(status->GetHResult(index), want, label);
+        starts += starts_decode;
+        decode_errors += decode_error;
+        source_bytes += r.SourceSize;
+        destination_bytes += r.DestinationSize;
+        DSTORAGE_STATS now{};
+        env.factory->GetStats(&now);
+        check(now.PendingDecompressionRequestCount == before.PendingDecompressionRequestCount,
+              "each physical source completion balances pending decompression");
+    };
+    const auto request = [&](const uint64_t* ids, uint16_t offset, uint32_t n, void* destination) {
+        DSTORAGE_REQUEST r{};
+        r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+        r.Options.SourceIsPhysicalPages = 1;
+        r.SourcePageArray = page_array(ids);
+        r.SourcePageOffset = offset;
+        r.SourceSize = r.DestinationSize = n;
+        r.Destination = destination;
+        return r;
+    };
+    const auto initial = pattern(6 * kPage, 133);
+    std::memcpy(window, initial.data(), initial.size());
+    // UINT16's maximum offset needs three pages for 64 KiB + 2 bytes, in deliberately non-contiguous page order.
+    const uint64_t reordered[3]{pages[2], pages[0], pages[1]};
+    std::vector<uint8_t> output(kPage + 4, 0xe7), expected;
+    expected.push_back(initial[3 * kPage - 1]);
+    expected.insert(expected.end(), initial.begin(), initial.begin() + kPage + 1);
+    auto r = request(reordered, 65535, static_cast<uint32_t>(expected.size()), output.data() + 1);
+    run(r, S_OK, "physical source offset65535 spans three reordered pages");
+    check(std::equal(expected.begin(), expected.end(), output.begin() + 1) && output.front() == 0xe7 && output.back() == 0xe7,
+          "physical source page order, maximum offset and destination canaries are exact");
+    alias[3 * kPage - 1] ^= 0x81;
+    alias[17] ^= 0x44;
+    expected[0] ^= 0x81;
+    expected[18] ^= 0x44;
+    run(r, S_OK, "physical reads observe writes through a second CPU alias");
+    check(std::equal(expected.begin(), expected.end(), output.begin() + 1), "second CPU alias changes reach the source stage");
+    check(map_pages(window, 6, nullptr) == window && map_pages(alias, 6, nullptr) == alias,
+          "unmap both CPU aliases before a physical source request");
+    std::fill(output.begin(), output.end(), uint8_t{0xe7});
+    run(r, S_OK, "unmapped physical source pages remain readable");
+    check(std::equal(expected.begin(), expected.end(), output.begin() + 1) && output.front() == 0xe7 && output.back() == 0xe7,
+          "unmapped persistent backing preserves every byte and output canaries");
+    check(map_pages(window, 6, pages) == window && map_pages(alias, 6, pages) == alias, "remap both physical source aliases");
+
+    // An overlap across physical pages would destroy unread input if the worker wrote each source page as it read it.
+    std::memcpy(window, initial.data(), initial.size());
+    auto overlap_want = initial;
+    std::memmove(overlap_want.data() + 0xf000, overlap_want.data() + 0xe000, 0x24000);
+    r = request(pages, 0xe000, 0x24000, nullptr);
+    r.Options.DestinationIsPhysicalPages = 1;
+    r.DestinationPageArray = page_array(pages);
+    r.DestinationPageOffset = 0xf000;
+    run(r, S_OK, "overlapping physical source and destination are staged before any write");
+    check(std::memcmp(window, overlap_want.data(), overlap_want.size()) == 0,
+          "overlapping physical copy matches memmove with every surrounding byte preserved");
+    std::memcpy(window, initial.data(), initial.size());
+    overlap_want = initial;
+    std::memmove(overlap_want.data() + 0xf000, overlap_want.data() + 0xe000, 0x24000);
+    r = request(pages, 0xe000, 0x24000, alias + 0xf000);
+    run(r, S_OK, "physical source can overlap an ordinary destination through another CPU alias");
+    check(std::memcmp(window, overlap_want.data(), overlap_want.size()) == 0, "CPU-alias overlap also uses complete source staging");
+
+    void* unreadable = VirtualAlloc(nullptr, kPage, MEM_RESERVE, PAGE_READWRITE);
+    check(unreadable != nullptr, "reserve an unreadable physical source page-array span");
+    std::vector<uint8_t> sentinel(8192, 0x9d);
+    const auto refuse = [&](DSTORAGE_REQUEST bad, HRESULT want, const char* label, bool started = false, bool error = false) {
+        std::fill(sentinel.begin(), sentinel.end(), uint8_t{0x9d});
+        bad.Destination = sentinel.data();
+        run(bad, want, label, started, error);
+        check(std::all_of(sentinel.begin(), sentinel.end(), [](uint8_t b) { return b == 0x9d; }),
+              "failed physical source request preserves the entire destination");
+    };
+    const uint64_t zero[1]{0}, invalid[1]{UINT64_MAX};
+    refuse(request(zero, 0, 16, nullptr), E_DSTORAGE_ACCESS_VIOLATION, "page zero cannot be a physical source");
+    refuse(request(invalid, 0, 16, nullptr), E_DSTORAGE_ACCESS_VIOLATION, "an invalid physical source page is refused");
+    refuse(request(static_cast<const uint64_t*>(unreadable), 0, 16, nullptr), E_DSTORAGE_ACCESS_VIOLATION,
+           "an unreadable physical source page array is refused");
+    refuse(request(nullptr, 0, 16, nullptr), E_INVALIDARG, "a null physical source page array is invalid");
+    uint64_t dead = 0, dead_count = 1;
+    const bool have_dead = allocate(0x280, &dead_count, &dead) && dead_count == 1;
+    check(have_dead, "allocate a separate page for a stale physical source ID");
+    if (have_dead) {
+        check(free_pages(1, &dead) != FALSE, "free the stale physical source page");
+        const uint64_t partial[2]{pages[0], dead};
+        refuse(request(partial, 65535, 2, nullptr), E_DSTORAGE_ACCESS_VIOLATION,
+               "a freed second source page causes no partial destination write");
+    }
+    auto* split = static_cast<uint8_t*>(VirtualAlloc(nullptr, 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    check(split != nullptr, "allocate a source array across two CPU protection pages");
+    if (split) {
+        std::memcpy(split + 4088, pages, 2 * sizeof(uint64_t));
+        DWORD old = 0;
+        check(VirtualProtect(split + 4096, 4096, PAGE_NOACCESS, &old) != FALSE, "protect the second source-array entry");
+        refuse(request(reinterpret_cast<uint64_t*>(split + 4088), 65535, 2, nullptr), E_DSTORAGE_ACCESS_VIOLATION,
+               "a partially unreadable source page array is rejected atomically");
+        VirtualFree(split, 0, MEM_RELEASE);
+    }
+    for (const auto* ids : {zero, static_cast<const uint64_t*>(unreadable)})
+        refuse(request(ids, 65535, 0, nullptr), S_OK, "zero-byte physical source does not dereference a nonnull page array");
+    r = request(pages, 0, 16, nullptr); r.DestinationSize = 15;
+    refuse(r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "physical sources retain exact raw-copy size validation");
+
+    // Place the entire encoded stream across an actual source-page boundary, then compare decoded bytes.
+    const auto encoded = [&](const uint8_t* bytes, size_t n, uint32_t decoded, bool zlib, bool bcpack) {
+        std::memset(window, 0xc3, 6 * kPage);
+        std::memcpy(window + 65535, bytes, n);
+        auto compressed = request(pages, 65535, static_cast<uint32_t>(n), sentinel.data());
+        compressed.DestinationSize = decoded;
+        compressed.Options.ZlibDecompress = zlib;
+        compressed.Options.BcpackMode = bcpack ? DSTORAGE_BCPACK_MODE_BC1 : DSTORAGE_BCPACK_MODE_NONE;
+        compressed.IntermediateSize = zlib && bcpack ? static_cast<uint32_t>(sizeof(kBc1)) : 0;
+        return compressed;
+    };
+    const auto text = zlib_text(64);
+    r = encoded(kZlibDynamic, sizeof(kZlibDynamic), static_cast<uint32_t>(text.size()), true, false);
+    std::fill(sentinel.begin(), sentinel.end(), uint8_t{0x9d});
+    run(r, S_OK, "zlib reads its compressed stream across physical source pages", true);
+    check(std::equal(text.begin(), text.end(), sentinel.begin()) &&
+              std::all_of(sentinel.begin() + text.size(), sentinel.end(), [](uint8_t b) { return b == 0x9d; }),
+          "physical-source zlib produces exact decoded text and preserves its suffix");
+    std::vector<uint8_t> blocks(kDecodedBytes);
+    for (size_t at = 0; at < blocks.size(); at += sizeof(kBlock)) std::memcpy(blocks.data() + at, kBlock, sizeof(kBlock));
+    for (bool zlib : {false, true}) {
+        r = encoded(zlib ? kZlibBc1 : kBc1, zlib ? sizeof(kZlibBc1) : sizeof(kBc1), kDecodedBytes, zlib, true);
+        std::fill(sentinel.begin(), sentinel.end(), uint8_t{0x9d});
+        run(r, S_OK, "strict BC1 or zlib-plus-BC1 reads physical source pages", true);
+        check(std::equal(blocks.begin(), blocks.end(), sentinel.begin()) &&
+                  std::all_of(sentinel.begin() + blocks.size(), sentinel.end(), [](uint8_t b) { return b == 0x9d; }),
+              "physical-source BCPack returns all 512 exact synthetic blocks and preserves suffix");
+    }
+    const std::vector<uint8_t> packed(std::begin(kBc1), std::end(kBc1));
+    const auto stored = stored_stream(packed);
+    r = encoded(stored.data(), stored.size(), kDecodedBytes, true, true);
+    r.Options.DestinationIsPhysicalPages = 1;
+    r.DestinationPageArray = page_array(pages + 3);
+    r.DestinationPageOffset = 0xf800;
+    auto physical_want = std::vector<uint8_t>(window, window + 6 * kPage);
+    std::memcpy(physical_want.data() + 3 * kPage + 0xf800, blocks.data(), blocks.size());
+    run(r, S_OK, "stored-zlib-plus-BC1 supports physical sources and destinations together", true);
+    check(stored.size() > r.IntermediateSize && std::memcmp(window, physical_want.data(), physical_want.size()) == 0,
+          "both-page compressed request allows IntermediateSize below SourceSize and preserves all surrounding bytes");
+    r = encoded(kBc1, 1, kDecodedBytes, false, true);
+    refuse(r, E_DSTORAGE_DECOMPRESSION_ERROR, "truncated physical-source entropy is an exact decompression error", true, true);
+    r = encoded(kProvisional, sizeof(kProvisional), kDecodedBytes, false, true);
+    refuse(r, E_NOTIMPL, "physical sources cannot bypass strict refusal of unconfirmed BC1 history", true, true);
+
+#ifdef LEONIDA_DSTORAGE_TEST_HOOKS
+    for (bool length_error : {false, true}) {
+        for (const auto stage : {test::AllocationStage::source, test::AllocationStage::source_page_array,
+                                test::AllocationStage::inflate, test::AllocationStage::bcpack}) {
+            const bool inflate = stage == test::AllocationStage::inflate;
+            r = encoded(inflate ? kZlibBc1 : kBc1, inflate ? sizeof(kZlibBc1) : sizeof(kBc1), kDecodedBytes, inflate, true);
+            test::fail_next_allocation(stage, length_error);
+            const bool started = stage == test::AllocationStage::inflate || stage == test::AllocationStage::bcpack;
+            refuse(r, E_OUTOFMEMORY, "physical source allocation failures preserve destination and exact stats", started, started);
+        }
+        r = encoded(kBc1, sizeof(kBc1), kDecodedBytes, false, true);
+        r.Options.DestinationIsPhysicalPages = 1;
+        r.DestinationPageArray = page_array(pages + 3);
+        r.DestinationPageOffset = 0xf800;
+        const std::vector<uint8_t> before_oom(window, window + 6 * kPage);
+        test::fail_next_allocation(test::AllocationStage::source_page_array, length_error);
+        run(r, E_OUTOFMEMORY, "source-page array OOM leaves a physical destination untouched");
+        check(std::memcmp(window, before_oom.data(), before_oom.size()) == 0, "source-page array OOM preserves all source/destination pages");
+    }
+#endif
+
+    // Both buffers explicitly name 64 KiB pages, so the memory-request 1 GiB combined bound replaces both 32 MiB caps.
+    constexpr uint32_t kOver32MiB = (32u << 20) + 1;
+    constexpr uint64_t kBigPages = (kOver32MiB + kPage - 1) / kPage;
+    std::vector<uint64_t> big_source(kBigPages), big_destination(kBigPages);
+    uint64_t ns = kBigPages, nd = kBigPages;
+    const bool have_source = allocate(0x280, &ns, big_source.data()) && ns == kBigPages;
+    const bool have_destination = allocate(0x280, &nd, big_destination.data()) && nd == kBigPages;
+    check(have_source && have_destination, "allocate source and destination for a physical copy over32MiB");
+    auto* source_window = have_source ? static_cast<uint8_t*>(reserve(nullptr, kBigPages * kPage, kReserve64kWindow, 1, PAGE_READWRITE)) : nullptr;
+    auto* destination_window = have_destination ? static_cast<uint8_t*>(reserve(nullptr, kBigPages * kPage, kReserve64kWindow, 1, PAGE_READWRITE)) : nullptr;
+    const bool source_mapped = source_window && map_pages(source_window, kBigPages, big_source.data()) == source_window;
+    const bool destination_mapped = destination_window && map_pages(destination_window, kBigPages, big_destination.data()) == destination_window;
+    check(source_mapped && destination_mapped, "map both large physical ranges");
+    if (source_mapped && destination_mapped) {
+        const auto bytes = pattern(kOver32MiB, 141);
+        std::memcpy(source_window, bytes.data(), bytes.size());
+        std::memset(destination_window, 0xa6, kBigPages * kPage);
+        check(map_pages(source_window, kBigPages, nullptr) == source_window, "unmap the large physical source before its queued read");
+        r = request(big_source.data(), 0, kOver32MiB, nullptr);
+        r.Options.DestinationIsPhysicalPages = 1;
+        r.DestinationPageArray = page_array(big_destination.data());
+        run(r, S_OK, "unmapped physical source and physical destination allow a copy over32MiB");
+        check(std::memcmp(destination_window, bytes.data(), bytes.size()) == 0 &&
+                  std::all_of(destination_window + bytes.size(), destination_window + kBigPages * kPage,
+                              [](uint8_t b) { return b == 0xa6; }),
+              "every byte of the large physical copy is exact and the full trailing page suffix is untouched");
+        r.Options.SourceIsPhysicalPages = 0;
+        r.Source = bytes.data();
+        std::memset(destination_window, 0xa6, kBigPages * kPage);
+        run(r, E_DSTORAGE_REQUEST_TOO_LARGE, "an ordinary source over32MiB is refused even with a physical destination");
+        check(std::all_of(destination_window, destination_window + kBigPages * kPage, [](uint8_t b) { return b == 0xa6; }),
+              "oversized ordinary-source rejection leaves the physical destination intact");
+        r = request(big_source.data(), 0, kOver32MiB, sentinel.data());
+        refuse(r, E_DSTORAGE_REQUEST_TOO_LARGE, "a physical source does not waive the ordinary destination32MiB cap");
+    }
+    // No huge allocation is needed to reject an oversized declared request before either page array is read.
+    r = request(static_cast<const uint64_t*>(unreadable), 65535, (512u << 20) + 1, nullptr);
+    r.Options.DestinationIsPhysicalPages = 1;
+    r.DestinationPageArray = page_array(pages);
+    const std::vector<uint8_t> before_limit(window, window + 6 * kPage);
+    run(r, E_DSTORAGE_REQUEST_TOO_LARGE, "physical source plus destination cannot exceed the combined1GiB bound");
+    check(std::memcmp(window, before_limit.data(), before_limit.size()) == 0, "combined-limit failure never reads bad arrays or writes destination");
+    r.SourceSize = r.DestinationSize = UINT32_MAX;
+    run(r, E_DSTORAGE_REQUEST_TOO_LARGE, "physical source/destination size sum is checked without32bit overflow");
+    check(std::memcmp(window, before_limit.data(), before_limit.size()) == 0, "overflow-sized declaration preserves all destination pages");
+    if (source_mapped) map_pages(source_window, kBigPages, nullptr);
+    if (destination_mapped) map_pages(destination_window, kBigPages, nullptr);
+    if (source_window) check(free_window(source_window, 0, MEM_RELEASE) != FALSE, "release the large physical source window");
+    if (destination_window) check(free_window(destination_window, 0, MEM_RELEASE) != FALSE, "release the large physical destination window");
+    if (have_source) check(free_pages(kBigPages, big_source.data()) != FALSE, "free large source pages");
+    if (have_destination) check(free_pages(kBigPages, big_destination.data()) != FALSE, "free large destination pages");
+
+    DSTORAGE_STATS after{};
+    env.factory->GetStats(&after);
+    check(after.TotalDecompressionRequestCount - before.TotalDecompressionRequestCount == starts &&
+              after.DecompressionErrors - before.DecompressionErrors == decode_errors,
+          "physical sources count decode starts/errors exactly, excluding validation and source staging failures");
+    const auto& a = after.RealtimePriorityStats;
+    const auto& b = before.RealtimePriorityStats;
+    check(a.TotalRequestCount - b.TotalRequestCount == slot && a.TotalRequestSourceByteCount - b.TotalRequestSourceByteCount == source_bytes &&
+              a.TotalRequestDestinationByteCount - b.TotalRequestDestinationByteCount == destination_bytes &&
+              a.PendingRequestCount == b.PendingRequestCount && after.PendingDecompressionRequestCount == before.PendingDecompressionRequestCount,
+          "physical source success/failure/OOM cases account all submitted sizes and balance every pending count");
+    if (unreadable) VirtualFree(unreadable, 0, MEM_RELEASE);
+    check(map_pages(window, 6, nullptr) == window && map_pages(alias, 6, nullptr) == alias, "unmap both final physical source aliases");
+    check(free_window(window, 0, MEM_RELEASE) != FALSE && free_window(alias, 0, MEM_RELEASE) != FALSE, "release both physical source windows");
+    check(free_pages(6, pages) != FALSE, "free physical source test pages");
+    status->Release(); mq->Release();
+}
+
 }  // namespace
 
 int main() {
@@ -1253,6 +1987,9 @@ int main() {
     test_stats_timing(env);
     test_stats(env);
     test_zlib(env);  // after test_stats, whose request totals it would change
+    test_destination_pages(env);
+    test_bcpack(env);
+    test_source_pages(env);
 
     fs::remove_all(env.root, ec);
     std::printf("dstorage: %d checks, %d failures\n", g_checks, g_failures);

@@ -5,9 +5,21 @@ repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the
 separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
 `DllMain`s without an exception
 ([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
-trace tool for the first boot. Outbound `ws2_32.dll` and `winhttp.dll` calls are restricted offline by the shims
-(`ws2_offline.cpp` permits loopback only; `winhttp_offline.cpp` refuses all requests), though running with the network
-off remains good defence in depth. Nothing here quotes game data; a real trace stays on the player's machine.
+trace tool for the first boot. The default build permits loopback Winsock calls and refuses outbound connections. Builds configured with
+`-DLEONIDA_DISABLE_GUEST_SOCKETS=ON` bind the executable's `ws2_32.dll` imports to the guest-only offline boundary
+(`winsock_offline.cpp`): socket creation and I/O return `INVALID_SOCKET`/`SOCKET_ERROR` with `WSAENETDOWN`.
+`gethostbyname` returns null, and `getaddrinfo` returns `WSATRY_AGAIN` directly with a null result. No socket or DNS
+request is made. Named and measured ordinal imports and guest `GetProcAddress` use the same bindings; unknown
+dynamic exports on the owned Winsock module fail with `ERROR_PROC_NOT_FOUND`. Startup/cleanup, thread-local error
+access and local address helpers remain host-backed. This does not change host exports or system networking.
+WinHTTP requests are also refused by the offline shim. Nothing here quotes game data; a real trace stays on the player's machine.
+
+The signatures and error conventions follow Microsoft's [socket](https://learn.microsoft.com/windows/win32/api/winsock2/nf-winsock2-socket),
+[WSASend](https://learn.microsoft.com/windows/win32/api/winsock2/nf-winsock2-wsasend),
+[gethostbyname](https://learn.microsoft.com/windows/win32/api/winsock2/nf-winsock2-gethostbyname), and
+[getaddrinfo](https://learn.microsoft.com/windows/win32/api/ws2tcpip/nf-ws2tcpip-getaddrinfo) references.
+`winsock_offline_test` checks the registry and dynamic lookup paths with inaccessible synthetic input/output pages,
+immediate send failure with no callbacks, null DNS results, and thread-local errors. It never opens a host socket.
 
 ## 1. What the first boot produces
 
@@ -168,7 +180,7 @@ order. It maps each question to the event to look for; it does not answer them.
 | # | Question | Signal in the first trace |
 |---|---|---|
 | 1 | `D3D12XboxCreateDevice` 24-word params and flags | first `D3D12XboxCreateDevice` in the D3D12 trace; the shim prints the 24 words as an `[rt]` line in the same log, with or without `--trace-d3d12` (grep `^\[rt\]`); accept unknown flags |
-| 2 | Xbox device/heap/queue/command-list slots | queue, fence and allocator method names in the D3D12 trace; device slots past the PC vtable print an `[rt] d3d12_xs: device slot …` line instead and record nothing; compare with the SDK vtable |
+| 2 | Xbox device/heap/queue/command-list slots | queue, fence and allocator method names in the D3D12 trace; device slots past the PC vtable print an `[rt] d3d12_xs: device slot â€¦` line instead and record nothing; compare with the SDK vtable |
 | 3 | Root signature → `s0..s31` | `CreateRootSignature`, `SetGraphicsRootSignature`, then the shader's user-SGPR reads; mask `0x03000000` on a copy |
 | 4 | Descriptor bytes and heap increments | first `CreateShaderResourceView`/`CreateSampler` and the first draw; dump the heap bytes and compare with the T#/S# parser |
 | 5 | VA range and arena capacity | `GetGPUVirtualAddress` and every descriptor base; high-water mark |

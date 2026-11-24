@@ -18,6 +18,8 @@
 
 #include <filesystem>
 
+#include "partial_package.h"
+
 namespace rt::fs {
 
 inline constexpr wchar_t kPersistentStorageDir[] = L".gta6rt-persistent";
@@ -28,6 +30,12 @@ void configure(const std::filesystem::path& game_dir, const std::filesystem::pat
 
 std::filesystem::path game_dir();
 std::filesystem::path overlay_dir();
+
+// Private read-only tokens used by the file and DirectStorage shims. They never expose the partial source's
+// native handle. Each new token has its own synchronous file position; unknown handles are not consumed.
+partial_package::FileRef partial_file_for_handle(HANDLE handle);
+HANDLE make_partial_read_handle(const partial_package::FileRef& file);
+bool close_partial_read_handle(HANDLE handle);
 
 // For tests: true makes the CopyFile2 shim use its CopyFileExW fallback even where the host has CopyFile2, so the
 // path Wine 9 takes can be checked on Windows. Off by default; main.cpp never sets it.

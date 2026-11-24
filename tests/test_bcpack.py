@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -488,6 +489,41 @@ class EntropyLayerTest(unittest.TestCase):
             bcpack.decode_lanes(raw, 99, 64)
         with self.assertRaises(bcpack.BcpackError):
             bcpack.decode_lanes(raw, 1, 60)
+
+    def test_non_final_fragment_ending_at_the_home_state_raises(self):
+        """A flush=0 fragment whose bytes run out with the state exactly at RANS_L while a symbol is still owed
+        is refused. It used to match no branch of the lane decoder, which then looped forever, so the decode runs
+        in a child process with a timeout and a regression fails here instead of hanging the suite."""
+        # Every BC1 lane: header 0x00 (flush 0, q 0), length byte 3 (4 bytes), payload 01 00 00 00, which leaves
+        # the state at ((1 << 8) << 8) << 8 = RANS_L after the last byte. The scheduler serves 8 bytes a cycle:
+        # lanes 0-7 for the 6 bytes, then lanes 8-11 (72 bytes in all).
+        lane = bytes([0x00, 0x03, 0x01, 0x00, 0x00, 0x00])
+        raw = b"".join(bytes([b]) * 8 for b in lane) + b"".join(bytes([b]) * 4 for b in lane)
+        child = (
+            "import sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import bcpack\n"
+            "raw = bytes.fromhex(sys.argv[2])\n"
+            "for call in (lambda: bcpack._decode_lanes_raw(raw, bcpack.LANE_WIDTHS[1], 1),\n"
+            "             lambda: bcpack.decode(raw, 1, 8)):\n"
+            "    try:\n"
+            "        call()\n"
+            "    except bcpack.BcpackError as exc:\n"
+            "        print('BcpackError', exc)\n"
+            "    else:\n"
+            "        print('no error')\n"
+        )
+        try:
+            proc = subprocess.run([sys.executable, "-I", "-c", child, os.path.join(ROOT, "tools"), raw.hex()],
+                                  capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail("the lane decoder did not finish within 60 s on a 72-byte chunk (endless loop)")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(len(lines), 2, proc.stdout)
+        for line in lines:
+            self.assertTrue(line.startswith("BcpackError "), line)
+            self.assertIn("home state", line)
 
     def test_unsupported_codec_rebuild_raises(self):
         # Codec 2 (BC2) is unused in the corpus and has no lane/block decoder.
@@ -1241,7 +1277,8 @@ class ValidationAndTerminationTests(unittest.TestCase):
         # Single-lane direct test: non-flushing (flush=0), 4-byte payload 01 00 00 00
         # loads st == RANS_L with in_rem == 0 while out_rem == 1 remains.
         bad_frag = bytes(_make_hdr(8, 8, 0, False, 4) + [0x01, 0x00, 0x00, 0x00])
-        with self.assertRaisesRegex(bcpack.BcpackError, r"lane 0 .*fragment did not end at its home state"):
+        message = r"lane 0 .*fragment ended at its home state with symbols still to decode"
+        with self.assertRaisesRegex(bcpack.BcpackError, message):
             bcpack._decode_lanes_raw(bad_frag, (8,), 1)
 
         # Full 12-lane BC1 chunk via public decode_lanes(): lane 0 has bad_frag while
@@ -1296,7 +1333,7 @@ class ValidationAndTerminationTests(unittest.TestCase):
                     in_rem[i] -= 1
                     full[i] = False
         self.assertEqual(lpos, [len(f) for f in frags])
-        with self.assertRaisesRegex(bcpack.BcpackError, r"lane 0 .*fragment did not end at its home state"):
+        with self.assertRaisesRegex(bcpack.BcpackError, message):
             bcpack.decode_lanes(bytes(raw), 1, 8)
 
     def test_bc6h_anchor_violation_without_provisional_history_raises_in_provisional_mode(self):

@@ -40,6 +40,7 @@ using FindCloseFn = BOOL(WINAPI*)(HANDLE);
 using GetFileAttributesWFn = DWORD(WINAPI*)(LPCWSTR);
 using GetFileAttributesAFn = DWORD(WINAPI*)(LPCSTR);
 using GetFileAttributesExWFn = BOOL(WINAPI*)(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
+using GetFileAttributesExAFn = BOOL(WINAPI*)(LPCSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
 using DeleteFileWFn = BOOL(WINAPI*)(LPCWSTR);
 using DeleteFileAFn = BOOL(WINAPI*)(LPCSTR);
 using CreateDirectoryWFn = BOOL(WINAPI*)(LPCWSTR, LPSECURITY_ATTRIBUTES);
@@ -70,6 +71,51 @@ template <typename Fn>
 Fn resolve(const char* dll, const char* name) {
     return reinterpret_cast<Fn>(rt::shims::find(dll, name));
 }
+
+// Non-tail callers let the synthetic module lookup distinguish the title's caller from an ANSI-to-wide shim
+// delegation. Its deliberate last-error change also checks that trace formatting cannot corrupt the API error.
+int g_attribute_calls_returned = 0;
+__declspec(noinline) DWORD traced_attributes_w(GetFileAttributesWFn fn, LPCWSTR name) {
+    const DWORD result = fn(name);
+    ++g_attribute_calls_returned;
+    return result;
+}
+__declspec(noinline) DWORD traced_attributes_a(GetFileAttributesAFn fn, LPCSTR name) {
+    const DWORD result = fn(name);
+    ++g_attribute_calls_returned;
+    return result;
+}
+__declspec(noinline) BOOL traced_attributes_ex_w(GetFileAttributesExWFn fn, LPCWSTR name, LPVOID info) {
+    const BOOL result = fn(name, GetFileExInfoStandard, info);
+    ++g_attribute_calls_returned;
+    return result;
+}
+__declspec(noinline) BOOL traced_attributes_ex_a(GetFileAttributesExAFn fn, LPCSTR name, LPVOID info) {
+    const BOOL result = fn(name, GetFileExInfoStandard, info);
+    ++g_attribute_calls_returned;
+    return result;
+}
+struct AttributeCaller {
+    uint64_t begin = 0, end = 0;
+    int hits = 0;
+
+    void expect(const void* function) {
+        DWORD64 base = 0;
+        const auto entry = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(function), &base, nullptr);
+        check(entry != nullptr, "synthetic attribute caller has unwind bounds");
+        begin = entry ? base + entry->BeginAddress : 0;
+        end = entry ? base + entry->EndAddress : 0;
+    }
+    static bool lookup(void* context, uint64_t address, std::string& module, uint32_t& rva) {
+        auto& probe = *static_cast<AttributeCaller*>(context);
+        if (address < probe.begin || address >= probe.end) return false;
+        ++probe.hits;
+        module = "attribute_guest.exe";
+        rva = static_cast<uint32_t>(address - probe.begin);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return true;
+    }
+};
 
 void write_path(const std::filesystem::path& path, const std::string& text) {
     std::filesystem::create_directories(path.parent_path());
@@ -291,10 +337,11 @@ void run_checks(const std::filesystem::path& root) {
     const auto attributes_w = resolve<GetFileAttributesWFn>("kernel32.dll", "GetFileAttributesW");
     const auto attributes_a = resolve<GetFileAttributesAFn>("kernel32.dll", "GetFileAttributesA");
     const auto attributes_ex_w = resolve<GetFileAttributesExWFn>("kernel32.dll", "GetFileAttributesExW");
+    const auto attributes_ex_a = resolve<GetFileAttributesExAFn>("kernelbase.dll", "GetFileAttributesExA");
     const auto delete_w = resolve<DeleteFileWFn>("kernel32.dll", "DeleteFileW");
     const auto delete_a = resolve<DeleteFileAFn>("api-ms-win-core-file-l1-1-0.dll", "DeleteFileA");
     check(create_w && create_a && first_w && first_a && next_w && find_close && attributes_w && attributes_a &&
-              attributes_ex_w && delete_w && delete_a,
+              attributes_ex_w && attributes_ex_a && delete_w && delete_a,
           "the file API resolves through the registry under kernel32/kernelbase and the api sets");
 
     // A read of a package file, through the mixed-case prefix and through forward slashes.
@@ -343,6 +390,73 @@ void run_checks(const std::filesystem::path& root) {
         check(log.find("\"error\":2,") != std::string::npos, "the event carries error 2");
         check(log.find("\"caller\":\"host:") != std::string::npos, "the event names a caller");
         check(count(log, "absent_off") == 0, "nothing was traced before the trace was opened");
+    }
+
+    // Failed attribute probes are traced only when opted in, with the original A/W API and caller. Both a native
+    // missing-file error and a refused guest traversal retain their normal results/errors despite the trace writer.
+    {
+        std::wstring trace = (root / "attribute_success_trace.jsonl").wstring();
+        const auto events = [&] {
+            std::ifstream in(std::filesystem::path(trace), std::ios::binary);
+            std::stringstream text;
+            text << in.rdbuf();
+            return text.str();
+        };
+        const auto count = [](const std::string& hay, const std::string& needle) {
+            int n = 0;
+            for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) ++n;
+            return n;
+        };
+        check(attributes_w(L"GAME:\\data\\attribute_off.txt") == INVALID_FILE_ATTRIBUTES &&
+                  GetLastError() == ERROR_FILE_NOT_FOUND, "attribute failure with tracing off retains its error");
+        check(rt::startup_trace::open(trace.c_str()), "open attribute-probe startup trace");
+        check(attributes_w(L"GAME:\\data\\hello.txt") != INVALID_FILE_ATTRIBUTES,
+              "successful attribute query with tracing on");
+        WIN32_FILE_ATTRIBUTE_DATA info{};
+        check(attributes_ex_a("GAME:\\data\\hello.txt", GetFileExInfoStandard, &info) != FALSE,
+              "successful ANSI extended attribute query with tracing on");
+        rt::startup_trace::close();  // the Windows CRT writer denies reads while the file is open
+        check(count(events(), "file_attributes_failed") == 0, "success writes no attribute-failure event");
+        trace = (root / "attribute_trace.jsonl").wstring();
+        check(rt::startup_trace::open(trace.c_str()), "open failure attribute-probe trace");
+        AttributeCaller caller;
+        rt::shims::add_module_lookup(&caller, &AttributeCaller::lookup);
+        caller.expect(reinterpret_cast<const void*>(&traced_attributes_w));
+        check(traced_attributes_w(attributes_w, L"GAME:\\data\\attribute_\u00e9_w.txt") == INVALID_FILE_ATTRIBUTES &&
+                  GetLastError() == ERROR_FILE_NOT_FOUND, "wide native query failure preserves last error while tracing");
+        caller.expect(reinterpret_cast<const void*>(&traced_attributes_a));
+        check(traced_attributes_a(attributes_a, "GAME:\\data\\attribute_a.txt") == INVALID_FILE_ATTRIBUTES &&
+                  GetLastError() == ERROR_FILE_NOT_FOUND, "ANSI native query failure preserves last error while tracing");
+        caller.expect(reinterpret_cast<const void*>(&traced_attributes_ex_w));
+        check(!traced_attributes_ex_w(attributes_ex_w, L"GAME:\\..\\attribute_outside.txt", &info) &&
+                  GetLastError() == ERROR_INVALID_NAME, "wide policy refusal preserves last error while tracing");
+        caller.expect(reinterpret_cast<const void*>(&traced_attributes_ex_a));
+        check(!traced_attributes_ex_a(attributes_ex_a, "GAME:\\data\\attribute_ex_a.txt", &info) &&
+                  GetLastError() == ERROR_FILE_NOT_FOUND, "ANSI extended query failure preserves last error while tracing");
+        rt::shims::remove_module_lookup(&caller);
+        check(caller.hits == 4 && g_attribute_calls_returned == 4,
+              "all four events resolve the original caller, including ANSI entry points");
+        rt::startup_trace::close();
+        std::string log = events();
+        check(count(log, "\"kind\":\"file_attributes_failed\"") == 4, "one event per failed attribute query");
+        for (const char* api : {"GetFileAttributesA", "GetFileAttributesW", "GetFileAttributesExA", "GetFileAttributesExW"})
+            check(count(log, std::string("\"api\":\"") + api + "\"") == 1, "attribute event names its original API");
+        check(log.find("\"path\":\"GAME:\\\\data\\\\attribute_\xc3\xa9_w.txt\"") != std::string::npos &&
+                  log.find("\"path\":\"GAME:\\\\..\\\\attribute_outside.txt\"") != std::string::npos,
+              "events preserve the guest paths as UTF-8 JSON, including a refused path");
+        check(count(log, "\"error\":2,") == 3 && count(log, "\"error\":123,") == 1 &&
+                  count(log, "\"caller\":\"attribute_guest.exe+0x") == 4,
+              "events carry native/policy errors and a module-relative original caller");
+        check(log.find("attribute_off") == std::string::npos, "failure before trace activation is not recorded");
+        trace = (root / "attribute_budget_trace.jsonl").wstring();
+        check(rt::startup_trace::open(trace.c_str()), "open bounded attribute-probe trace");
+        for (int i = 0; i != 260; ++i) attributes_a("GAME:\\data\\attribute_budget.txt");
+        rt::startup_trace::close();
+        log = events();
+        check(count(log, "\"kind\":\"file_attributes_failed\"") == 252,
+              "attribute-failure diagnostics are capped at 256 events");
+        attributes_a("GAME:\\data\\attribute_after_close.txt");
+        check(events() == log, "closing the trace disables further attribute diagnostics");
     }
 
     // Attributes, wide and narrow.

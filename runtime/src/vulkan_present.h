@@ -51,6 +51,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -85,6 +86,117 @@ struct PresentPlanes {
 };
 
 namespace detail {
+// Sample small horizontal strips spread across the central 80% of the presented image. Each in-flight
+// frame owns a disjoint mapped slice, consumed after the presenter's existing fence wait.
+struct PresentPixelSamples {
+    using Clock = std::chrono::steady_clock;
+    static constexpr unsigned columns = 6, rows = 4, strip = 8, capacity = columns * rows * strip;
+    static constexpr VkDeviceSize slice_bytes = capacity * sizeof(std::uint32_t);
+    std::array<std::array<VkBufferImageCopy, columns * rows>, 2> regions{};
+    std::array<Clock::time_point, 2> submitted{};
+    std::array<std::uint32_t, capacity> previous{};
+    unsigned region_count = 0, pixels = 0;
+    std::uint32_t rgb_mask = 0, channel_mask = 0, channel_delta_limit = 0;
+    unsigned channel_bits = 0, required_pixels = 0;
+    Clock::time_point start{}, last{};
+    std::uint64_t frames = 0, changed = 0, changed_pixels = 0, threshold_frames = 0;
+
+    void configure(VkExtent2D extent, VkFormat format, VkDeviceSize base) {
+        start = last = {};
+        frames = changed = changed_pixels = threshold_frames = 0;
+        submitted = {};
+        region_count = pixels = required_pixels = 0;
+        const auto left = extent.width / 10, top = extent.height / 10;
+        const auto w = extent.width - 2 * left, h = extent.height - 2 * top;
+        const auto cols = std::min(columns, w), lines = std::min(rows, h);
+        if (!cols || !lines) return;
+        const auto width = std::min(strip, w / cols);
+        channel_bits = format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 || format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
+            ? 10u : 8u;
+        channel_mask = (1u << channel_bits) - 1;
+        rgb_mask = (1u << (3 * channel_bits)) - 1;
+        // Strictly over 8/255 of the encoded channel range: at least 9 SDR codes or 33 HDR10 codes.
+        channel_delta_limit = (8u * channel_mask) / 255u;
+        for (unsigned y = 0; y < lines; ++y) {
+            for (unsigned x = 0; x < cols; ++x) {
+                VkBufferImageCopy copy{};
+                copy.bufferOffset = base + pixels * sizeof(std::uint32_t);
+                copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.imageOffset.x = std::int32_t(left + (std::uint64_t(2 * x + 1) * w / cols - width) / 2);
+                copy.imageOffset.y = std::int32_t(top + std::uint64_t(2 * y + 1) * h / (2 * lines));
+                copy.imageExtent = {width, 1, 1};
+                regions[0][region_count] = copy;
+                copy.bufferOffset += slice_bytes;
+                regions[1][region_count++] = copy;
+                pixels += width;
+            }
+        }
+        required_pixels = std::min(4u, pixels);  // on tiny images require all available samples
+    }
+
+    bool channel_delta_over_limit(std::uint32_t rgb, std::uint32_t old) const {
+        for (unsigned channel = 0; channel < 3; ++channel) {
+            const auto a = rgb & channel_mask, b = old & channel_mask;
+            if (a > b + channel_delta_limit || b > a + channel_delta_limit) return true;
+            rgb >>= channel_bits;
+            old >>= channel_bits;
+        }
+        return false;
+    }
+
+    void report() {
+        const double seconds = std::chrono::duration<double>(last - start).count();
+        if (frames && seconds > 0)
+            std::fprintf(stderr, "[rt] presented pixel samples: seconds=%.3f changed_frames=%llu compared_frames=%llu "
+                         "changed_fps=%.2f samples_per_frame=%u changed_samples=%llu "
+                         "rgb_delta_gt_8_of_255_required_samples=%u rgb_delta_gt_8_of_255_frames=%llu "
+                         "rgb_delta_gt_8_of_255_fps=%.2f\n", seconds,
+                         static_cast<unsigned long long>(changed), static_cast<unsigned long long>(frames),
+                         double(changed) / seconds, pixels, static_cast<unsigned long long>(changed_pixels),
+                         required_pixels, static_cast<unsigned long long>(threshold_frames), double(threshold_frames) / seconds);
+        start = last;
+        frames = changed = changed_pixels = threshold_frames = 0;
+    }
+
+    void consume(unsigned slot, const std::uint8_t* mapped) {
+        const auto stamp = submitted[slot];
+        if (stamp == Clock::time_point{}) return;
+        submitted[slot] = {};
+        if (!pixels) return;
+        const auto* src = mapped + regions[slot][0].bufferOffset;
+        unsigned diff = 0, over_limit = 0;
+        for (unsigned i = 0; i < pixels; ++i) {
+            std::uint32_t raw;
+            std::memcpy(&raw, src + i * sizeof(raw), sizeof(raw));
+            const auto rgb = raw & rgb_mask;
+            if (rgb != previous[i]) {
+                ++diff;
+                if (over_limit < required_pixels && channel_delta_over_limit(rgb, previous[i])) ++over_limit;
+                previous[i] = rgb;
+            }
+        }
+        if (last == Clock::time_point{}) start = stamp;
+        else {
+            ++frames;
+            changed += diff != 0;
+            changed_pixels += diff;
+            threshold_frames += over_limit >= required_pixels;
+        }
+        last = stamp;
+        if (last - start >= std::chrono::seconds(4)) report();
+    }
+};
+
+// For an unsynchronized present, MAILBOX replaces queued frames at vblank; IMMEDIATE permits mid-scan updates.
+inline VkPresentModeKHR choose_present_mode(const std::vector<VkPresentModeKHR>& modes, bool sync, bool prefer_tearing) {
+    if (sync) return VK_PRESENT_MODE_FIFO_KHR;
+    const auto first = prefer_tearing ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_MAILBOX_KHR;
+    const auto second = prefer_tearing ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
+    for (const auto candidate : {first, second})
+        if (std::find(modes.begin(), modes.end(), candidate) != modes.end()) return candidate;
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
 inline bool is_srgb_format(VkFormat format) {
     switch (format) {
     case VK_FORMAT_R8_SRGB: case VK_FORMAT_R8G8_SRGB: case VK_FORMAT_R8G8B8_SRGB: case VK_FORMAT_B8G8R8_SRGB:
@@ -117,7 +229,7 @@ public:
                     bool swapchain_maintenance1 = false,
                     std::function<VkExtent2D()> extent_fn = nullptr,
                     std::function<VkSurfaceKHR()> recreate_surface_fn = nullptr)
-        : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
+        : context_(context), instance_(instance), physical_(physical), queue_(queue), family_(family), surface_(surface),
           maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)),
           recreate_surface_fn_(std::move(recreate_surface_fn)) {
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
@@ -131,7 +243,12 @@ public:
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceMemoryProperties)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceFormatProperties)
 #undef LEONIDA_INSTANCE_FN
-        if (!vkGetDeviceProcAddr_ || !vkDestroySurfaceKHR_) return;
+        if (!vkGetDeviceProcAddr_ || !vkDestroySurfaceKHR_ || !vkGetPhysicalDeviceSurfaceSupportKHR_ ||
+            !vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ || !vkGetPhysicalDeviceSurfaceFormatsKHR_ ||
+            !vkGetPhysicalDeviceSurfacePresentModesKHR_) {
+            std::fprintf(stderr, "[rt] present: Vulkan instance presentation entry points unavailable\n");
+            return;
+        }
         const VkDevice device = context.device();
 #define LEONIDA_DEVICE_FN(name) name##_ = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr_(device, #name));
         LEONIDA_DEVICE_FN(vkCreateSwapchainKHR)
@@ -146,17 +263,26 @@ public:
         LEONIDA_DEVICE_FN(vkWaitForFences)
         LEONIDA_DEVICE_FN(vkResetFences)
 #undef LEONIDA_DEVICE_FN
-        if (!vkCreateSwapchainKHR_ || !vkQueuePresentKHR_ || !vkCmdBlitImage_ || !vkCreateFence_) return;
+        if (!vkCreateSwapchainKHR_ || !vkDestroySwapchainKHR_ || !vkGetSwapchainImagesKHR_ ||
+            !vkAcquireNextImageKHR_ || !vkQueuePresentKHR_ || !vkCmdBlitImage_ || !vkCmdClearColorImage_ ||
+            !vkCreateFence_ || !vkDestroyFence_ || !vkWaitForFences_ || !vkResetFences_) {
+            std::fprintf(stderr, "[rt] present: Vulkan device presentation entry points unavailable\n");
+            return;
+        }
 
         VkBool32 supported = VK_FALSE;
-        vkGetPhysicalDeviceSurfaceSupportKHR_(physical, family, surface, &supported);
-        if (!supported) return;
+        if (!wsi_ok("vkGetPhysicalDeviceSurfaceSupportKHR",
+                    vkGetPhysicalDeviceSurfaceSupportKHR_(physical, family, surface, &supported))) return;
+        if (!supported) {
+            std::fprintf(stderr, "[rt] present: surface unsupported on queue family %u\n", family);
+            return;
+        }
 
         auto& vk = context.vk;
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pool.queueFamilyIndex = family;
-        if (vk.vkCreateCommandPool(device, &pool, nullptr, &pool_) != VK_SUCCESS) return;
+        if (!wsi_ok("vkCreateCommandPool", vk.vkCreateCommandPool(device, &pool, nullptr, &pool_))) return;
         for (Frame& frame : frames_) {
             VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
             allocate.commandPool = pool_;
@@ -165,9 +291,9 @@ public:
             VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
             VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-            if (vk.vkAllocateCommandBuffers(device, &allocate, &frame.commands) != VK_SUCCESS ||
-                vkCreateFence_(device, &fence, nullptr, &frame.done) != VK_SUCCESS ||
-                vk.vkCreateSemaphore(device, &semaphore, nullptr, &frame.acquired) != VK_SUCCESS)
+            if (!wsi_ok("vkAllocateCommandBuffers", vk.vkAllocateCommandBuffers(device, &allocate, &frame.commands)) ||
+                !wsi_ok("vkCreateFence", vkCreateFence_(device, &fence, nullptr, &frame.done)) ||
+                !wsi_ok("vkCreateSemaphore", vk.vkCreateSemaphore(device, &semaphore, nullptr, &frame.acquired)))
                 return;
         }
         // LEONIDA_CAPTURE=<dir>: besides presenting, copy the swapchain image to host memory and write it out as a
@@ -180,13 +306,23 @@ public:
             std::error_code created;
             std::filesystem::create_directories(capture_dir_, created);
             capture_to_disk_ = true;
-            capture_ = true;  // the swapchain needs TRANSFER_SRC, and every frame copies into a staging buffer
+            capture_ = true;  // the swapchain needs TRANSFER_SRC for the sampled frames
             if (const char* every = std::getenv("LEONIDA_CAPTURE_EVERY")) capture_every_ = std::max(1, std::atoi(every));
+            if (const char* ms = std::getenv("LEONIDA_CAPTURE_INTERVAL_MS"))
+                capture_interval_ = std::chrono::milliseconds(std::max(0, std::atoi(ms)));
             if (const char* limit = std::getenv("LEONIDA_CAPTURE_LIMIT")) capture_limit_ = std::max(1, std::atoi(limit));
-            std::fprintf(stderr, "[rt] present: capture on: every %d presented frame(s), at most %d, into %s\n",
-                         capture_every_, capture_limit_, capture_dir_.c_str());
+            std::fprintf(stderr, "[rt] present: capture on: every %lld %s, at most %d, into %s\n",
+                         capture_interval_.count() ? static_cast<long long>(capture_interval_.count()) : capture_every_,
+                         capture_interval_.count() ? "ms" : "presented frame(s)", capture_limit_, capture_dir_.c_str());
         }
+        if (const auto* v = std::getenv("LEONIDA_PROFILE_PIXELS"); v && v[0] == '1' && !v[1])
+            pixel_samples_.reset(new (std::nothrow) detail::PresentPixelSamples{});
         ok_ = recreate(true, false);
+        if (!ok_ && pixel_samples_) {
+            std::fprintf(stderr, "[rt] present: retrying swapchain without sampled pixel reads\n");
+            pixel_samples_.reset();
+            ok_ = recreate(true, false);
+        }
         if (!ok_ && capture_to_disk_) {
             // The surface refused a TRANSFER_SRC swapchain, or the staging buffer could not be made: present
             // without the capture rather than not at all.
@@ -204,7 +340,8 @@ public:
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
-            vk.vkQueueWaitIdle(queue_);
+            const auto idle = vk.vkQueueWaitIdle(queue_);
+            finish_samples(idle);
             // A WSI layer may perform a device-wide idle while destroying the swapchain.
             // Keep that implicit idle serialized with submits from every context queue.
             release(swapchain_);
@@ -343,9 +480,10 @@ public:
         capture_ = true;
         stale_ = true;
         if (!recreate(vsync_, swapchain_srgb_, swapchain_hdr_req_) || (swapchain_ && !capture_buffer_)) {
-            capture_ = false;
+            capture_ = capture_to_disk_;
             return false;
         }
+        continuous_readback_ = true;
         return true;
     }
 
@@ -382,6 +520,7 @@ public:
 
     VkResult submit(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
                     bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
+        if (planes && (planes->count < 1 || planes->count > 2)) return VK_ERROR_UNKNOWN;
         wait_for_room();
         std::lock_guard lock(present_mutex_);
         // `binding` null and `planes` null: clear instead of blit; `planes`: compose them (`binding`, `source`,
@@ -452,8 +591,10 @@ private:
                          int(result));
     }
 
+    FrameProfile present_profile_;
     VkResult submit_now(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
                         bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
+        const auto profile_start = FrameProfile::now();
         last_tore_ = false;
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
         if (surface_lost_) {  // the window's display went away under a presented swapchain
@@ -485,18 +626,23 @@ private:
             captured_ = false;  // nothing was shown: read_back() must not hand out the frame before
             return VK_SUCCESS;
         }
-        if (binding && !presentable(source)) return VK_ERROR_UNKNOWN;  // checked before an image is acquired for it
         if ((binding || planes) && !(format_features(format_) & VK_FORMAT_FEATURE_BLIT_DST_BIT))
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         if (planes && !prepare_compose()) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        if (binding || planes) {
+            const auto ready = prepare_sources(source, planes);
+            if (ready != VK_SUCCESS) return ready;
+        }
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         Frame& frame = frames_[frame_index_ % frames_.size()];
         if (const VkResult waited = vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX); waited != VK_SUCCESS)
             return stop(waited);
-        // Every submit copies into the same mapped buffer, even if its frame is outside the disk capture stride.
+        if (pixel_samples_) pixel_samples_->consume(unsigned(frame_index_ % frames_.size()), capture_ptr_);
+        // Finish a sampled frame before reusing either its fence or its mapped bytes.
         if (const VkResult r = finish_pending_capture(); r != VK_SUCCESS) return stop(r);
 
+        const auto profile_waited = FrameProfile::now();
         std::uint32_t image = 0;
         VkResult acquired = acquire(frame.acquired, &image);
         if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -517,11 +663,17 @@ private:
         // An out-of-date retry above may have given the swapchain another extent: the compose target follows it.
         if (planes && !prepare_compose()) return give_back(frame, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
+        const auto profile_acquired = FrameProfile::now();
+        const bool disk_sample = capture_to_disk_ && capture_written_ < capture_limit_ &&
+            (capture_interval_.count() ? std::chrono::steady_clock::now() >= next_capture_ :
+             presented_.load(std::memory_order_relaxed) % std::uint64_t(capture_every_) == 0);
+        const bool copy_frame = capture_buffer_ && (continuous_readback_ || disk_sample);
         bool recorded = false;
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
         bool rollback_source = false;
         VkImageLayout prev_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         std::array<RollbackPlane, 2> plane_rollbacks{};  // present_planes(): the same, per plane
+        std::uintptr_t primary_activity_image = 0;
         if (planes) {
             std::array<ResourceBinding, 2> current{};
             bool found_all = true;
@@ -535,13 +687,14 @@ private:
                         found_all = false;
                 }
                 if (found_all) {
+                    primary_activity_image = current[0].draw_activity_image;
                     tracker_lock.lock();
                     for (std::uint32_t i = 0; i < planes->count; ++i) {
                         plane_rollbacks[i].id = planes->plane[i].source;
                         plane_rollbacks[i].tracked = context_.tracker_.tracked(plane_rollbacks[i].id);
                         if (plane_rollbacks[i].tracked) plane_rollbacks[i].layout = context_.tracker_.layout(plane_rollbacks[i].id, 0);
                     }
-                    recorded = record_planes(frame, std::uint32_t(frame_index_ % frames_.size()), current, *planes, image);
+                    recorded = record_planes(frame, std::uint32_t(frame_index_ % frames_.size()), current, *planes, image, copy_frame);
                 }
             }
         } else if (binding) {
@@ -551,14 +704,15 @@ private:
             std::shared_lock resource_lock(context_.resource_mutex_);
             const ResourceBinding* current = context_.resolve(source);
             if (current && current->image && current->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
+                primary_activity_image = current->draw_activity_image;
                 tracker_lock.lock();
                 rollback_source = context_.tracker_.tracked(source);
                 if (rollback_source) prev_layout = context_.tracker_.layout(source, 0);
-                record(frame.commands, *current, source, image, source_rect);
+                record(frame.commands, *current, source, image, source_rect, copy_frame);
                 recorded = true;
             }
         } else {
-            record_blank(frame.commands, image);
+            record_blank(frame.commands, image, copy_frame);
             recorded = true;
         }
         const auto rollback = [&] {
@@ -570,7 +724,7 @@ private:
                         context_.tracker_.set(plane_rollbacks[i].id, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
                                               plane_rollbacks[i].layout);
         };
-        if (!recorded) return give_back(frame, VK_ERROR_UNKNOWN);  // released by another thread since presentable()
+        if (!recorded) return give_back(frame, VK_ERROR_UNKNOWN);  // released by another thread since prepare_sources()
         if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) {
             rollback();
             return stop(reset);
@@ -603,7 +757,9 @@ private:
         const bool tearing = false;
         (void)tear;
 #endif
+        const auto profile_recorded = FrameProfile::now();
         VkResult submitted, result = VK_SUCCESS;
+        FrameDrawActivity::Report draw_report;
         {
             std::lock_guard lock(context_.submit_mutex());
             submitted = vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
@@ -612,24 +768,35 @@ private:
             // order without holding tracker_mutex_ across vkQueuePresentKHR.
             if (tracker_lock.owns_lock()) tracker_lock.unlock();
             if (submitted == VK_SUCCESS) result = vkQueuePresentKHR_(queue_, &present);
+            if (FrameDrawActivity::enabled() && submitted == VK_SUCCESS &&
+                (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)) {
+                draw_report = context_.frame_draw_activity().present(reinterpret_cast<std::uintptr_t>(queue_), primary_activity_image,
+                                                                     FrameDrawActivity::Clock::now());
+            }
         }
+        draw_report.print();
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
         ++frame_index_;
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
             ++presented_;
+            if (pixel_samples_)
+                pixel_samples_->submitted[(frame_index_ - 1) % frames_.size()] = detail::PresentPixelSamples::Clock::now();
+            present_profile_.record("present-fence,acquire,record,queue", profile_start, profile_waited,
+                                    profile_acquired, profile_recorded);
             if (planes) ++composed_;
             if (tearing) {
                 last_tore_ = true;
                 ++tear_presents_;
             }
-            if (capture_to_disk_ && capture_ && capture_ptr_ && capture_written_ < capture_limit_ &&
-                (presented_ - 1) % std::uint64_t(capture_every_) == 0)
+            if (disk_sample && copy_frame) {
                 pending_capture_ = frame.done;
+                if (capture_interval_.count()) next_capture_ = std::chrono::steady_clock::now() + capture_interval_;
+            }
         }
-        if (capture_ && capture_ptr_) {
-            captured_ = true;
+        captured_ = copy_frame;
+        if (copy_frame) {
             captured_extent_ = extent_;
             captured_format_ = format_;
         }
@@ -655,11 +822,34 @@ private:
         std::array<VkImageView, 2> views{};  // the plane views of the last composed present, until the frame is reused
     };
 
-    // Whether `source` is a colour texture the device knows, so present() can refuse it before acquiring an image.
-    bool presentable(ResourceId source) {
-        std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
-        const ResourceBinding* binding = context_.resolve(source);
-        return binding && binding->image && binding->aspects == VK_IMAGE_ASPECT_COLOR_BIT;
+    // Resolve at execution time, after held guest work. A CPU-owned plane needs the same capture, upload and
+    // retirement transaction as a guest draw. Both submissions use the presenter's native queue, in order.
+    VkResult prepare_sources(ResourceId source, const PresentPlanes* planes) {
+        std::array<ResourceId, 2> imports{};
+        std::size_t count = 0;
+        {
+            std::shared_lock lock(context_.resource_mutex_);
+            for (std::uint32_t i = 0; i < (planes ? planes->count : 1); ++i) {
+                const ResourceId id = planes ? planes->plane[i].source : source;
+                const ResourceBinding* binding = context_.resolve(id);
+                if (!binding || !binding->image || binding->aspects != VK_IMAGE_ASPECT_COLOR_BIT ||
+                    (planes && !binding->sampled)) return VK_ERROR_UNKNOWN;
+                if (binding->host_readonly_image) imports[count++] = id;
+            }
+        }
+        if (!count) return VK_SUCCESS;
+        try {
+            // present_mutex_ serializes this private queue. It never joins QueueHolds or receives guest fence waits.
+            if (!upload_queue_) {
+                auto uploader = std::unique_ptr<VulkanQueue>(
+                    new VulkanQueue(context_, queue_, family_, VulkanQueue::QueueKind::copy, false));
+                if (!uploader->ok()) return VK_ERROR_INITIALIZATION_FAILED;
+                upload_queue_ = std::move(uploader);
+            }
+            std::vector<std::shared_ptr<void>> pins;
+            return upload_queue_->execute_now({}, pins, {imports.data(), count}) == ReplayResult::success
+                ? VK_SUCCESS : VK_ERROR_UNKNOWN;
+        } catch (const std::bad_alloc&) { return VK_ERROR_OUT_OF_HOST_MEMORY; }
     }
 
     // An image was acquired into `frame` but its blit was not submitted. An empty batch waits on the acquire
@@ -719,7 +909,7 @@ private:
     }
 
     void record(VkCommandBuffer commands, const ResourceBinding& binding, ResourceId source, std::uint32_t image,
-                const PresentRect* source_rect) {
+                const PresentRect* source_rect, bool copy_frame) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
         vk.vkResetCommandBuffer(commands, 0);
@@ -732,11 +922,12 @@ private:
         // PRESENT is D3D12's common state: GENERAL for an ordinary texture. A never-written back buffer is
         // zero-filled first, as any committed resource is.
         const VkImageLayout common = image_layout(binding, VK_IMAGE_LAYOUT_GENERAL);
+        const VkImageLayout read_layout = image_layout(binding, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         auto pieces = detail::current(&context_.tracker_, source, range, common);
         detail::initialize(fn, commands, binding, source, pieces, common, &context_.tracker_);
         for (const auto& piece : pieces)
             detail::image_barrier(fn, commands, binding, piece.range, piece.layout,
-                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
+                                  read_layout, VK_ACCESS_MEMORY_WRITE_BIT,
                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                                   VK_PIPELINE_STAGE_TRANSFER_BIT);
         ResourceBinding target{};  // the swapchain image, for the barrier helpers
@@ -758,13 +949,13 @@ private:
         blit.srcOffsets[1] = {src.right, src.bottom, 1};
         blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.dstOffsets[1] = {dw, dh, 1};
-        vkCmdBlitImage_(commands, binding.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[image],
+        vkCmdBlitImage_(commands, binding.image, read_layout, images_[image],
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                         sw == dw && sh == dh ? VK_FILTER_NEAREST : blit_filter(binding.format));
 
-        finish_image(commands, image);
+        finish_image(commands, image, copy_frame);
         for (const auto& piece : pieces)
-            detail::image_barrier(fn, commands, binding, piece.range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            detail::image_barrier(fn, commands, binding, piece.range, read_layout,
                                   piece.layout, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, any,
                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         vk.vkEndCommandBuffer(commands);
@@ -805,7 +996,7 @@ private:
     // Records the composition of `planes` and its copy to swapchain image `image`. False, with nothing recorded and the
     // tracker untouched, when a view cannot be made. The caller holds the resource and tracker locks.
     bool record_planes(Frame& frame, std::uint32_t slot, const std::array<ResourceBinding, 2>& current,
-                       const PresentPlanes& planes, std::uint32_t image) {
+                       const PresentPlanes& planes, std::uint32_t image, bool copy_frame) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
         if (composer_->target() == VK_NULL_HANDLE || composer_->extent().width != extent_.width ||
@@ -893,7 +1084,7 @@ private:
         blit.dstOffsets[1] = {std::int32_t(extent_.width), std::int32_t(extent_.height), 1};
         vkCmdBlitImage_(commands, composer_->target(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[image],
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
-        finish_image(commands, image);
+        finish_image(commands, image, copy_frame);
         for (std::uint32_t i = 0; i < planes.count; ++i) {
             if (i == 1 && same) continue;
             for (const auto& piece : pieces[i])
@@ -929,7 +1120,7 @@ private:
     }
 
     // Clears the swapchain image to opaque black.
-    void record_blank(VkCommandBuffer commands, std::uint32_t image) {
+    void record_blank(VkCommandBuffer commands, std::uint32_t image, bool copy_frame) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
         vk.vkResetCommandBuffer(commands, 0);
@@ -942,18 +1133,18 @@ private:
                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
         vkCmdClearColorImage_(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-        finish_image(commands, image);
+        finish_image(commands, image, copy_frame);
         vk.vkEndCommandBuffer(commands);
     }
 
     // The swapchain image is written (TRANSFER_DST): optionally copy it to the capture buffer, then hand it to
     // the presentation engine.
-    void finish_image(VkCommandBuffer commands, std::uint32_t image) {
+    void finish_image(VkCommandBuffer commands, std::uint32_t image, bool copy_frame) {
         const ReplayFunctions& fn = context_.replay_;
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         VkAccessFlags access = VK_ACCESS_TRANSFER_WRITE_BIT;
-        if (capture_ && capture_buffer_) {
+        if (copy_frame || pixel_samples_) {
             // Two frames may be in flight and share `capture_buffer_`: serialize the prior frame's capture copy
             // before overwriting it, while moving this frame's swapchain image to TRANSFER_SRC.
             VkBufferMemoryBarrier capture_waw{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -963,7 +1154,7 @@ private:
             capture_waw.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             capture_waw.buffer = capture_buffer_;
             capture_waw.offset = 0;
-            capture_waw.size = VK_WHOLE_SIZE;
+            capture_waw.size = capture_size_;
             VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_src.srcAccessMask = access;
             to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -974,12 +1165,25 @@ private:
             to_src.image = images_[image];
             to_src.subresourceRange = range;
             fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                                nullptr, 1, &capture_waw, 1, &to_src);
-            VkBufferImageCopy copy{};
-            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.imageExtent = {extent_.width, extent_.height, 1};
-            fn.copy_image_to_buffer(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, capture_buffer_, 1,
-                                    &copy);
+                                nullptr, copy_frame ? 1 : 0, copy_frame ? &capture_waw : nullptr, 1, &to_src);
+            if (copy_frame) {
+                VkBufferImageCopy copy{};
+                copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.imageExtent = {extent_.width, extent_.height, 1};
+                fn.copy_image_to_buffer(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        capture_buffer_, 1, &copy);
+            }
+            if (pixel_samples_) {
+                const auto& copies = pixel_samples_->regions[frame_index_ % frames_.size()];
+                fn.copy_image_to_buffer(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        capture_buffer_, pixel_samples_->region_count, copies.data());
+                VkBufferMemoryBarrier host = capture_waw;
+                host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                host.offset = copies[0].bufferOffset;
+                host.size = pixel_samples_->pixels * sizeof(std::uint32_t);
+                fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                    0, 0, nullptr, 1, &host, 0, nullptr);
+            }
             layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             access = VK_ACCESS_TRANSFER_READ_BIT;
         }
@@ -992,9 +1196,9 @@ private:
         release_capture();
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
-        capture_size_ = VkDeviceSize(extent_.width) * extent_.height * 4;
+        capture_size_ = capture_ ? VkDeviceSize(extent_.width) * extent_.height * 4 : 0;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = capture_size_;
+        info.size = capture_size_ + (pixel_samples_ ? frames_.size() * detail::PresentPixelSamples::slice_bytes : 0);
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         if (vk.vkCreateBuffer(device, &info, nullptr, &capture_buffer_) != VK_SUCCESS) return false;
@@ -1003,32 +1207,47 @@ private:
         VkPhysicalDeviceMemoryProperties memory{};
         vkGetPhysicalDeviceMemoryProperties_(physical_, &memory);
         constexpr VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        std::uint32_t type = UINT32_MAX;
-        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i)
-            if ((requirements.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & wanted) == wanted) {
-                type = i;
-                break;
-            }
         VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocate.allocationSize = requirements.size;
-        allocate.memoryTypeIndex = type;
+        // A 4K readback is 32 MiB of CPU reads. Prefer cached system memory over write-combined upload memory.
+        for (const bool want_cached : {true, false}) {
+            for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+                const auto flags = memory.memoryTypes[i].propertyFlags;
+                if (!(requirements.memoryTypeBits & (1u << i)) || (flags & wanted) != wanted ||
+                    bool(flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != want_cached) continue;
+                allocate.memoryTypeIndex = i;
+                if (vk.vkAllocateMemory(device, &allocate, nullptr, &capture_memory_) == VK_SUCCESS) break;
+            }
+            if (capture_memory_) break;
+        }
         void* mapped = nullptr;
-        if (type == UINT32_MAX || vk.vkAllocateMemory(device, &allocate, nullptr, &capture_memory_) != VK_SUCCESS ||
+        if (!capture_memory_ ||
             vk.vkBindBufferMemory(device, capture_buffer_, capture_memory_, 0) != VK_SUCCESS ||
             vk.vkMapMemory(device, capture_memory_, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
             release_capture();
             return false;
         }
         capture_ptr_ = static_cast<std::uint8_t*>(mapped);
+        if (pixel_samples_) pixel_samples_->configure(extent_, format_, capture_size_);
         captured_ = false;
         return true;
+    }
+
+    void finish_samples(VkResult idle) {
+        if (!pixel_samples_) return;
+        if (idle == VK_SUCCESS && capture_ptr_) {
+            for (unsigned n = 0; n < frames_.size(); ++n)
+                pixel_samples_->consume(unsigned((frame_index_ + n) % frames_.size()), capture_ptr_);
+            pixel_samples_->report();
+        }
+        *pixel_samples_ = {};
     }
 
     void release_capture() {
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
-        if (capture_memory_) vk.vkFreeMemory(device, capture_memory_, nullptr);  // unmaps
         if (capture_buffer_) vk.vkDestroyBuffer(device, capture_buffer_, nullptr);
+        if (capture_memory_) vk.vkFreeMemory(device, capture_memory_, nullptr);  // unmaps
         capture_memory_ = VK_NULL_HANDLE;
         capture_buffer_ = VK_NULL_HANDLE;
         capture_ptr_ = nullptr;
@@ -1140,18 +1359,33 @@ private:
     // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
     // swapchain and is retried on the next present. Keep the old swapchain until the surface queries succeed and
     // the replacement can be attempted. An incomplete replacement stays stale so the next present tries again.
+    static bool wsi_ok(const char* stage, VkResult result) {
+        if (result == VK_SUCCESS) return true;
+        std::fprintf(stderr, "[rt] present: %s returned VkResult %d\n", stage, int(result));
+        return false;
+    }
+
+    static bool wsi_count(const char* stage, VkResult result, std::uint32_t count) {
+        if (!wsi_ok(stage, result)) return false;
+        if (count) return true;
+        std::fprintf(stderr, "[rt] present: %s returned zero entries\n", stage);
+        return false;
+    }
+
     bool recreate(bool vsync, bool srgb, bool hdr = false) {
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
-            vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
+            const auto idle = vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
+            finish_samples(idle);
         }
-        if (finish_pending_capture() != VK_SUCCESS) return false;
+        if (!wsi_ok("finish_pending_capture", finish_pending_capture())) return false;
         stale_ = true;  // until this succeeds
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
-        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
+        if (!wsi_ok("vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+                    vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps))) return false;
         VkExtent2D extent = caps.currentExtent;
         // When the platform leaves the swapchain extent to the application (0xFFFFFFFF, as on Intel UHD / Win32 WSI),
         // query the window client area or fall back to the last known extent, and clamp to the surface bounds (D3D-165).
@@ -1180,8 +1414,17 @@ private:
             return true;
         }
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (capture_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        if ((caps.supportedUsageFlags & usage) != usage) return false;
+        if (pixel_samples_ && (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+                               !context_.replay_.copy_image_to_buffer)) {
+            std::fprintf(stderr, "[rt] present: sampled pixel reads unavailable on this surface\n");
+            pixel_samples_.reset();
+        }
+        if (capture_ || pixel_samples_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if ((caps.supportedUsageFlags & usage) != usage) {
+            std::fprintf(stderr, "[rt] present: surface usage flags 0x%x do not include 0x%x\n",
+                         caps.supportedUsageFlags, usage);
+            return false;
+        }
         // Not used by the presenter itself (it blits or copies into the images), but overlays that hook the swapchain
         // draw their own frame into its images through a framebuffer, which needs COLOR_ATTACHMENT: without it
         // Bandicam's VK_LAYER_bandicam_helper builds framebuffers and image views on images that don't allow it
@@ -1191,11 +1434,11 @@ private:
         if (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
         std::uint32_t count = 0;
-        if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
-            return false;
+        VkResult result = vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr);
+        if (!wsi_count("vkGetPhysicalDeviceSurfaceFormatsKHR(count)", result, count)) return false;
         std::vector<VkSurfaceFormatKHR> formats(count);
-        if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data()) != VK_SUCCESS || !count)
-            return false;
+        result = vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data());
+        if (!wsi_count("vkGetPhysicalDeviceSurfaceFormatsKHR", result, count)) return false;
         formats.resize(count);
         // An sRGB source wants an sRGB swapchain (the blit decodes and encodes, which cancel); any other source
         // wants UNORM (the bytes go through as they are). BGRA before RGBA, as the surface lists them.
@@ -1241,20 +1484,18 @@ private:
                     break;
                 }
         }
-        if (vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
-            return false;
+        result = vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, nullptr);
+        if (!wsi_count("vkGetPhysicalDeviceSurfacePresentModesKHR(count)", result, count)) return false;
         std::vector<VkPresentModeKHR> modes(count);
-        if (vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, modes.data()) != VK_SUCCESS || !count)
-            return false;
+        result = vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, modes.data());
+        if (!wsi_count("vkGetPhysicalDeviceSurfacePresentModesKHR", result, count)) return false;
         modes.resize(count);
-        VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;  // always available
-        if (!vsync) {
-            for (const VkPresentModeKHR wanted : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR})
-                if (std::find(modes.begin(), modes.end(), wanted) != modes.end()) {
-                    mode = wanted;
-                    break;
-                }
-        }
+        // Display sync takes priority over tearing even while the guest frame clock runs uncapped.
+        const char* display_sync = std::getenv("LEONIDA_DISPLAY_SYNC");
+        const bool force_sync = display_sync && std::strcmp(display_sync, "1") == 0;
+        const char* allow_tearing = std::getenv("LEONIDA_ALLOW_TEARING");
+        const bool prefer_tearing = allow_tearing && std::strcmp(allow_tearing, "1") == 0;
+        const auto mode = detail::choose_present_mode(modes, vsync || force_sync, prefer_tearing);
 
         VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         info.surface = surface_;
@@ -1275,7 +1516,7 @@ private:
         VkSwapchainPresentModesCreateInfoEXT switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT};
         std::array<VkPresentModeKHR, 2> switchable_modes{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAX_ENUM_KHR};
         VkPresentModeKHR tear = VK_PRESENT_MODE_MAX_ENUM_KHR;
-        if (vsync && mode == VK_PRESENT_MODE_FIFO_KHR) tear = find_tear_mode(modes, info.minImageCount, info.imageUsage, info.imageExtent);
+        if (vsync && !force_sync) tear = find_tear_mode(modes, info.minImageCount, info.imageUsage, info.imageExtent);
         if (tear != VK_PRESENT_MODE_MAX_ENUM_KHR) {
             switchable_modes[1] = tear;
             switchable.presentModeCount = 2;
@@ -1293,7 +1534,7 @@ private:
             std::lock_guard lock(context_.submit_mutex());
             release(old);  // retired by the creation attempt, whether or not it succeeded
         }
-        if (created != VK_SUCCESS) return false;
+        if (!wsi_ok("vkCreateSwapchainKHR", created)) return false;
 
         std::vector<VkImage> images;
         std::vector<VkSemaphore> ready;
@@ -1304,14 +1545,17 @@ private:
             vkDestroySwapchainKHR_(device, fresh, nullptr);
             return false;
         };
-        if (vkGetSwapchainImagesKHR_(device, fresh, &count, nullptr) != VK_SUCCESS || !count) return discard();
+        result = vkGetSwapchainImagesKHR_(device, fresh, &count, nullptr);
+        if (!wsi_count("vkGetSwapchainImagesKHR(count)", result, count)) return discard();
         images.resize(count);
-        if (vkGetSwapchainImagesKHR_(device, fresh, &count, images.data()) != VK_SUCCESS) return discard();
+        result = vkGetSwapchainImagesKHR_(device, fresh, &count, images.data());
+        if (!wsi_count("vkGetSwapchainImagesKHR", result, count)) return discard();
         images.resize(count);
         for (std::uint32_t i = 0; i < count; ++i) {
             VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
             VkSemaphore semaphore = VK_NULL_HANDLE;
-            if (vk.vkCreateSemaphore(device, &semaphore_info, nullptr, &semaphore) != VK_SUCCESS) return discard();
+            if (!wsi_ok("vkCreateSemaphore", vk.vkCreateSemaphore(device, &semaphore_info, nullptr, &semaphore)))
+                return discard();
             ready.push_back(semaphore);
         }
         swapchain_ = fresh;
@@ -1324,18 +1568,29 @@ private:
         extent_ = extent;
         extent_packed_ = (std::uint64_t(extent.width) << 32) | extent.height;
         hdr_active_ = chose_hdr;
-        if (capture_) {
+        if (capture_ || pixel_samples_) {
             // A capture that cannot be made fails the recreation with the swapchain in place and stale_ still set.
             const bool four_bytes = format_ == VK_FORMAT_B8G8R8A8_UNORM || format_ == VK_FORMAT_R8G8B8A8_UNORM ||
                                     format_ == VK_FORMAT_B8G8R8A8_SRGB || format_ == VK_FORMAT_R8G8B8A8_SRGB ||
                                     format_ == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
                                     format_ == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-            if (!four_bytes || !make_capture_buffer()) return false;
+            if (!four_bytes || !make_capture_buffer()) {
+                if (!pixel_samples_) return false;
+                std::fprintf(stderr, "[rt] present: sampled pixel reads unavailable for this swapchain\n");
+                pixel_samples_.reset();
+                if (capture_ && (!four_bytes || !make_capture_buffer())) return false;
+            }
         }
         vsync_ = vsync;
         swapchain_srgb_ = srgb;
         swapchain_hdr_req_ = hdr;
         stale_ = false;
+        if (prefer_tearing || force_sync || FrameProfile::now() != FrameProfile::Time{}) {
+            const char* name = mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE"
+                             : mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO";
+            std::fprintf(stderr, "[rt] present: swapchain mode=%s extent=%ux%u images=%u\n",
+                         name, extent.width, extent.height, count);
+        }
         return true;
     }
 
@@ -1406,6 +1661,8 @@ private:
     VkInstance instance_;
     VkPhysicalDevice physical_;
     VkQueue queue_;
+    std::uint32_t family_;
+    std::unique_ptr<VulkanQueue> upload_queue_;
     mutable std::recursive_mutex present_mutex_;  // all presenter state: submit(), a deferred present, the accessors
     mutable std::mutex abort_mutex_;               // abort_ alone: set_abort() must work while a present waits
     std::deque<PendingPresent> deferred_;  // presents queued behind held work, in call order
@@ -1441,6 +1698,8 @@ private:
     std::map<VkFormat, VkFormatFeatureFlags> features_;
     bool warned_srgb_ = false;
     bool capture_ = false;
+    std::unique_ptr<detail::PresentPixelSamples> pixel_samples_;
+    bool continuous_readback_ = false;  // Explicit read_back() users need every frame.
     VkBuffer capture_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory capture_memory_ = VK_NULL_HANDLE;
     VkDeviceSize capture_size_ = 0;
@@ -1452,6 +1711,8 @@ private:
     bool capture_to_disk_ = false;
     std::string capture_dir_;
     int capture_every_ = 30;  // presented frames between files
+    std::chrono::milliseconds capture_interval_{0};
+    std::chrono::steady_clock::time_point next_capture_{};
     int capture_limit_ = 24;  // files at most
     VkFence pending_capture_ = VK_NULL_HANDLE;  // owns the shared staging bytes until written
     std::uint64_t capture_written_ = 0;

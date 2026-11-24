@@ -3,8 +3,12 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 
+#include "../src/frame_draw_activity.h"
 #include "../src/vulkan_present.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -27,12 +31,33 @@ void log_once(bool& done, const char* text) {
     std::fprintf(stderr, "[rt] present: %s\n", text);
 }
 
+// Keep a bounded record per plane count so a title changing flags on one layout cannot hide another.
+void profile_plane_layout(UINT count, const XboxPresentPlaneParameters* planes) {
+    struct Layouts {
+        std::array<std::uint64_t, 8> flags{};
+        unsigned used = 0;
+    };
+    static std::mutex mutex;
+    static std::array<Layouts, 3> counts;
+    const UINT first = count >= 1 ? planes[0].Flags : 0;
+    const UINT second = count == 2 ? planes[1].Flags : 0;
+    const std::uint64_t flags = (std::uint64_t(second) << 32) | first;
+    std::lock_guard guard(mutex);
+    auto& seen = counts[count];
+    const auto end = seen.flags.begin() + seen.used;
+    if (seen.used == seen.flags.size() || std::find(seen.flags.begin(), end, flags) != end) return;
+    seen.flags[seen.used++] = flags;
+    std::fprintf(stderr, "[rt] present: PresentX plane layout count=%u flags0=0x%x flags1=0x%x\n", count, first, second);
+}
+
 }  // namespace
 
-XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock)
+XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock,
+                                   leonida::FramePacer* pacer)
     : presenter_(std::move(presenter)),
-      own_clock_(clock ? nullptr : std::make_unique<leonida::SteadyFrameClock>()),
-      pacer_(clock ? *clock : *own_clock_) {
+      own_clock_(pacer || clock ? nullptr : std::make_unique<leonida::SteadyFrameClock>()),
+      own_pacer_(pacer ? nullptr : std::make_unique<leonida::FramePacer>(clock ? *clock : *own_clock_)),
+      pacer_(pacer ? *pacer : *own_pacer_) {
     // A present waiting for a swapchain image gives up once SuspendX has been called.
     presenter_->set_abort([this] { return pacer_.suspended(); });
     // LEONIDA_SDR_EOTF=gamma22 (or 2.2, any case) decodes SDR with a pure power of 2.2 instead of piecewise sRGB; "srgb" or
@@ -151,8 +176,17 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
 HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlaneParameters* planes,
                                     const XboxPresentParameters* params) {
     std::lock_guard serialise(present_mutex_);
-    if (plane_count > 2 || (plane_count && !planes)) return E_INVALIDARG;
-    if (pacer_.suspended()) return from_pacer(hr::invalid_state);
+    const auto failed = [plane_count](const char* reason, HRESULT result, std::uint64_t token = 0,
+                                      UINT plane = ~UINT(0)) {
+        static std::atomic<unsigned> failures{0};
+        if (failures.fetch_add(1, std::memory_order_relaxed) < 32)
+            std::fprintf(stderr, "[rt] present: PresentX refused reason=%s hr=0x%08x planes=%u plane=%u token=%llu\n",
+                reason, static_cast<unsigned>(result), plane_count, plane, static_cast<unsigned long long>(token));
+        return result;
+    };
+    if (plane_count > 2 || (plane_count && !planes)) return failed("plane-array", E_INVALIDARG);
+    if (pacer_.suspended()) return failed("suspended", from_pacer(hr::invalid_state));
+    if (leonida::FrameDrawActivity::enabled()) profile_plane_layout(plane_count, planes);
     // A zero, negative or NaN threshold never tears; an uncapped frame is never late for anything either.
     const float threshold = params ? params->ImmediateThresholdPercent : 0.0f;
     const bool wants_tear = threshold > 0.0f && !pacer_.uncapped();
@@ -171,7 +205,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
             pacer_.note_untokened_present();
             ++presents_;
         }
-        return result;
+        return FAILED(result) ? failed("native-blank", result) : result;
     }
 
     // All planes carry the token of one frame.
@@ -179,20 +213,20 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     for (UINT i = 0; i < plane_count; ++i) {
         const XboxPresentPlaneParameters& plane = planes[i];
         if (plane.Token != token || plane.ResourceCount == 0 || !plane.ppResources || !plane.ppResources[0])
-            return E_INVALIDARG;
+            return failed("plane-resource-or-token", E_INVALIDARG, token, i);
         // Both paths read ppResources[0] only: a plane with several resources would silently lose the others and could show
         // the wrong frame, so it is refused (before anything is presented) until it is modelled. What the console does
         // with ResourceCount above 1 (views? stereo?) is unmeasured.
         if (plane.ResourceCount != 1) {
             log_once(logged_resource_count_, "PresentX plane with ResourceCount other than 1: not implemented, refused");
-            return DXGI_ERROR_UNSUPPORTED;
+            return failed("resource-count", DXGI_ERROR_UNSUPPORTED, token, i);
         }
     }
     // Only a token that was never handed out is refused. Null, stale and repeated tokens are presented anyway (what the
     // console does with them is unmeasured, and a title that does it must not freeze); each kind is logged once.
     FramePacer::TokenIssue issue{};
     if (const std::int32_t checked = pacer_.check_present_token(token, &issue); checked != hr::ok)
-        return from_pacer(checked);
+        return failed("pacer-token", from_pacer(checked), token);
     switch (issue) {
     case FramePacer::TokenIssue::null_token:
         log_once(logged_null_token_, "PresentX with the null token: presented anyway (real behaviour unmeasured)");
@@ -256,12 +290,13 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
             const XboxPresentPlaneParameters& p = planes[i];
             ID3D12Resource* source = p.ppResources[0];
             const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
-            if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
+            if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+                return failed("compose-source-dimension", E_INVALIDARG, token, i);
             const D3D12_RECT* source_rect = p.pSrcViewRects;
             if (source_rect && (source_rect->left < 0 || source_rect->top < 0 || source_rect->left >= source_rect->right ||
                                 source_rect->top >= source_rect->bottom || UINT64(source_rect->right) > source_desc.Width ||
                                 UINT(source_rect->bottom) > source_desc.Height))
-                return E_INVALIDARG;
+                return failed("compose-source-rect", E_INVALIDARG, token, i);
             const XboxViewRect* place = placement(p);
             leonida::PresentPlane& out = composed.plane[i];
             out.source = resource_id(source);
@@ -285,7 +320,8 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
             tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
         }
         const HRESULT result = presenter_->present_planes(composed, sync_interval, tear);
-        if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
+        if (FAILED(result))
+            return failed("native-compose", pacer_.suspended() ? from_pacer(hr::invalid_state) : result, token);
         pacer_.commit_present_token(token, plane_count,
                                     tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
                                                                             : leonida::PresentSync::vblank);
@@ -296,7 +332,8 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     const XboxPresentPlaneParameters& plane = planes[0];
     ID3D12Resource* resource = plane.ppResources[0];
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        return failed("source-dimension", E_INVALIDARG, token, 0);
     D3D12_HEAP_PROPERTIES heap{};
     D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
     if (SUCCEEDED(resource->GetHeapProperties(&heap, &heap_flags)) && !(heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY))
@@ -305,7 +342,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     const D3D12_RECT* rect = plane.pSrcViewRects;
     if (rect && (rect->left < 0 || rect->top < 0 || rect->left >= rect->right || rect->top >= rect->bottom ||
                  UINT64(rect->right) > desc.Width || UINT(rect->bottom) > desc.Height))
-        return E_INVALIDARG;
+        return failed("source-rect", E_INVALIDARG, token, 0);
 
     // How late the frame is, now that everything that can refuse it has: past the vblank it was due at, by what part of
     // the interval the scan has moved on. The presenter says whether it really queued it as a tear.
@@ -316,7 +353,8 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
         tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
     }
     const HRESULT result = presenter_->present(resource, sync_interval, rect, tear);
-    if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
+    if (FAILED(result))
+        return failed("native-blit", pacer_.suspended() ? from_pacer(hr::invalid_state) : result, token);
     pacer_.commit_present_token(token, plane_count,
                                 tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
                                                                         : leonida::PresentSync::vblank);

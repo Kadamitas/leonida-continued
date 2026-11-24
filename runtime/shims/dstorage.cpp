@@ -5,14 +5,18 @@
 // for those names, the console ABI and what each method does here. In short:
 //   - OpenFile resolves kernel32.dll!CreateFileW through the shim registry, so a GAME: path goes through the
 //     runtime's console path mapping and write overlay (file_system.cpp) exactly as the title's own CreateFileW.
+//     Opt-in incomplete package archives retain the verified-range provider, never a raw source file handle.
 //   - Each queue has one worker thread that runs its submitted entries in order: a request reads a file range or
 //     copies a memory range into the destination, a status entry, fence signal or event runs when every entry before
 //     it has. Completion is therefore in queue order, as the API guarantees.
-//   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
-//     the runtime's RFC 1950 inflater (leonida::zlib_inflate, src/shader_library.h) and copies the result to the
-//     destination only when it is exactly DestinationSize bytes; a stream that fails leaves the destination as it was.
-//   - BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages between
-//     the read and the destination write, BCPack after the inflate).
+//   - Owned staging follows read -> optional RFC 1950 inflate -> optional strict BCPack -> destination write.
+//     A failed stream or allocation leaves the destination as it was. Unknown BCPack histories are unsupported;
+//     provisional decoding is never enabled here.
+//   - A DestinationIsPhysicalPages request names its destination by 64 KiB page numbers of XMemAllocatePhysicalPages
+//     and a byte offset into the first one. The data is staged and written through the pages' backing
+//     (rt::xmem::write_physical_pages), so the pages need not be mapped.
+//   - SourceIsPhysicalPages reads memory-queue sources through the same backing into owned staging.
+//     BC2 and swizzle requests fail with E_NOTIMPL.
 // Nothing here goes online or touches the GPU.
 #include <windows.h>
 #include <d3d12.h>
@@ -24,21 +28,45 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <set>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <unordered_set>
 #include <vector>
 
 #include "../src/shader_library.h"  // leonida::zlib_inflate
+#include "../src/bcpack.h"
 #include "dstorage_xs_abi.h"
+#include "file_system.h"
+#include "partial_package.h"
 #include "shims.h"
+#include "xmem_pages.h"
 
 using namespace dsx;
 
 namespace {
+
+enum class StagingAllocation : uint32_t { source = 1, inflate = 2, bcpack = 3, physical_page_array = 4, source_page_array = 5 };
+#ifdef LEONIDA_DSTORAGE_TEST_HOOKS
+std::atomic<uint32_t> g_fail_allocation{0};
+#endif
+
+void allocation_point(StagingAllocation stage) {
+#ifdef LEONIDA_DSTORAGE_TEST_HOOKS
+    uint32_t pending = g_fail_allocation.load(std::memory_order_acquire);
+    if ((pending & 0xffu) == static_cast<uint32_t>(stage) &&
+        g_fail_allocation.compare_exchange_strong(pending, 0, std::memory_order_acq_rel)) {
+        if (pending & 0x100u) throw std::length_error("synthetic DirectStorage allocation length");
+        throw std::bad_alloc();
+    }
+#else
+    (void)stage;
+#endif
+}
 
 // ---- Logging ------------------------------------------------------------------------------------------------------
 
@@ -212,6 +240,25 @@ void count_error() {
     ++stats().s.ErrorCount;
 }
 
+// One scope per request, including a combined zlib/BCPack request. Allocation
+// exceptions unwind through it before the worker converts them to E_OUTOFMEMORY.
+class DecompressionScope {
+public:
+    DecompressionScope() {
+        std::lock_guard lock(stats().mutex);
+        ++stats().s.PendingDecompressionRequestCount;
+        ++stats().s.TotalDecompressionRequestCount;
+    }
+    ~DecompressionScope() {
+        std::lock_guard lock(stats().mutex);
+        --stats().s.PendingDecompressionRequestCount;
+        if (!succeeded_) ++stats().s.DecompressionErrors;
+    }
+    void succeeded() { succeeded_ = true; }
+private:
+    bool succeeded_ = false;
+};
+
 // ---- Live objects ---------------------------------------------------------------------------------------------------
 //
 // A request names its file and a status entry its array by pointer. Only objects this shim made and that are still
@@ -293,7 +340,8 @@ private:
 
 class File final : public IDStorageFileX {
 public:
-    File(HANDLE handle, std::wstring path) : handle_(handle), path_(std::move(path)) {
+    File(HANDLE handle, std::wstring path, rt::partial_package::FileRef partial = {})
+        : handle_(handle), path_(std::move(path)), partial_(std::move(partial)) {
         {
             std::lock_guard lock(live_mutex());
             live_files().insert(static_cast<IDStorageFileX*>(this));
@@ -338,20 +386,26 @@ public:
         closed_ = true;
         idle_.wait(lock, [&] { return pending_ == 0; });
         if (handle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle_);
+            if (partial_)
+                rt::fs::close_partial_read_handle(handle_);
+            else
+                CloseHandle(handle_);
             handle_ = INVALID_HANDLE_VALUE;
         }
+        partial_.reset();
     }
 
     // A new handle the caller closes (GENERIC_READ, FILE_SHARE_READ, as the reference describes it). ReOpenFile,
     // not DuplicateHandle: a duplicate shares the file position with the shim's own reads, so the title's ReadFile
-    // through it would start wherever the worker's last read ended.
+    // through it would start wherever the worker's last read ended. An incomplete archive instead gets an opaque
+    // read-only token with its own cursor; neither ReOpenFile nor a native reader can reach the partial source.
     HANDLE STDMETHODCALLTYPE GetHandle() override {
         std::lock_guard lock(mutex_);
         if (closed_ || handle_ == INVALID_HANDLE_VALUE) {
             SetLastError(ERROR_INVALID_HANDLE);
             return INVALID_HANDLE_VALUE;
         }
+        if (partial_) return rt::fs::make_partial_read_handle(partial_);
         return ReOpenFile(handle_, GENERIC_READ, FILE_SHARE_READ, 0);
     }
 
@@ -368,6 +422,7 @@ public:
     }
     // Valid while the caller holds a pending count: Close does not close the handle before it drops to zero.
     HANDLE handle() const { return handle_; }
+    const rt::partial_package::FileRef& partial() const { return partial_; }
     const std::wstring& path() const { return path_; }
     std::atomic<ULONG>& refs() { return refs_; }
 
@@ -375,8 +430,9 @@ private:
     std::atomic<ULONG> refs_{1};
     std::mutex mutex_;
     std::condition_variable idle_;
-    HANDLE handle_;
+    HANDLE handle_;  // a native complete-file handle or an opaque partial-file sharing lease
     const std::wstring path_;
+    rt::partial_package::FileRef partial_;
     uint32_t pending_ = 0;
     bool closed_ = false;
 };
@@ -409,6 +465,28 @@ bool guarded_move(void* destination, const void* source, size_t size) {
     }
 }
 
+// Check the whole stable destination span before the first byte is changed.
+// The caller still owns its lifetime and must not concurrently unmap/protect it.
+bool writable_range(void* destination, size_t size) {
+    uintptr_t at = reinterpret_cast<uintptr_t>(destination);
+    if (size > (std::numeric_limits<uintptr_t>::max)() - at) return false;
+    while (size) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof region) || region.State != MEM_COMMIT ||
+            (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            !(region.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+            return false;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(region.BaseAddress);
+        if (region.RegionSize > (std::numeric_limits<uintptr_t>::max)() - base) return false;
+        const uintptr_t end = base + region.RegionSize;
+        if (end <= at) return false;
+        const size_t step = (std::min)(size, static_cast<size_t>(end - at));
+        at += step;
+        size -= step;
+    }
+    return true;
+}
+
 // Reads one byte of every 4 KiB page of the range from user mode. Title memory that xmem maps from physical pages is
 // committed by a vectored handler on first touch; a kernel write (ReadFile) raises no user-mode fault and fails with
 // ERROR_NOACCESS instead. No C++ objects here: the function has __try.
@@ -431,8 +509,27 @@ HRESULT read_error(DWORD error) {
     }
 }
 
-// Reads exactly "size" bytes at "offset" of a synchronous handle into "destination".
-HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint32_t size) {
+// Reads exactly "size" bytes into owned request staging. The caller holds the file's pending count throughout.
+// Provider chunks are independently verified snapshots; a later unavailable chunk cannot change a guest destination.
+HRESULT read_file_range(const File& file, uint64_t offset, void* destination, uint32_t size) {
+    if (const auto& partial = file.partial()) {
+        const uint64_t file_size = rt::partial_package::size(partial);
+        if (offset > file_size || size > file_size - offset) return E_DSTORAGE_END_OF_FILE;
+        constexpr uint32_t kSnapshotReadBytes = 16u * 1024u * 1024u;
+        auto* out = static_cast<uint8_t*>(destination);
+        uint32_t done = 0;
+        while (done < size) {
+            const uint32_t wanted = (std::min)(size - done, kSnapshotReadBytes);
+            uint32_t got = 0;
+            DWORD error = ERROR_SUCCESS;
+            if (!rt::partial_package::read_at(partial, offset + done, out + done, wanted, got, error))
+                return read_error(error ? error : ERROR_READ_FAULT);
+            if (got != wanted) return E_DSTORAGE_END_OF_FILE;
+            done += got;
+        }
+        return S_OK;
+    }
+    const HANDLE handle = file.handle();
     LARGE_INTEGER length{};
     if (!GetFileSizeEx(handle, &length)) return HRESULT_FROM_WIN32(GetLastError());
     const uint64_t file_size = static_cast<uint64_t>(length.QuadPart);
@@ -537,6 +634,19 @@ public:
                 desc_.SourceType == DSTORAGE_REQUEST_SOURCE_FILE && e.request.File) {
                 e.file = live_file(e.request.File);
                 if (!e.file) e.enqueue_error = E_DSTORAGE_INVALID_FILE_HANDLE;
+                static const bool trace_ranges = [] {
+                    wchar_t value[2]{};
+                    return GetEnvironmentVariableW(L"LEONIDA_TRACE_STORAGE_REQUESTS", value, 2) == 1 && value[0] == L'1';
+                }();
+                if (trace_ranges && e.file) {
+                    static std::atomic<unsigned> requests{};
+                    const unsigned n = requests.fetch_add(1, std::memory_order_relaxed);
+                    if (n < 8192 || !(n % 256))
+                        std::fprintf(stderr, "[rt] dstorage: read #%u thread=%lu file=%ls offset=%llu source=%u destination=%u\n",
+                                     n, GetCurrentThreadId(), e.file->path().c_str(),
+                                     static_cast<unsigned long long>(e.request.FileOffset),
+                                     e.request.SourceSize, e.request.DestinationSize);
+                }
             }
             e.counted = true;  // TotalRequestCount is "submitted requests" (DSTORAGE_PRIORITY_STATS): see submit_locked
         }
@@ -761,7 +871,13 @@ private:
                 } else if (SUCCEEDED(hr)) {
                     // Pending: processing has started and not completed (DSTORAGE_PRIORITY_STATS).
                     set_pending(+1);
-                    hr = execute_request(e);
+                    try {
+                        hr = execute_request(e);
+                    } catch (const std::bad_alloc&) {
+                        hr = E_OUTOFMEMORY;
+                    } catch (const std::length_error&) {
+                        hr = E_OUTOFMEMORY;
+                    }
                     set_pending(-1);
                 }
                 if (e.file && e.file_counted) e.file->finish_pending();
@@ -794,33 +910,42 @@ private:
         const uint64_t o = r.Options.AsUINT64;
         if (o & options::kReservedMask) return E_DSTORAGE_RESERVED_FIELDS;
         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
+        const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
+        const bool source_pages = (o & options::kSourcePages) != 0;
+        if (source_pages && !memory) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
-        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
-            log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
+        const int codec = static_cast<int>(options::bcpack(o));
+        if (codec == DSTORAGE_BCPACK_MODE_BC2 || options::swizzle(o) != 0) {
+            log_once("unsupported-decompress", "BC2 and MDU swizzle requests are not implemented (E_NOTIMPL)");
             return E_NOTIMPL;
         }
-        if (o & (options::kDestinationPages | options::kSourcePages)) {
-            log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
-            return E_NOTIMPL;
-        }
+        const bool pages = (o & options::kDestinationPages) != 0;
         const bool zlib = options::zlib(o);
-        // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
-        // it is 0 for every request that gets here (BCPack is refused above).
-        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        const bool bcpack = codec != 0;
+        const bool decompress = zlib || bcpack;
+        if (zlib && bcpack) {
+            if (r.IntermediateSize == 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+            // A stored zlib stream can be larger than this intermediate result;
+            // only the final DestinationSize must exceed SourceSize.
+            if (r.IntermediateSize > kMaxBcpackIntermediateSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
+        } else if (r.IntermediateSize != 0) {
+            return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        }
         // E_DSTORAGE_INVALID_DESTINATION_SIZE: without decompression DestinationSize must equal the source's length,
         // with it it must be larger (dstorageerr.h's description; DSTORAGE_REQUEST says the same of DestinationSize).
-        if (zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize)
+        if (decompress ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize)
             return E_DSTORAGE_INVALID_DESTINATION_SIZE;
-        const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
         const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
         if (total > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
-        // DSTORAGE_REQUEST: a buffer over 32 MiB is allowed only with 64 KiB or 2 MiB pages, which are not implemented
-        // yet (refused above). The source is never larger than the destination here (the same size without zlib,
-        // smaller with it), so this covers both buffers, and bounds the staging buffers of a zlib request too.
-        if (r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
-        // DSTORAGE_REQUEST: with ZlibDecompress the file offset must be 16-byte aligned.
-        if (zlib && !memory && r.FileOffset % 16 != 0) return E_DSTORAGE_INVALID_FILE_OFFSET;
+        // DSTORAGE_REQUEST: a buffer over 32 MiB is allowed only with 64 KiB or 2 MiB pages. A physical-page
+        // source/destination explicitly names 64 KiB pages; the page size behind
+        // an ordinary address is unknown, so each address keeps the 32 MiB cap.
+        if ((!pages && r.DestinationSize > kMax4kPageDestinationSize) ||
+            (memory && !source_pages && r.SourceSize > kMax4kPageDestinationSize))
+            return E_DSTORAGE_REQUEST_TOO_LARGE;
+        // DSTORAGE_REQUEST: either decompression mode requires a 16-byte-aligned file offset.
+        if (decompress && !memory && r.FileOffset % 16 != 0) return E_DSTORAGE_INVALID_FILE_OFFSET;
         if (!r.Destination) return E_INVALIDARG;
         if (memory) {
             if (!r.Source) return E_INVALIDARG;
@@ -828,74 +953,111 @@ private:
             if (!r.File) return E_INVALIDARG;
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
-        if (zlib) return inflate_request(e, memory);
-        if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
-        if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
-        return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
-    }
-
-    // A zlib request whose checks have passed: the source (SourceSize bytes of the file or of memory) goes into a
-    // staging buffer, inflates there, and only a result of exactly DestinationSize bytes is copied to the destination.
-    // So a failed stream leaves the destination as it was, and a memory source that overlaps its destination is safe.
-    // Both buffers are at most 32 MiB (execute_request). The stream is RFC 1950: the two header bytes, the deflate
-    // data, the Adler-32 of the result; bytes after the Adler-32 are not read. A failure is the matching
-    // dstorageerr.h code: a bad header (not deflate, a window over 32 KiB, a bad check value or a preset dictionary)
-    // E_DSTORAGE_ZLIB_BAD_HEADER, bad or truncated deflate data E_DSTORAGE_ZLIB_BAD_DATA, an Adler-32 mismatch
-    // E_DSTORAGE_ZLIB_PARITY_FAIL, and a stream that inflates to more or fewer bytes than DestinationSize
-    // E_DSTORAGE_DECOMPRESSION_ERROR (no code names a size mismatch; this is the header's generic one).
-    HRESULT inflate_request(const Entry& e, bool memory) {
-        const DSTORAGE_REQUEST& r = e.request;
-        std::vector<uint8_t> source, result;
-        try {
-            source.resize(r.SourceSize);
-            result.reserve(r.DestinationSize);
-        } catch (const std::bad_alloc&) {
-            return E_OUTOFMEMORY;
-        }
-        if (r.SourceSize != 0) {
-            if (memory) {
+        if (!decompress && r.SourceSize == 0) return S_OK;
+        // All input and intermediate bytes are owned by this worker before any
+        // destination is changed, including in-place memory requests.
+        std::vector<uint8_t> source, inflated, unpacked;
+        allocation_point(StagingAllocation::source);
+        source.resize(r.SourceSize);
+        if (r.SourceSize) {
+            if (source_pages) {
+                const HRESULT hr = read_source_pages(r, source.data());
+                if (FAILED(hr)) return hr;
+            } else if (memory) {
                 if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
-            } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
+            } else if (const HRESULT hr = read_file_range(*e.file, r.FileOffset, source.data(), r.SourceSize);
                        FAILED(hr)) {
                 return hr;
             }
         }
-        log_once("zlib", "zlib requests are inflated on the CPU (RFC 1950, leonida::zlib_inflate)");
-        set_decompression_pending(+1);
-        leonida::ZlibError why = leonida::ZlibError::none;
-        const bool inflated = leonida::zlib_inflate(source, result, r.DestinationSize, &why);
-        set_decompression_pending(-1);
-        HRESULT hr = S_OK;
-        if (!inflated) {
-            switch (why) {
-                case leonida::ZlibError::header: hr = E_DSTORAGE_ZLIB_BAD_HEADER; break;
-                case leonida::ZlibError::checksum: hr = E_DSTORAGE_ZLIB_PARITY_FAIL; break;
-                case leonida::ZlibError::limit: hr = E_DSTORAGE_DECOMPRESSION_ERROR; break;  // longer than the destination
-                default: hr = E_DSTORAGE_ZLIB_BAD_DATA; break;
+        const std::vector<uint8_t>* output = &source;
+        if (decompress) {
+            DecompressionScope pending;
+            if (zlib) {
+                const uint32_t expected = bcpack ? r.IntermediateSize : r.DestinationSize;
+                allocation_point(StagingAllocation::inflate);
+                inflated.reserve(expected);
+                log_once("zlib", "zlib requests are inflated on the CPU (RFC 1950, leonida::zlib_inflate)");
+                leonida::ZlibError why = leonida::ZlibError::none;
+                if (!leonida::zlib_inflate(source, inflated, expected, &why)) {
+                    switch (why) {
+                        case leonida::ZlibError::header: return E_DSTORAGE_ZLIB_BAD_HEADER;
+                        case leonida::ZlibError::checksum: return E_DSTORAGE_ZLIB_PARITY_FAIL;
+                        case leonida::ZlibError::limit: return E_DSTORAGE_DECOMPRESSION_ERROR;
+                        default: return E_DSTORAGE_ZLIB_BAD_DATA;
+                    }
+                }
+                if (inflated.size() != expected) return E_DSTORAGE_DECOMPRESSION_ERROR;
+                output = &inflated;
             }
-        } else if (result.size() != r.DestinationSize) {
-            hr = E_DSTORAGE_DECOMPRESSION_ERROR;  // shorter than the destination
+            if (bcpack) {
+                allocation_point(StagingAllocation::bcpack);
+                unpacked.resize(r.DestinationSize);
+                // Strict only. The native API's output may change on failure,
+                // which is why it receives owned staging rather than guest memory.
+                const auto decoded = leonida::bcpack::decode(*output, codec, unpacked, false);
+                if (!decoded) {
+                    wchar_t trace[2]{};
+                    if (GetEnvironmentVariableW(L"LEONIDA_TRACE_BCPACK_FAILURES", trace, 2) == 1 && trace[0] == L'1') {
+                        static std::atomic_uint failures{};
+                        if (failures.fetch_add(1, std::memory_order_relaxed) < 24) {
+                            std::fprintf(stderr, "[rt] dstorage: BCPack codec=%d zlib=%d source=%u intermediate=%u "
+                                "destination=%u file=%ls offset=%llu status=%u detail=%s\n", codec, int(zlib),
+                                r.SourceSize, r.IntermediateSize, r.DestinationSize,
+                                e.file ? e.file->path().c_str() : L"(memory)",
+                                static_cast<unsigned long long>(e.file ? r.FileOffset : 0),
+                                unsigned(decoded.status), decoded.message.c_str());
+                        }
+                    }
+                    if (decoded.status == leonida::bcpack::Status::error) return E_DSTORAGE_DECOMPRESSION_ERROR;
+                    log_once("bcpack-history", "strict BCPack cannot decode an unknown history or signature (E_NOTIMPL)");
+                    return E_NOTIMPL;
+                }
+                output = &unpacked;
+            }
+            pending.succeeded();
         }
-        if (FAILED(hr)) {
-            std::lock_guard lock(stats().mutex);
-            ++stats().s.DecompressionErrors;
-            return hr;
-        }
-        return guarded_move(r.Destination, result.data(), result.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+        return write_destination(r, output->data(), output->size());
+    }
+
+    static HRESULT read_source_pages(const DSTORAGE_REQUEST& r, uint8_t* destination) {
+        const size_t offset = r.SourcePageOffset;
+        const size_t count = (offset + r.SourceSize + rt::xmem::kPhysicalPageBytes - 1) / rt::xmem::kPhysicalPageBytes;
+        std::vector<uint64_t> page_numbers;
+        allocation_point(StagingAllocation::source_page_array);
+        page_numbers.resize(count);
+        if (!guarded_move(page_numbers.data(), r.SourcePageArray, count * sizeof(uint64_t)))
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        return rt::xmem::read_physical_pages(page_numbers.data(), offset, destination, r.SourceSize)
+            ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+    }
+
+    // The last step of a request: `size` bytes of the shim's own buffer go to the destination. For a
+    // DestinationIsPhysicalPages request that is DestinationPageArray, entries of 64 KiB page numbers, starting
+    // DestinationPageOffset bytes into the first (a UINT16, so always inside it). The entries the range covers are
+    // copied out of the title's array first, and every one is checked before a byte is written, so a bad array or a
+    // page that is not a live XMemAllocatePhysicalPages page leaves the pages as they were. Both are
+    // E_DSTORAGE_ACCESS_VIOLATION, the code for a destination that cannot be written.
+    static HRESULT write_destination(const DSTORAGE_REQUEST& r, const uint8_t* data, size_t size) {
+        if (!(r.Options.AsUINT64 & options::kDestinationPages))
+            return writable_range(r.Destination, size) && guarded_move(r.Destination, data, size)
+                ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+        if (size == 0) return S_OK;
+        log_once("destination-pages", "DestinationIsPhysicalPages requests are written through the xmem shim's pages");
+        const size_t offset = r.DestinationPageOffset;
+        const size_t count = (offset + size + rt::xmem::kPhysicalPageBytes - 1) / rt::xmem::kPhysicalPageBytes;
+        std::vector<uint64_t> page_numbers;
+        allocation_point(StagingAllocation::physical_page_array);
+        page_numbers.resize(count);
+        if (!guarded_move(page_numbers.data(), r.DestinationPageArray, count * sizeof(uint64_t)))
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        return rt::xmem::write_physical_pages(page_numbers.data(), offset, data, size) ? S_OK
+                                                                                       : E_DSTORAGE_ACCESS_VIOLATION;
     }
 
     void set_pending(int delta) {
         std::lock_guard lock(stats().mutex);
         priority_stats(stats().s, desc_.Priority).PendingRequestCount += static_cast<uint32_t>(delta);
-    }
-
-    // PendingDecompressionRequestCount is the zlib requests being inflated; TotalDecompressionRequestCount counts each
-    // one that reached its inflate (its source was read), DecompressionErrors those whose stream then failed.
-    static void set_decompression_pending(int delta) {
-        std::lock_guard lock(stats().mutex);
-        auto& s = stats().s;
-        s.PendingDecompressionRequestCount += static_cast<uint32_t>(delta);
-        if (delta > 0) ++s.TotalDecompressionRequestCount;
     }
 
     void describe(const Entry& e, DSTORAGE_ERROR_FIRST_FAILURE& f) const {
@@ -1051,9 +1213,29 @@ public:
             const DWORD error = GetLastError();
             return HRESULT_FROM_WIN32(error ? error : ERROR_FILE_NOT_FOUND);
         }
-        File* f = new (std::nothrow) File(h, path);
+        // CreateFileW owns path/overlay eligibility. Retain a partial token as the original sharing lease for the
+        // File's lifetime; worker reads still use only its provider. No host file API ever sees a partial token.
+        auto partial = rt::fs::partial_file_for_handle(h);
+        // Preserve the handle kind even if File construction moves the provider before throwing.
+        const bool virtual_source = static_cast<bool>(partial);
+        const auto close_unpublished = [&] {
+            if (virtual_source)
+                rt::fs::close_partial_read_handle(h);
+            else
+                CloseHandle(h);
+        };
+        File* f = nullptr;
+        try {
+            f = new (std::nothrow) File(h, path, std::move(partial));
+        } catch (const std::bad_alloc&) {
+            close_unpublished();
+            return E_OUTOFMEMORY;
+        } catch (const std::length_error&) {
+            close_unpublished();
+            return E_OUTOFMEMORY;
+        }
         if (!f) {
-            CloseHandle(h);
+            close_unpublished();
             return E_OUTOFMEMORY;
         }
         *ppv = static_cast<IDStorageFileX*>(f);
@@ -1138,6 +1320,12 @@ HRESULT WINAPI dstorage_get_factory(REFIID riid, void** ppv) {
 }
 
 }  // namespace
+
+#ifdef LEONIDA_DSTORAGE_TEST_HOOKS
+void dsx::test::fail_next_allocation(AllocationStage stage, bool length_error) {
+    g_fail_allocation.store(static_cast<uint32_t>(stage) | (length_error ? 0x100u : 0u), std::memory_order_release);
+}
+#endif
 
 // The console module names; docs/directstorage.md has the evidence and the confidence for each.
 SHIM_TABLE(dstorage,

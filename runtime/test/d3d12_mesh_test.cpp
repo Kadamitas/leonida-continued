@@ -153,14 +153,16 @@ int main() {
     };
     const auto root_signature = [&](ID3D12Device* device, Ref<ID3D12RootSignature>& root) {
         // [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint), as in d3d12_draw_test.
-        D3D12_ROOT_PARAMETER params[2] = {};
+        D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants = {0, 0, 2};
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[1].Descriptor = {1, 0};
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[2].Descriptor = {0, 0};  // s4:s5: optional per-mesh-workgroup invocation counter
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        root_desc.Desc_1_0 = {3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
         const auto blob = serialize_root_signature(root_desc);
         return !blob.empty() &&
                SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p)));
@@ -181,6 +183,11 @@ int main() {
         stream.add(TargetsSubobject{.inner = one_target()});
         Ref<ID3D12PipelineState> pso;
         EXPECT(create(device.p, stream, pso) == E_NOTIMPL && !pso.p);
+        const D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+        const D3D12_COMMAND_SIGNATURE_DESC signature_desc{20, 1, &argument, 0};
+        Ref<ID3D12CommandSignature> signature;
+        EXPECT(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature.p)) == E_NOTIMPL);
+        EXPECT(!signature.p);
         root.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
@@ -273,11 +280,38 @@ int main() {
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        Ref<ID3D12Resource> upload, readback, target;
+        Ref<ID3D12Resource> upload, readback, target, indirect_args, indirect_count, mesh_counter, counter_readback;
         const auto upload_desc = buffer_desc(4096);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&upload.p))));
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&indirect_args.p))));
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&indirect_count.p))));
+        const auto counter_desc = buffer_desc(16, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        const auto counter_read_desc = buffer_desc(16);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &counter_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&mesh_counter.p))));
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &counter_read_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&counter_readback.p))));
+        const D3D12_INDIRECT_ARGUMENT_DESC mesh_argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+        const D3D12_COMMAND_SIGNATURE_DESC mesh_signature_desc{20, 1, &mesh_argument, 0};
+        Ref<ID3D12CommandSignature> mesh_signature;
+        EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_signature_desc, nullptr,
+                                                        IID_PPV_ARGS(&mesh_signature.p))));
+        D3D12_INDIRECT_ARGUMENT_DESC mutating_arguments[2]{};
+        mutating_arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        mutating_arguments[0].Constant = {0, 0, 1};
+        mutating_arguments[1] = mesh_argument;
+        const D3D12_COMMAND_SIGNATURE_DESC mutating_desc{16, 2, mutating_arguments, 0};
+        Ref<ID3D12CommandSignature> unsupported_signature;
+        EXPECT(device->CreateCommandSignature(&mutating_desc, root.p, IID_PPV_ARGS(&unsupported_signature.p)) == E_NOTIMPL);
+        EXPECT(!unsupported_signature.p);
         const auto readback_desc = buffer_desc(size * 256);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -298,6 +332,17 @@ int main() {
         std::uint8_t* up = nullptr;
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         for (int i = 0; i < 3; ++i) std::memcpy(up + 256 * i, tints[i], sizeof(tints[i]));
+        // Padded GPU-only argument records and a count written by GPU copy commands. A CPU snapshot of the
+        // count's initial value (zero), or ignoring the count and executing both green records, gives wrong pixels.
+        const UINT red_records[15] = {0, 1, 1, 0xa5a5a5a5, 0x5a5a5a5a,
+                                     2, 2, 1, 0xa5a5a5a5, 0x5a5a5a5a,
+                                     0, 0, 0, 0xa5a5a5a5, 0x5a5a5a5a};
+        const UINT green_records[10] = {1, 1, 2, 0xa5a5a5a5, 0x5a5a5a5a,
+                                       2, 2, 2, 0xa5a5a5a5, 0x5a5a5a5a};
+        std::memcpy(up + 1024, red_records, sizeof(red_records));
+        std::memcpy(up + 1152, green_records, sizeof(green_records));
+        const UINT counts[] = {0, 1};
+        std::memcpy(up + 2048, counts, sizeof(counts));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -320,6 +365,20 @@ int main() {
         EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list6.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
+        list->CopyBufferRegion(indirect_args.p, 0, upload.p, 0, 4096);
+        list->CopyBufferRegion(indirect_count.p, 8, upload.p, 2048, 4);
+        auto initial_count = transition(indirect_count.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                         D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        list->ResourceBarrier(1, &initial_count);
+        auto update_count = transition(indirect_count.p, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                        D3D12_RESOURCE_STATE_COPY_DEST);
+        list->ResourceBarrier(1, &update_count);
+        list->CopyBufferRegion(indirect_count.p, 8, upload.p, 2052, 4);
+        const D3D12_RESOURCE_BARRIER indirect_ready[] = {
+            transition(indirect_args.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+            transition(indirect_count.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)};
+        list->ResourceBarrier(2, indirect_ready);
+
         D3D12_RESOURCE_BARRIER to_target =
             transition(target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->ResourceBarrier(1, &to_target);
@@ -338,12 +397,12 @@ int main() {
         list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va);
         list6->DispatchMesh(0, 1, 1);
-        list6->DispatchMesh(2, 2, 1);
+        list->ExecuteIndirect(mesh_signature.p, 3, indirect_args.p, 1024, nullptr, 0);
         // Mesh draw 2: groups (0,0,0) and (0,0,1), columns 0 and 1 of row 0, moved by (1, -1), green -> the top half
         // of the bottom-right quadrant.
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
-        list6->DispatchMesh(1, 1, 2);
+        list->ExecuteIndirect(mesh_signature.p, 2, indirect_args.p, 1152, indirect_count.p, 8);
         // The stream's VS PSO: a full-screen triangle through a viewport on the bottom-left quadrant, yellow.
         const D3D12_VIEWPORT bottom_left{0, float(size / 2), float(size / 2), float(size / 2), 0, 1};
         list->RSSetViewports(1, &bottom_left);
@@ -371,6 +430,7 @@ int main() {
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
+        readback->Unmap(0, nullptr);
 
         // The wrong kind of draw for the pipeline fails at execution: a vertex draw with the mesh PSO, then
         // DispatchMesh with the VS PSO.
@@ -388,6 +448,15 @@ int main() {
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_draw);
         }
+        EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, vs_pso.p)));
+        list->SetGraphicsRootSignature(root.p);
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->ExecuteIndirect(mesh_signature.p, 1, indirect_args.p, 1044, nullptr, 0);
+        EXPECT(list->Close() == S_OK);
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_draw);
         // A grid beyond D3D12's limits (65535 per count, 2^22 groups) is a recording error.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
         list->SetGraphicsRootSignature(root.p);
@@ -399,22 +468,17 @@ int main() {
         list->RSSetViewports(1, &viewport);
         list6->DispatchMesh(4096, 1025, 1);
         EXPECT(list->Close() == E_INVALIDARG);
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+        list->ExecuteIndirect(mesh_signature.p, 1, indirect_args.p, 4092, nullptr, 0);
+        EXPECT(list->Close() == E_INVALIDARG);
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+        list->ExecuteIndirect(mesh_signature.p, 1, indirect_args.p, 1044, indirect_count.p, 4096);
+        EXPECT(list->Close() == E_INVALIDARG);
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 
-        // D3D-291: pipeline statistics around mesh draws. Query 0 holds a vertex draw, two mesh draws and another
-        // vertex draw, which the layer splits into a full, a mesh and a full segment; query 1 holds one mesh draw;
-        // query 2 the two vertex draws alone. A mesh draw has no input assembly or vertex shader, so those fields
-        // count only the two full-screen triangles (3 vertices, 1 primitive each). How many clipping and pixel
-        // shader invocations a draw makes is the driver's (RADV's PSInvocations is not the pixel count), so query
-        // 0 is checked against query 2: more pixel shader invocations is the mesh segment's share. A mesh segment
-        // runs in a pool that counts the fragment and compute invocations only, because
-        // VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076 leaves the clipping counters out of a pool that is
-        // active during a mesh draw; D3D12 counts the clipping invocations and primitives of a mesh pipeline, so
-        // those two fields read 0 here. Under LEONIDA_VK_VALIDATION=1 the run must stay free of the VUID.
-        // Where the device has the meshShaderQueries feature, the clipping invocations of a mesh segment come
-        // from a mesh-primitives query instead (D3D-MESH-CLIPPING-COUNTER): the number of primitives the mesh
-        // shader emitted that reached the fragment shader. How many that is depends on the driver, so the counts
-        // are compared with each other and not written down.
+        // Legacy D3D12 statistics include meaningful clipping counters for mesh work. Vulkan forbids those
+        // counters with mesh draws (07076), so this whole submission must fail before emission. No zero or
+        // mesh-primitive-count substitute is accepted. Subsequent draws still start from COPY_SOURCE.
         if (d.pipeline_statistics_query) {
             const D3D12_QUERY_HEAP_DESC statistics_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 3, 0};
             Ref<ID3D12QueryHeap> statistics;
@@ -442,7 +506,9 @@ int main() {
             const auto mesh_draw = [&](UINT x, UINT y) {
                 list->SetPipelineState(mesh_pso.p);
                 list->RSSetViewports(1, &viewport);
-                list6->DispatchMesh(x, y, 1);
+                if (x == 2 && y == 2)
+                    list->ExecuteIndirect(mesh_signature.p, 1, indirect_args.p, 1044, indirect_count.p, 8);
+                else list6->DispatchMesh(x, y, 1);
             };
             list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
             vertex_draw();
@@ -459,52 +525,118 @@ int main() {
             list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 2);
             list->ResolveQueryData(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 3, results.p, 0);
             EXPECT(list->Close() == S_OK);
+            Ref<ID3D12CommandAllocator> empty_allocator;
+            Ref<ID3D12GraphicsCommandList> empty_list;
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                             IID_PPV_ARGS(&empty_allocator.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, empty_allocator.p,
+                                                       nullptr, IID_PPV_ARGS(&empty_list.p))));
+            EXPECT(empty_list->Close() == S_OK);
+            ID3D12CommandList* rejected_batch[] = {empty_list.p, list.p};
+            queue->ExecuteCommandLists(2, rejected_batch);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::unsupported);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+            // A rejected larger batch must not poison a later smaller, valid statistics submission through
+            // inactive cached preparation entries. The target still starts in COPY_SOURCE after refusal.
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, vs_pso.p)));
+            auto to_render = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &to_render);
+            list->SetGraphicsRootSignature(root.p);
+            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 2);
+            vertex_draw();
+            list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 2);
+            auto back_to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &back_to_copy);
+            list->ResolveQueryData(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 2, 1, results.p, 0);
+            EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
-            D3D12_QUERY_DATA_PIPELINE_STATISTICS data[3]{};
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)) && SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
             void* stats_mapped = nullptr;
             EXPECT(SUCCEEDED(results->Map(0, nullptr, &stats_mapped)));
-            std::memcpy(data, stats_mapped, sizeof(data));
+            const auto actual = *static_cast<const D3D12_QUERY_DATA_PIPELINE_STATISTICS*>(stats_mapped);
+            EXPECT(actual.IAVertices == 3 && actual.IAPrimitives == 1 && actual.VSInvocations >= 1 &&
+                   actual.CSInvocations == 0);
             results->Unmap(0, nullptr);
-            const auto& mixed = data[0];
-            const auto& mesh_only = data[1];
-            const auto& vertex_only = data[2];
-            std::printf("statistics, mixed: IA %llu/%llu VS %llu C %llu/%llu PS %llu CS %llu; mesh only: C %llu/%llu "
-                        "PS %llu; vertex only: C %llu PS %llu\n",
-                        mixed.IAVertices, mixed.IAPrimitives, mixed.VSInvocations, mixed.CInvocations,
-                        mixed.CPrimitives, mixed.PSInvocations, mixed.CSInvocations, mesh_only.CInvocations,
-                        mesh_only.CPrimitives, mesh_only.PSInvocations, vertex_only.CInvocations,
-                        vertex_only.PSInvocations);
-            EXPECT(mixed.IAVertices == 6 && mixed.IAPrimitives == 2 && mixed.VSInvocations >= 1);
-            EXPECT(vertex_only.IAVertices == 6 && vertex_only.IAPrimitives == 2);
-            EXPECT(mixed.GSInvocations == 0 && mixed.GSPrimitives == 0 && mixed.HSInvocations == 0 &&
-                   mixed.DSInvocations == 0 && mixed.CSInvocations == 0);
-            // The clipping invocations of the mesh segments (D3D-MESH-CLIPPING-COUNTER). Without the feature they
-            // read 0; with it they are the mesh-primitives count of those segments.
-            const auto mesh_clipping = mixed.CInvocations - vertex_only.CInvocations;
-            if (d.mesh_shader_queries) {
-                // The count has to be wired up, not merely self-consistent. A layer that reported the feature but
-                // never created the third pool would leave both counts at 0, and 0 >= 0 would still hold. How many
-                // primitives the mesh shader emits is the driver's, so ask for a positive count and not for a
-                // number: the mesh draw above fills the top-left quadrant, so it emits at least one.
-                EXPECT(mesh_clipping >= mesh_only.CInvocations);
-                EXPECT(mesh_only.CInvocations > 0);
-            } else {
-                EXPECT(mesh_clipping == 0);
-            }
-            EXPECT(mixed.PSInvocations > vertex_only.PSInvocations);
-            EXPECT(mesh_only.IAVertices == 0 && mesh_only.IAPrimitives == 0 && mesh_only.VSInvocations == 0 &&
-                   mesh_only.GSInvocations == 0 && mesh_only.GSPrimitives == 0 && mesh_only.HSInvocations == 0 &&
-                   mesh_only.DSInvocations == 0 && mesh_only.CSInvocations == 0);
-            // Vulkan has no clipped-primitive counter, so the clipping primitives of a mesh segment stay 0.
-            EXPECT(mesh_only.CPrimitives == 0 && mesh_only.PSInvocations > 0);
-            if (!d.mesh_shader_queries) EXPECT(mesh_only.CInvocations == 0);
         } else {
             std::printf("pipelineStatisticsQuery not available: the D3D-291 statistics check is skipped\n");
         }
 
-        for (auto* r : {&upload, &readback, &target}) r->reset();
+        // Counts are GPU-visible UINTs: zero must skip, large counts must clamp to MaxCommandCount, and a zero
+        // MaxCommandCount must do nothing. None of these cases requires host access to the default-heap count.
+        struct CountCase { UINT count, maximum, empty_dimension = 0; };
+        const std::array<CountCase, 7> count_cases{{{0, 1}, {1, 1}, {3, 1}, {UINT_MAX, 1}, {1, 0}, {1, 1, 1}, {1, 1, 2}}};
+        UINT64 next_fence = 5;
+        for (const auto [count, maximum, empty_dimension] : count_cases) {
+            std::memcpy(up + 2052, &count, sizeof(count));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            auto ready = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &ready);
+            auto count_to_copy = transition(indirect_count.p, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                             D3D12_RESOURCE_STATE_COPY_DEST);
+            list->ResourceBarrier(1, &count_to_copy);
+            list->CopyBufferRegion(indirect_count.p, 8, upload.p, 2052, 4);
+            auto count_ready = transition(indirect_count.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                           D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            list->ResourceBarrier(1, &count_ready);
+            if (next_fence != 5) {
+                auto writable = transition(mesh_counter.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                list->ResourceBarrier(1, &writable);
+            }
+            list->CopyBufferRegion(mesh_counter.p, 0, upload.p, 2048, 4);
+            auto counter_ready = transition(mesh_counter.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list->ResourceBarrier(1, &counter_ready);
+            list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+            list->SetGraphicsRootSignature(root.p);
+            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+            list->SetGraphicsRootConstantBufferView(1, upload_va);
+            list->SetGraphicsRootUnorderedAccessView(2, mesh_counter->GetGPUVirtualAddress());
+            D3D12_VIEWPORT case_viewport = viewport;
+            if (empty_dimension == 1) case_viewport.Width = 0;
+            if (empty_dimension == 2) case_viewport.Height = 0;
+            list->RSSetViewports(1, &case_viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->ExecuteIndirect(mesh_signature.p, maximum, indirect_args.p, 1044, indirect_count.p, 8);
+            auto counter_to_read = transition(mesh_counter.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &counter_to_read);
+            list->CopyBufferRegion(counter_readback.p, 0, mesh_counter.p, 0, 4);
+            auto to_read = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &to_read);
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, next_fence)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(next_fence, nullptr)));
+            ++next_fence;
+            void* case_pixels = nullptr;
+            EXPECT(SUCCEEDED(readback->Map(0, nullptr, &case_pixels)));
+            for (UINT y = 0; y < size; ++y) for (UINT x = 0; x < size; ++x) {
+                const bool red = count && maximum && !empty_dimension && x < size / 2 && y < size / 2;
+                const std::array<std::uint8_t, 4> expected = red
+                    ? std::array<std::uint8_t, 4>{255, 0, 0, 255}
+                    : std::array<std::uint8_t, 4>{0, 0, 255, 255};
+                const auto* pixel = static_cast<const std::uint8_t*>(case_pixels) + y * 256 + x * 4;
+                EXPECT(std::equal(expected.begin(), expected.end(), pixel));
+            }
+            readback->Unmap(0, nullptr);
+            void* invocation_count = nullptr;
+            EXPECT(SUCCEEDED(counter_readback->Map(0, nullptr, &invocation_count)));
+            EXPECT(*static_cast<const UINT*>(invocation_count) == (count && maximum ? 4u : 0u));
+            counter_readback->Unmap(0, nullptr);
+        }
+
+        for (auto* r : {&upload, &readback, &target, &indirect_args, &indirect_count, &mesh_counter, &counter_readback})
+            r->reset();
+        mesh_signature.reset();
         for (auto* p : {&mesh_pso, &vs_pso, &refused}) p->reset();
         root.reset();
         rtv_heap.reset();
@@ -540,7 +672,8 @@ int main() {
     }
     std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (9 refused as invalid, 2 as not "
                 "implemented); DispatchMesh over X, Y and Z and a stream VS draw matched all %u pixels; wrong-kind "
-                "draws fail at execution, oversized grids at Close; statistics queries around mesh draws resolve\n",
+                "draws fail at execution, oversized grids at Close; legacy mesh clipping queries are refused; "
+                "GPU-counted indirect mesh draws, padded records and empty-viewport UAV writes matched\n",
                 size * size);
     return 0;
 }

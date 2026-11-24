@@ -265,6 +265,11 @@ def parse_file(path):
         info["insns"].append(ins)
     tail = "\n".join(lines)
     info["invalid"] = tail.count("invalid instruction encoding")
+    if m:
+        # The Python decoder records omitted words in the header and has no LLVM stderr diagnostics.
+        count = re.search(r", (\d+) invalid words?\s*$", lines[0])
+        if count:
+            info["invalid"] = max(info["invalid"], int(count.group(1)))
     return info
 
 

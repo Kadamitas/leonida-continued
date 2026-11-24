@@ -23,6 +23,7 @@
 // Only images mapped by the loader see these: they are bound through the registry, the runtime's own code calls the
 // host directly.
 #include <windows.h>
+#include <winternl.h>
 #include <intrin.h>
 
 #include <atomic>
@@ -30,6 +31,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -248,6 +250,7 @@ bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts
 
 struct Target {
     std::filesystem::path path;
+    partial_package::FileRef partial;
     DWORD error = 0;  // non-zero: the caller fails with this error and does not touch the host
 };
 
@@ -273,6 +276,84 @@ bool deleted(const std::filesystem::path& overlay, const std::vector<std::wstrin
     const std::filesystem::path m = marker(overlay, parts);
     return std::filesystem::is_regular_file(win32_io_path(m), ec) ||
            std::filesystem::is_regular_file(win32_io_path(m / kRemovedDirMarker), ec);
+}
+
+// Only a missing installed-package file can use the explicit, verified-range source. Overlay files, deletion
+// markers, scratch paths, inaccessible paths and real installed files keep their ordinary behaviour.
+partial_package::FileRef partial_target(const Roots& r, const std::vector<std::wstring>& parts) {
+    if (r.game.empty() || parts.empty() || same_name(parts.front().c_str(), kScratchDir) ||
+        !partial_package::enabled() || deleted(r.overlay, parts)) return {};
+    std::error_code ec;
+    if (!r.overlay.empty()) {
+        if (std::filesystem::exists(join(r.overlay, parts), ec) || ec) return {};
+    }
+    if (std::filesystem::exists(join(r.game, parts), ec) || ec) return {};
+    return partial_package::find(join({}, parts).generic_wstring());
+}
+
+struct PartialHandle {
+    partial_package::FileRef file;
+    std::mutex position_mutex;
+    std::uint64_t position = 0;
+    bool readable = true;
+    bool unbuffered = false;
+    DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+};
+
+std::mutex g_partial_mutex;
+std::map<HANDLE, std::shared_ptr<PartialHandle>> g_partial_handles;
+
+std::shared_ptr<PartialHandle> partial_handle(HANDLE handle) {
+    std::lock_guard lock(g_partial_mutex);
+    const auto found = g_partial_handles.find(handle);
+    return found == g_partial_handles.end() ? nullptr : found->second;
+}
+
+HANDLE open_partial_handle(const partial_package::FileRef& file, DWORD access, DWORD share, bool unbuffered = false) {
+    if (!file) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    try {
+        auto entry = std::make_shared<PartialHandle>();
+        entry->file = file;
+        entry->readable = (access & (GENERIC_READ | FILE_READ_DATA)) != 0;
+        entry->unbuffered = unbuffered;
+        entry->share = share;
+        std::lock_guard lock(g_partial_mutex);
+        for (const auto& pair : g_partial_handles) {
+            const auto& other = pair.second;
+            if (other->file != file) continue;
+            if ((entry->readable && !(other->share & FILE_SHARE_READ)) ||
+                (other->readable && !(share & FILE_SHARE_READ))) {
+                SetLastError(ERROR_SHARING_VIOLATION);
+                return INVALID_HANDLE_VALUE;
+            }
+        }
+        // A record address is an opaque token, not a kernel handle. Native file I/O cannot use it to reach the
+        // partial source, and the live map owns it until CloseHandle. In-flight synchronous calls retain ownership.
+        const HANDLE token = reinterpret_cast<HANDLE>(entry.get());
+        g_partial_handles.emplace(token, std::move(entry));
+        return token;
+    } catch (...) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return INVALID_HANDLE_VALUE;
+    }
+}
+
+HANDLE create_partial_handle(const partial_package::FileRef& file, DWORD access, DWORD share, DWORD disposition,
+                             DWORD flags, const SECURITY_ATTRIBUTES* attributes, HANDLE template_file) {
+    if (disposition != OPEN_EXISTING ||
+        (flags & (FILE_FLAG_OVERLAPPED | FILE_FLAG_DELETE_ON_CLOSE)) ||
+        (attributes && (attributes->bInheritHandle || attributes->lpSecurityDescriptor)) || template_file) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (share & ~(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    return open_partial_handle(file, access, share, (flags & FILE_FLAG_NO_BUFFERING) != 0);
 }
 
 // Writes an empty hidden marker file. On failure `error` holds the reason.
@@ -337,6 +418,10 @@ View view(const Roots& r, const std::vector<std::wstring>& parts) {
             v.in_package = true;
             if (v.kind == Kind::None) v.kind = std::filesystem::is_directory(p, ec) ? Kind::Directory : Kind::File;
         }
+    }
+    if (v.kind == Kind::None && partial_target(r, parts)) {
+        v.kind = Kind::File;
+        v.in_package = true;
     }
     return v;
 }
@@ -410,7 +495,8 @@ Target read_target(const std::wstring& path) {
     if (deleted(r.overlay, parts)) return fail(ERROR_FILE_NOT_FOUND);
 
     Target t;
-    t.path = disk_path(r.game, parts);
+    t.path = join(r.game, parts);
+    t.partial = partial_target(r, parts);
     return t;
 }
 
@@ -427,6 +513,7 @@ Target write_target(const std::wstring& path, bool copy_up) {
     const Roots r = roots();
     if (r.overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail(ERROR_INVALID_NAME);  // "GAME:" is a folder, not a file
+    if (partial_target(r, parts)) return fail(ERROR_ACCESS_DENIED);
 
     // The folder has to exist in the title's view, as CreateDirectory, MoveFile and CopyFile require: without the
     // check a failed open left the missing folders behind, and a create succeeded in a folder that was never made,
@@ -620,7 +707,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         return deleted(r.overlay, entry_parts);
     };
     // Names already listed, ordered by _wcsicmp itself, so two names are one entry exactly when same_name says so, in
-    // whatever locale the title set (a lower-cased key is not: under .UTF-8 _wcslwr_s folds É and é, _wcsicmp not).
+    // whatever locale the title set (a lower-cased key is not: under .UTF-8 _wcslwr_s folds Ã‰ and Ã©, _wcsicmp not).
     struct NoCase {
         bool operator()(const std::wstring& a, const std::wstring& b) const { return _wcsicmp(a.c_str(), b.c_str()) < 0; }
     };
@@ -682,30 +769,61 @@ std::filesystem::path overlay_dir() {
     return g_overlay_dir;
 }
 
-// gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the
-// path the title passed, the Win32 error, the caller as module+RVA), so a boot that stops on a missing or refused
-// file names it. Failures only, and at most 256 of them, so a title probing many optional files can't fill the file.
-void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* caller) {
+partial_package::FileRef partial_file_for_handle(HANDLE handle) {
+    const auto entry = partial_handle(handle);
+    return entry ? entry->file : partial_package::FileRef{};
+}
+
+HANDLE make_partial_read_handle(const partial_package::FileRef& file) {
+    return open_partial_handle(file, GENERIC_READ, FILE_SHARE_READ);
+}
+
+bool close_partial_read_handle(HANDLE handle) {
+    std::lock_guard lock(g_partial_mutex);
+    return g_partial_handles.erase(handle) != 0;
+}
+
+BOOL WINAPI close_handle(HANDLE handle) {
+    if (close_partial_read_handle(handle)) return TRUE;
+    return ::CloseHandle(handle);
+}
+
+void note_partial_read(const char* phase, const PartialHandle& entry, std::uint64_t offset, DWORD length, DWORD done, DWORD error,
+                       const void* caller) noexcept {
     if (!rt::startup_trace::enabled()) return;
-    static std::atomic<int> left{256};
-    if (left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
-    std::string utf8;
-    if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
-        utf8.resize(static_cast<size_t>(n) - 1);
-        WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
+    static std::atomic<unsigned> events{0};
+    if (events.fetch_add(1, std::memory_order_relaxed) >= 128) return;
+    const DWORD saved = GetLastError();
+    try {
+        rt::startup_trace::event("partial_file_read",
+            "\"phase\":" + rt::startup_trace::quote(phase) + ",\"offset\":" + std::to_string(offset) +
+            ",\"length\":" + std::to_string(length) + ",\"bytes\":" + std::to_string(done) +
+            ",\"error\":" + std::to_string(error) + ",\"file_size\":" +
+            std::to_string(partial_package::size(entry.file)) + ",\"caller\":" +
+            rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<std::uint64_t>(caller))));
+    } catch (...) {}
+    SetLastError(saved);
+}
+
+ULONG_PTR partial_read_status(DWORD error) {
+    switch (error) {
+        case ERROR_SUCCESS: return 0;
+        case ERROR_HANDLE_EOF: return 0xc0000011u;  // STATUS_END_OF_FILE
+        case ERROR_NOT_READY: return 0xc00000a3u;  // STATUS_DEVICE_NOT_READY
+        case ERROR_ACCESS_DENIED: return 0xc0000022u;
+        case ERROR_NOACCESS: return 0xc0000005u;
+        case ERROR_NOT_ENOUGH_MEMORY: return 0xc0000017u;
+        case ERROR_INVALID_PARAMETER: return 0xc000000du;
+        case ERROR_NOT_SUPPORTED: return 0xc00000bbu;
+        default: return 0xc0000185u;  // STATUS_IO_DEVICE_ERROR
     }
-    rt::startup_trace::event(
-        "file_open_failed",
-        std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) +
-            ",\"error\":" + std::to_string(error) + ",\"caller\":" +
-            rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
 // Reads one byte of every 4 KiB page of [buffer, buffer + size) from user mode, so that pages committed on first
 // touch (xmem's physical-page views: a reserve-only section committed by its vectored handler) are committed before
 // the kernel writes into them. A page that is not valid at all is left for the caller's ReadFile to refuse. No C++
 // objects here: the function has __try.
-bool touch_pages(void* buffer, DWORD size) {
+static bool touch_pages(void* buffer, DWORD size) {
     auto* p = static_cast<volatile const unsigned char*>(buffer);
     const uintptr_t first = reinterpret_cast<uintptr_t>(buffer) & ~uintptr_t{0xfff};
     const uintptr_t end = reinterpret_cast<uintptr_t>(buffer) + size;
@@ -725,7 +843,7 @@ bool touch_pages(void* buffer, DWORD size) {
 // that xmem maps from physical pages committed on first touch; the kernel's write raises no user-mode fault, so
 // ReadFile fails with ERROR_NOACCESS (998), and the title's read loop sleeps 1 ms and retries forever (measured on
 // 1.0.2.1, native Windows). Touching the pages from user mode commits them; the read is then retried once.
-BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
+static BOOL read_host_file(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
     if (ReadFile(file, buffer, size, read, overlapped)) return TRUE;
     if (GetLastError() != ERROR_NOACCESS || !buffer || !size) return FALSE;
     static std::atomic<bool> logged{false};
@@ -734,6 +852,249 @@ BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOV
                              "destination pages and retrying (logged once)\n");
     touch_pages(buffer, size);
     return ReadFile(file, buffer, size, read, overlapped);
+}
+
+BOOL WINAPI read_file(HANDLE handle, LPVOID buffer, DWORD length, LPDWORD read_bytes, LPOVERLAPPED overlapped) {
+    const auto entry = partial_handle(handle);
+    if (!entry) return read_host_file(handle, buffer, length, read_bytes, overlapped);
+    if (read_bytes) *read_bytes = 0;
+    // A nonnull OVERLAPPED also supplies an explicit offset for a synchronous handle. This is not async I/O:
+    // FILE_FLAG_OVERLAPPED opens remain refused. The measured caller has no event and consumes completion here.
+    if ((!read_bytes && !overlapped) || (!buffer && length) || (overlapped && overlapped->hEvent))
+        return fail_bool(ERROR_INVALID_PARAMETER);
+    if (!entry->readable) return fail_bool(ERROR_ACCESS_DENIED);
+    std::lock_guard lock(entry->position_mutex);
+    const std::uint64_t offset = overlapped ? (std::uint64_t{overlapped->OffsetHigh} << 32) | overlapped->Offset
+                                           : entry->position;
+    if (offset > static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)()))
+        return fail_bool(ERROR_INVALID_PARAMETER);
+    // The measured archive reader uses synchronous, 4KiB-aligned unbuffered I/O. Support that subset with owned
+    // verified staging; do not silently accept arbitrary alignment or asynchronous requests through this token.
+    if (entry->unbuffered && length &&
+        ((reinterpret_cast<std::uintptr_t>(buffer) | offset | length) & 4095u))
+        return fail_bool(ERROR_INVALID_PARAMETER);
+    std::uint32_t done = 0;
+    DWORD error = ERROR_SUCCESS;
+    const void* caller = _ReturnAddress();
+    if (overlapped) {
+        overlapped->Internal = 0x103u;  // STATUS_PENDING until synchronous completion below
+        overlapped->InternalHigh = 0;
+    }
+    note_partial_read("begin", *entry, offset, length, 0, ERROR_SUCCESS, caller);
+    bool ok;
+    if (overlapped && length && offset >= partial_package::size(entry->file)) {
+        error = ERROR_HANDLE_EOF;
+        ok = false;
+    } else {
+        ok = partial_package::read_at(entry->file, offset, buffer, length, done, error);
+    }
+    if (overlapped) {
+        overlapped->Internal = partial_read_status(error);
+        overlapped->InternalHigh = done;
+        // Native Windows leaves Offset/OffsetHigh unchanged for this synchronous form (measured on the host).
+    }
+    note_partial_read("end", *entry, offset, length, done, error, caller);
+    if (!ok) return fail_bool(error);
+    entry->position = offset + done;
+    if (read_bytes) *read_bytes = done;
+    return TRUE;
+}
+
+BOOL WINAPI set_file_pointer_ex(HANDLE handle, LARGE_INTEGER distance, PLARGE_INTEGER result, DWORD method) {
+    const auto entry = partial_handle(handle);
+    if (!entry) return ::SetFilePointerEx(handle, distance, result, method);
+    std::lock_guard lock(entry->position_mutex);
+    std::uint64_t base = 0;
+    switch (method) {
+        case FILE_BEGIN: break;
+        case FILE_CURRENT: base = entry->position; break;
+        case FILE_END: base = partial_package::size(entry->file); break;
+        default: return fail_bool(ERROR_INVALID_PARAMETER);
+    }
+    std::uint64_t position = 0;
+    if (distance.QuadPart < 0) {
+        const auto magnitude = static_cast<std::uint64_t>(-(distance.QuadPart + 1)) + 1;
+        if (magnitude > base) return fail_bool(ERROR_NEGATIVE_SEEK);
+        position = base - magnitude;
+    } else {
+        constexpr auto maximum = static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)());
+        if (base > maximum || static_cast<std::uint64_t>(distance.QuadPart) > maximum - base)
+            return fail_bool(ERROR_INVALID_PARAMETER);
+        position = base + static_cast<std::uint64_t>(distance.QuadPart);
+    }
+    if (entry->unbuffered && (position & 4095u)) return fail_bool(ERROR_INVALID_PARAMETER);
+    entry->position = position;
+    if (result) result->QuadPart = static_cast<LONGLONG>(position);
+    return TRUE;
+}
+
+DWORD WINAPI set_file_pointer(HANDLE handle, LONG low, PLONG high, DWORD method) {
+    if (!partial_handle(handle)) return ::SetFilePointer(handle, low, high, method);
+    LARGE_INTEGER distance{}, result{};
+    distance.LowPart = static_cast<DWORD>(low);
+    distance.HighPart = high ? *high : (low < 0 ? -1 : 0);
+    if (!set_file_pointer_ex(handle, distance, &result, method)) return INVALID_SET_FILE_POINTER;
+    if (high) *high = result.HighPart;
+    SetLastError(ERROR_SUCCESS);  // INVALID_SET_FILE_POINTER is also a valid low word on success.
+    return result.LowPart;
+}
+
+BOOL WINAPI get_file_size_ex(HANDLE handle, PLARGE_INTEGER result) {
+    const auto entry = partial_handle(handle);
+    if (!entry) return ::GetFileSizeEx(handle, result);
+    if (!result) return fail_bool(ERROR_INVALID_PARAMETER);
+    result->QuadPart = static_cast<LONGLONG>(partial_package::size(entry->file));
+    return TRUE;
+}
+
+DWORD WINAPI get_file_size(HANDLE handle, LPDWORD high) {
+    const auto entry = partial_handle(handle);
+    if (!entry) return ::GetFileSize(handle, high);
+    const auto length = partial_package::size(entry->file);
+    if (high) *high = static_cast<DWORD>(length >> 32);
+    SetLastError(ERROR_SUCCESS);
+    return static_cast<DWORD>(length);
+}
+
+DWORD WINAPI get_file_type(HANDLE handle) {
+    if (partial_handle(handle)) return FILE_TYPE_DISK;
+    return ::GetFileType(handle);
+}
+
+BOOL WINAPI read_file_ex(HANDLE handle, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped,
+                         LPOVERLAPPED_COMPLETION_ROUTINE completion) {
+    if (partial_handle(handle)) return fail_bool(ERROR_NOT_SUPPORTED);
+    return ::ReadFileEx(handle, buffer, length, overlapped, completion);
+}
+
+BOOL WINAPI write_file(HANDLE handle, LPCVOID buffer, DWORD length, LPDWORD written, LPOVERLAPPED overlapped) {
+    if (partial_handle(handle)) {
+        if (written) *written = 0;
+        return fail_bool(ERROR_ACCESS_DENIED);
+    }
+    return ::WriteFile(handle, buffer, length, written, overlapped);
+}
+
+BOOL WINAPI write_file_ex(HANDLE handle, LPCVOID buffer, DWORD length, LPOVERLAPPED overlapped,
+                          LPOVERLAPPED_COMPLETION_ROUTINE completion) {
+    if (partial_handle(handle)) return fail_bool(ERROR_ACCESS_DENIED);
+    return ::WriteFileEx(handle, buffer, length, overlapped, completion);
+}
+
+BOOL WINAPI set_end_of_file(HANDLE handle) {
+    if (partial_handle(handle)) return fail_bool(ERROR_ACCESS_DENIED);
+    return ::SetEndOfFile(handle);
+}
+
+BOOL WINAPI flush_file_buffers(HANDLE handle) {
+    if (partial_handle(handle)) return fail_bool(ERROR_NOT_SUPPORTED);
+    return ::FlushFileBuffers(handle);
+}
+
+HANDLE WINAPI reopen_file(HANDLE handle, DWORD access, DWORD share, DWORD flags) {
+    if (partial_handle(handle)) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return INVALID_HANDLE_VALUE;
+    }
+    return ::ReOpenFile(handle, access, share, flags);
+}
+
+BOOL WINAPI duplicate_handle(HANDLE source_process, HANDLE source, HANDLE destination_process,
+                            LPHANDLE destination, DWORD access, BOOL inherit, DWORD options) {
+    if (partial_handle(source)) {
+        if ((options & DUPLICATE_CLOSE_SOURCE) && GetProcessId(source_process) == GetCurrentProcessId())
+            close_partial_read_handle(source);
+        return fail_bool(ERROR_NOT_SUPPORTED);
+    }
+    return ::DuplicateHandle(source_process, source, destination_process, destination, access, inherit, options);
+}
+
+HANDLE WINAPI create_file_mapping_w(HANDLE file, LPSECURITY_ATTRIBUTES attributes, DWORD protection,
+                                    DWORD high, DWORD low, LPCWSTR name) {
+    if (partial_handle(file)) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+    return ::CreateFileMappingW(file, attributes, protection, high, low, name);
+}
+
+HANDLE WINAPI create_file_mapping_a(HANDLE file, LPSECURITY_ATTRIBUTES attributes, DWORD protection,
+                                    DWORD high, DWORD low, LPCSTR name) {
+    if (partial_handle(file)) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+    return ::CreateFileMappingA(file, attributes, protection, high, low, name);
+}
+
+BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT* segments, DWORD length, LPDWORD reserved,
+                              LPOVERLAPPED overlapped) {
+    if (partial_handle(file)) return fail_bool(ERROR_NOT_SUPPORTED);
+    return ::ReadFileScatter(file, segments, length, reserved, overlapped);
+}
+
+LPVOID WINAPI map_view_of_file(HANDLE mapping, DWORD access, DWORD high, DWORD low, SIZE_T length) {
+    if (partial_handle(mapping)) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+    return ::MapViewOfFile(mapping, access, high, low, length);
+}
+
+LPVOID WINAPI map_view_of_file_ex(HANDLE mapping, DWORD access, DWORD high, DWORD low, SIZE_T length,
+                                 LPVOID address) {
+    if (partial_handle(mapping)) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+    return ::MapViewOfFileEx(mapping, access, high, low, length, address);
+}
+
+// Native I/O and section creation have contracts beyond this synchronous token API. Refuse them before the
+// host sees a virtual token. Direct syscalls or other unwrapped native APIs still receive no usable kernel handle.
+constexpr NTSTATUS kPartialNotSupported = static_cast<NTSTATUS>(0xc00000bbu);
+
+NTSTATUS NTAPI nt_read_file(HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, PVOID context,
+                           PIO_STATUS_BLOCK status, PVOID buffer, ULONG length, PLARGE_INTEGER offset,
+                           PULONG key) {
+    if (partial_handle(file)) {
+        if (status) {
+            status->Status = kPartialNotSupported;
+            status->Information = 0;
+        }
+        return kPartialNotSupported;
+    }
+    using Fn = decltype(&nt_read_file);
+    static const auto host = reinterpret_cast<Fn>(::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtReadFile"));
+    return host ? host(file, event, apc, context, status, buffer, length, offset, key) : kPartialNotSupported;
+}
+
+NTSTATUS NTAPI nt_create_section(PHANDLE section, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes,
+                                PLARGE_INTEGER maximum, ULONG protection, ULONG allocation, HANDLE file) {
+    if (partial_handle(file)) return kPartialNotSupported;
+    using Fn = decltype(&nt_create_section);
+    static const auto host = reinterpret_cast<Fn>(
+        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtCreateSection"));
+    return host ? host(section, access, attributes, maximum, protection, allocation, file) : kPartialNotSupported;
+}
+
+// gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the
+// path the title passed, the Win32 error, the caller as module+RVA), so a boot that stops on a missing or refused
+// file names it. Failures only, and at most 256 of them, so a title probing many optional files can't fill the file.
+void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* caller) {
+    if (!rt::startup_trace::enabled()) return;
+    static std::atomic<int> left{256};
+    if (left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+    std::string utf8;
+    if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
+        utf8.resize(static_cast<size_t>(n) - 1);
+        WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
+    }
+    rt::startup_trace::event(
+        "file_open_failed",
+        std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) +
+            ",\"error\":" + std::to_string(error) + ",\"caller\":" +
+            rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
@@ -748,7 +1109,10 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    const HANDLE h = ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    const HANDLE h = t.partial ? create_partial_handle(t.partial, access, share, disposition, flags, attributes,
+                                                       template_file)
+                               : ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags,
+                                               template_file);
     if (h == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
         note_open_failure("CreateFileW", name, error, _ReturnAddress());
@@ -779,7 +1143,15 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    const HANDLE h = ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+    if (t.partial && params && params->dwSize != sizeof(CREATEFILE2_EXTENDED_PARAMETERS)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    const HANDLE h = t.partial ? create_partial_handle(t.partial, access, share, disposition,
+                                                       params ? params->dwFileFlags : 0,
+                                                       params ? params->lpSecurityAttributes : nullptr,
+                                                       params ? params->hTemplateFile : nullptr)
+                               : ::CreateFile2(t.path.c_str(), access, share, disposition, params);
     if (h == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
         note_open_failure("CreateFile2", name, error, _ReturnAddress());
@@ -788,7 +1160,32 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
     return h;
 }
 
-DWORD WINAPI get_file_attributes_w(LPCWSTR name) {
+// Attribute probes often precede an open. Trace their failures separately, with the caller of the actual A/W
+// entry point; delegating A to W would attribute the probe to the shim instead of the mapped image.
+void note_attribute_failure(const char* api, LPCWSTR name, DWORD error, const void* caller) noexcept {
+    if (!rt::startup_trace::enabled()) return;
+    static std::atomic<int> left{256};
+    if (left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+    const DWORD saved = GetLastError();
+    try {
+        std::string utf8;
+        if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
+            utf8.resize(static_cast<size_t>(n));
+            WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
+            utf8.resize(static_cast<size_t>(n) - 1);
+        }
+        rt::startup_trace::event(
+            "file_attributes_failed",
+            std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) +
+                ",\"error\":" + std::to_string(error) + ",\"caller\":" +
+                rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
+    } catch (...) {
+        // A diagnostic allocation/formatting failure must not change a file API's result or error.
+    }
+    SetLastError(saved);
+}
+
+DWORD file_attributes(LPCWSTR name, const char* api, const void* caller) {
     if (!name) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_FILE_ATTRIBUTES;
@@ -796,9 +1193,20 @@ DWORD WINAPI get_file_attributes_w(LPCWSTR name) {
     const Target t = read_target(name);
     if (t.error) {
         SetLastError(t.error);
+        note_attribute_failure(api, name, t.error, caller);
         return INVALID_FILE_ATTRIBUTES;
     }
-    return ::GetFileAttributesW(t.path.c_str());
+    if (t.partial) return FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE;
+    const DWORD attributes = ::GetFileAttributesW(t.path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const DWORD error = GetLastError();
+        note_attribute_failure(api, name, error, caller);
+    }
+    return attributes;
+}
+
+DWORD WINAPI get_file_attributes_w(LPCWSTR name) {
+    return file_attributes(name, "GetFileAttributesW", _ReturnAddress());
 }
 
 DWORD WINAPI get_file_attributes_a(LPCSTR name) {
@@ -807,10 +1215,10 @@ DWORD WINAPI get_file_attributes_a(LPCSTR name) {
         return INVALID_FILE_ATTRIBUTES;
     }
     const std::wstring wide = widen_ansi(name);
-    return get_file_attributes_w(wide.c_str());
+    return file_attributes(wide.c_str(), "GetFileAttributesA", _ReturnAddress());
 }
 
-BOOL WINAPI get_file_attributes_ex_w(LPCWSTR name, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
+BOOL file_attributes_ex(LPCWSTR name, GET_FILEEX_INFO_LEVELS level, LPVOID info, const char* api, const void* caller) {
     if (!name || !info) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -818,9 +1226,29 @@ BOOL WINAPI get_file_attributes_ex_w(LPCWSTR name, GET_FILEEX_INFO_LEVELS level,
     const Target t = read_target(name);
     if (t.error) {
         SetLastError(t.error);
+        note_attribute_failure(api, name, t.error, caller);
         return FALSE;
     }
-    return ::GetFileAttributesExW(t.path.c_str(), level, info);
+    if (t.partial) {
+        if (level != GetFileExInfoStandard) return fail_bool(ERROR_INVALID_PARAMETER);
+        auto& data = *static_cast<WIN32_FILE_ATTRIBUTE_DATA*>(info);
+        data = {};
+        data.dwFileAttributes = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE;
+        const auto length = partial_package::size(t.partial);
+        data.nFileSizeHigh = static_cast<DWORD>(length >> 32);
+        data.nFileSizeLow = static_cast<DWORD>(length);
+        return TRUE;
+    }
+    const BOOL result = ::GetFileAttributesExW(t.path.c_str(), level, info);
+    if (!result) {
+        const DWORD error = GetLastError();
+        note_attribute_failure(api, name, error, caller);
+    }
+    return result;
+}
+
+BOOL WINAPI get_file_attributes_ex_w(LPCWSTR name, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
+    return file_attributes_ex(name, level, info, "GetFileAttributesExW", _ReturnAddress());
 }
 
 BOOL WINAPI get_file_attributes_ex_a(LPCSTR name, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
@@ -829,7 +1257,7 @@ BOOL WINAPI get_file_attributes_ex_a(LPCSTR name, GET_FILEEX_INFO_LEVELS level, 
         return FALSE;
     }
     const std::wstring wide = widen_ansi(name);
-    return get_file_attributes_ex_w(wide.c_str(), level, info);
+    return file_attributes_ex(wide.c_str(), level, info, "GetFileAttributesExA", _ReturnAddress());
 }
 
 HANDLE WINAPI find_first_file_w(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
@@ -996,6 +1424,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
         SetLastError(ERROR_INVALID_NAME);
         return FALSE;
     }
+    if (partial_target(r, parts)) return fail_bool(ERROR_ACCESS_DENIED);
 
     bool removed = false;
     std::error_code ec;
@@ -1152,6 +1581,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
+    if (partial_target(r, src) || partial_target(r, dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
     if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     const std::filesystem::path overlay_from = disk_path(r.overlay, src), overlay_to = disk_path(r.overlay, dst);
@@ -1242,6 +1672,10 @@ bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& ou
     const Roots r = roots();
     error = ERROR_PATH_NOT_FOUND;
     if (r.game.empty() || r.overlay.empty()) return false;
+    if (partial_target(r, parts)) {
+        error = ERROR_ACCESS_DENIED;
+        return false;
+    }
     const View v = view(r, parts);
     error = ERROR_ACCESS_DENIED;
     if (v.kind == Kind::Directory) return false;
@@ -1270,6 +1704,10 @@ bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::
     const Target t = read_target(from);
     if (t.error) {
         error = t.error;
+        return false;
+    }
+    if (t.partial) {
+        error = ERROR_ACCESS_DENIED;
         return false;
     }
     source = t.path;
@@ -1436,11 +1874,33 @@ using namespace rt::fs;
 // CreateFile, the FindFirstFile family, the attribute queries and DeleteFile arrive through kernel32/kernelbase
 // imports and through the api sets a GDK title is linked against (file-l1-1-0 for the find and attribute calls,
 // file-l1-2-0 and file-l2-1-0 for CreateFile).
+#define FILE_HANDLE_API(dll)                                                                          \
+    {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
+        {dll, "ReadFileEx", reinterpret_cast<void*>(&read_file_ex)},                                 \
+        {dll, "ReadFileScatter", reinterpret_cast<void*>(&read_file_scatter)},                       \
+        {dll, "SetFilePointer", reinterpret_cast<void*>(&set_file_pointer)},                         \
+        {dll, "SetFilePointerEx", reinterpret_cast<void*>(&set_file_pointer_ex)},                    \
+        {dll, "GetFileSize", reinterpret_cast<void*>(&get_file_size)},                               \
+        {dll, "GetFileSizeEx", reinterpret_cast<void*>(&get_file_size_ex)},                           \
+        {dll, "GetFileType", reinterpret_cast<void*>(&get_file_type)},                               \
+        {dll, "WriteFile", reinterpret_cast<void*>(&write_file)},                                    \
+        {dll, "WriteFileEx", reinterpret_cast<void*>(&write_file_ex)},                               \
+        {dll, "SetEndOfFile", reinterpret_cast<void*>(&set_end_of_file)},                             \
+        {dll, "FlushFileBuffers", reinterpret_cast<void*>(&flush_file_buffers)},                     \
+        {dll, "ReOpenFile", reinterpret_cast<void*>(&reopen_file)},                                  \
+        {dll, "CloseHandle", reinterpret_cast<void*>(&close_handle)},                                \
+        {dll, "DuplicateHandle", reinterpret_cast<void*>(&duplicate_handle)}
+
+#define FILE_MAPPING_API(dll)                                                                         \
+    {dll, "CreateFileMappingW", reinterpret_cast<void*>(&create_file_mapping_w)},                    \
+        {dll, "CreateFileMappingA", reinterpret_cast<void*>(&create_file_mapping_a)},                 \
+        {dll, "MapViewOfFile", reinterpret_cast<void*>(&map_view_of_file)},                           \
+        {dll, "MapViewOfFileEx", reinterpret_cast<void*>(&map_view_of_file_ex)}
+
 #define FILE_API(dll)                                                                                    \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
         {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \
-        {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
         {dll, "FindFirstFileA", reinterpret_cast<void*>(&find_first_file_a)},                            \
         {dll, "FindFirstFileW", reinterpret_cast<void*>(&find_first_file_w)},                            \
         {dll, "FindFirstFileExA", reinterpret_cast<void*>(&find_first_file_ex_a)},                       \
@@ -1475,8 +1935,23 @@ using namespace rt::fs;
 
 SHIM_TABLE(file_system,
     FILE_API("kernel32.dll"),
+    FILE_HANDLE_API("kernel32.dll"),
+    FILE_MAPPING_API("kernel32.dll"),
     FILE_API("kernelbase.dll"),
+    FILE_HANDLE_API("kernelbase.dll"),
+    FILE_MAPPING_API("kernelbase.dll"),
     FILE_API("api-ms-win-core-file-l1-1-0.dll"),
+    FILE_HANDLE_API("api-ms-win-core-file-l1-1-0.dll"),
     FILE_API("api-ms-win-core-file-l1-2-0.dll"),
+    FILE_HANDLE_API("api-ms-win-core-file-l1-2-0.dll"),
+    FILE_HANDLE_API("api-ms-win-core-file-l1-2-1.dll"),
     FILE_API("api-ms-win-core-file-l2-1-0.dll"),
+    FILE_HANDLE_API("api-ms-win-core-file-l2-1-0.dll"),
+    FILE_HANDLE_API("api-ms-win-core-handle-l1-1-0.dll"),
+    FILE_MAPPING_API("api-ms-win-core-memory-l1-1-0.dll"),
+    FILE_MAPPING_API("api-ms-win-core-memory-l1-1-1.dll"),
+    {"ntdll.dll", "NtReadFile", reinterpret_cast<void*>(&nt_read_file)},
+    {"ntdll.dll", "ZwReadFile", reinterpret_cast<void*>(&nt_read_file)},
+    {"ntdll.dll", "NtCreateSection", reinterpret_cast<void*>(&nt_create_section)},
+    {"ntdll.dll", "ZwCreateSection", reinterpret_cast<void*>(&nt_create_section)},
 );

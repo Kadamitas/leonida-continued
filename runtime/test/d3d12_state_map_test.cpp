@@ -585,8 +585,10 @@ int main() {
         };
 
         static std::vector<VkDeviceSize> offsets;
+        static bool single_record_calls = true;
         ReplayFunctions vk{};
-        vk.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t, std::uint32_t) {
+        vk.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t count, std::uint32_t) {
+            single_record_calls &= count == 1;
             offsets.push_back(offset);
         };
         vk.draw_indexed_indirect = vk.draw_indirect;
@@ -601,14 +603,26 @@ int main() {
         };
 
         CommandList list;
-        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0}));
-        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 8, 0, 0}));
-        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 12, 2, 4}));
-        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 16, 2, 8}));
+        const auto raw = [](ExecuteIndirect command) { command.raw_draw = true; return command; };
+        CHECK(list.execute_indirect(raw({IndirectKind::draw, 16, 2, 1, 4, 0, 0})));
+        CHECK(list.execute_indirect(raw({IndirectKind::draw_indexed, 20, 2, 1, 8, 0, 0})));
+        CHECK(list.execute_indirect(raw({IndirectKind::draw, 16, 2, 1, 12, 2, 4})));
+        CHECK(list.execute_indirect(raw({IndirectKind::draw_indexed, 20, 2, 1, 16, 2, 8})));
         CHECK(list.execute_indirect({IndirectKind::dispatch, 20, 2, 1, 20, 0, 0}));
         CHECK(list.close());
         CHECK(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success);
-        const std::vector<VkDeviceSize> expected{260, 264, 268, 516, 272, 520, 276, 296};
+        const std::vector<VkDeviceSize> expected{260, 276, 264, 284, 268, 516, 272, 520, 276, 296};
+        CHECK(offsets == expected);
+        CHECK(single_record_calls);
+
+        // A production command cannot inherit this fixture's external render state. Feature-off and counted
+        // draws fail before any raw Vulkan callback; explicit test-only opt-in above is required.
+        CommandList stateless, counted;
+        CHECK(stateless.execute_indirect({IndirectKind::draw, 16, 1, 1, 0, 0, 0}) && stateless.close());
+        CHECK(replay(stateless, VK_NULL_HANDLE, resolve, vk) == ReplayResult::unsupported);
+        vk.indirect_first_instance = true;
+        CHECK(counted.execute_indirect({IndirectKind::draw, 16, 1, 1, 0, 2, 0}) && counted.close());
+        CHECK(replay(counted, VK_NULL_HANDLE, resolve, vk) == ReplayResult::unsupported);
         CHECK(offsets == expected);
 
         // Reject invalid spans before invoking Vulkan, including after adding the backing-buffer base.
@@ -627,6 +641,57 @@ int main() {
         CHECK(rejected({IndirectKind::dispatch, 12, 1, 1, 0, 0, 0}));
         CHECK(offsets == expected);
     }
+
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    // A logical A8 copy crosses R8/native-alpha storage through retained transfer scratch, never vkCmdCopyImage.
+    // Check mip/layer byte ranges plus allocation/overflow failures without a Vulkan driver.
+    {
+        ResourceBinding red{}, alpha{};
+        red.image = reinterpret_cast<VkImage>(std::uintptr_t{1});
+        red.format = VK_FORMAT_R8_UNORM;
+        red.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        red.width = 8; red.height = 4; red.depth = 1; red.array_layers = 2; red.mip_levels = 2; red.samples = 1;
+        alpha = red;
+        alpha.image = reinterpret_cast<VkImage>(std::uintptr_t{2});
+        alpha.format = VK_FORMAT_A8_UNORM_KHR;
+        const auto resolve = [&](ResourceId id) -> const ResourceBinding* { return id == 1 ? &red : &alpha; };
+        ReplayFunctions vk{};
+        vk.copy_buffer = [](VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t, const VkBufferCopy*) {};
+        vk.copy_image = [](VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
+                           std::uint32_t, const VkImageCopy*) {};
+        vk.copy_image_to_buffer = [](VkCommandBuffer, VkImage, VkImageLayout, VkBuffer,
+                                     std::uint32_t, const VkBufferImageCopy*) {};
+        vk.copy_buffer_to_image = [](VkCommandBuffer, VkBuffer, VkImage, VkImageLayout,
+                                     std::uint32_t, const VkBufferImageCopy*) {};
+        unsigned allocations = 0;
+        VkDeviceSize requested = 0, base = 16;
+        vk.copy_scratch = [&](VkDeviceSize bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+            ++allocations; requested = bytes; offset = base;
+            buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{3});
+            return true;
+        };
+        CommandList list;
+        CHECK(list.copy_resource({2, 1}) && list.close());
+        PreparedList prepared;
+        CHECK(prepare(list, resolve, vk, prepared) == ReplayResult::success);
+        CHECK(allocations == 1 && requested == 80);
+        const auto& copy = prepared.commands[0];
+        CHECK(copy.image_copies.empty() && copy.staged_reads.size() == 2 && copy.staged_writes.size() == 2);
+        CHECK(copy.staged_reads[0].bufferOffset == 16 && copy.staged_reads[1].bufferOffset == 80);
+        CHECK(copy.staged_reads[0].imageSubresource.layerCount == 2);
+        CHECK(copy.staged_writes[1].imageSubresource.mipLevel == 1);
+        base = UINT64_MAX - 15;
+        CHECK(prepare(list, resolve, vk, prepared) == ReplayResult::invalid_copy);
+        const auto before_overflow = allocations;
+        red.width = alpha.width = UINT32_MAX;
+        red.height = alpha.height = UINT32_MAX;
+        CHECK(prepare(list, resolve, vk, prepared) == ReplayResult::invalid_copy);
+        CHECK(allocations == before_overflow);
+        red.width = alpha.width = 8; red.height = alpha.height = 4;
+        vk.copy_scratch = [](VkDeviceSize, VkBuffer&, VkDeviceSize&) { return false; };
+        CHECK(prepare(list, resolve, vk, prepared) == ReplayResult::unsupported);
+    }
+#endif
 
     // Resizable BAR detection (D3D-96) on the heap layouts real cards report.
     {

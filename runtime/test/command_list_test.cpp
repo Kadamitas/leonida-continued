@@ -9,7 +9,55 @@
     }                                                            \
 } while (0)
 
+int check_hooked_descriptor_heaps() {
+    using namespace leonida;
+    using HeapBytes = std::array<std::uint8_t, 64>;
+    HeapBytes title_a{}, arena_a{}, title_b{}, arena_b{};
+    title_a[0] = 7; // prefilled before the heap is handed to the device
+    DescriptorHeapMirror a{title_a.data(), arena_a.data(), title_a.size()};
+    DescriptorHeapMirror b{title_b.data(), arena_b.data(), title_b.size()};
+    CommandList draw;
+    CHECK(draw.use_descriptor_heap(&a));
+    CHECK(draw.use_descriptor_heap(nullptr));
+    CHECK(draw.use_descriptor_heap(&b));  // rebound: earlier draws can still read a
+    CHECK(draw.use_descriptor_heap(&a));
+    CHECK(draw.descriptor_heaps().size() == 2);
+    CHECK(draw.close());
+    CHECK(!draw.use_descriptor_heap(&a));
+    CommandList held = draw;
+    CHECK(draw.reset());
+    CHECK(draw.descriptor_heaps().empty());
+    CHECK(draw.use_descriptor_heap(&b));
+    CHECK(draw.close());
+    std::array<const CommandList*, 2> lists{&held, &draw};
+    std::vector<const DescriptorHeapMirror*> bound;
+    int waits = 0;
+    auto retire = [&] { ++waits; return true; };
+    CHECK(refresh_descriptor_heaps(lists, bound, retire));
+    CHECK(waits == 1 && bound.size() == 2 && arena_a == title_a && arena_b == title_b);
+    CHECK(refresh_descriptor_heaps(lists, bound, retire));
+    CHECK(waits == 1);
+
+    // A title CPU copy into one slot after Close must reach the next execution.
+    std::fill_n(title_b.data() + 32, 32, std::uint8_t{0x35});
+    std::copy_n(title_b.data() + 32, 32, title_a.data());
+    CHECK(!refresh_descriptor_heaps(lists, bound, [] { return false; }));
+    CHECK(arena_a[0] == 7 && arena_b[32] == 0);
+    CHECK(refresh_descriptor_heaps(lists, bound, retire));
+    CHECK(waits == 2 && arena_a == title_a && arena_b == title_b);
+
+    // Restore the original slot followed by an execution of a list binding only b.
+    std::fill_n(title_a.data(), 32, std::uint8_t{});
+    title_a[0] = 7;
+    CHECK(refresh_descriptor_heaps(std::span(lists).last(1), bound, retire));
+    CHECK(waits == 2 && arena_a[0] == 0x35);
+    CHECK(refresh_descriptor_heaps(lists, bound, retire));
+    CHECK(waits == 3 && arena_a == title_a);
+    return 0;
+}
+
 int main() {
+    CHECK(check_hooked_descriptor_heaps() == 0);
     using namespace leonida;
     namespace s = d3d12_state;
     CommandList list;

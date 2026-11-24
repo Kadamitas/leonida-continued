@@ -11,6 +11,7 @@
 #endif
 #include "binary_occlusion_spirv.h"
 #include "buffer_va_index.h"
+#include "image_view_cache.h"
 #include "occlusion_sum_spirv.h"
 #include "queue_holds.h"
 #include "retire_tickets.h"
@@ -19,6 +20,7 @@
 #include "vulkan_depth24.h"
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_scratch.h"
+#include "vulkan_title_image_pool.h"
 #include "vulkan_replay.h"
 #include "queue_families.h"
 #include "resource_tiling.h"
@@ -26,11 +28,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include "frame_profile.h"
+#include "host_shadow_profile.h"
+#include "host_image_index.h"
 #include <functional>
 #include <map>
 #include <memory>
@@ -107,6 +114,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
+    X(vkCmdDrawMeshTasksIndirectEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
@@ -434,6 +442,8 @@ public:
         bindless_slot,
         image_view,
         image,
+        pooled_title_image,
+        pooled_staging_buffer,
         sparse_resource,
         buffer,
         device_memory,
@@ -512,6 +522,12 @@ public:
             case Kind::image:
                 vk.vkDestroyImage(device, reinterpret_cast<VkImage>(item.handle), nullptr);
                 break;
+            case Kind::pooled_title_image:
+                delete reinterpret_cast<PooledTitleImage*>(item.handle);
+                break;
+            case Kind::pooled_staging_buffer:
+                delete reinterpret_cast<PooledStagingBuffer*>(item.handle);
+                break;
             case Kind::sparse_resource:
                 // Releases the resource and its page backing together after outstanding submissions.
                 delete reinterpret_cast<std::shared_ptr<SparseResource>*>(item.handle);
@@ -553,6 +569,12 @@ private:
 // Centralized single-thread fence dispatcher using Vulkan 1.2 vkWaitSemaphores(VK_SEMAPHORE_WAIT_ANY_BIT).
 // Eliminates per-fence OS threads and 10ms polling: a synthetic timeline semaphore (wakeup_sem_) at index 0
 // wakes vkWaitSemaphores immediately whenever a new wait, a released fence, or shutdown arrives while waiting_ == true.
+inline void publish_fence_completion(std::atomic<std::uint64_t>& value, std::uint64_t completed) noexcept {
+    auto previous = value.load(std::memory_order_relaxed);
+    while (previous < completed &&
+           !value.compare_exchange_weak(previous, completed, std::memory_order_release, std::memory_order_relaxed)) {}
+}
+
 class FenceWaitDispatcher {
 public:
     struct Entry {
@@ -646,6 +668,58 @@ public:
         cv_.notify_one();
     }
 
+    // The caller keeps the cell and semaphore alive until cancel() returns. The worker publishes only native
+    // counter observations; a queue's promised signal value must never be stored into this CPU-readable mirror.
+    bool watch_completion(VkSemaphore sem, std::atomic<std::uint64_t>& value) {
+        if (!sem || !wakeup_sem_ || !vk_.vkGetSemaphoreCounterValue || !vk_.vkWaitSemaphores) return false;
+        {
+            std::lock_guard lock(mutex_);
+            if (stop_) return false;
+            if (device_lost_.load(std::memory_order_acquire)) {
+                publish_fence_completion(value, UINT64_MAX);
+                return true;
+            }
+            for (const auto& watch : watchers_)
+                if (watch.semaphore == sem) return watch.value == &value;
+            std::uint64_t completed = 0;
+            const VkResult queried = vk_.vkGetSemaphoreCounterValue(device_, sem, &completed);
+            if (queried == VK_ERROR_DEVICE_LOST) {
+                device_lost_.store(true, std::memory_order_release);
+                publish_fence_completion(value, UINT64_MAX);
+                publish_lost_watchers_locked();
+                signal_wakeup_locked();
+                cv_.notify_all();
+                return true;
+            }
+            if (queried != VK_SUCCESS) return false;
+            if (completed == UINT64_MAX) {
+                publish_fence_completion(value, completed);
+                return true;  // no larger native timeline value can be awaited
+            }
+            try {
+                // Reserve before storing the caller's pointer or starting the worker. A failed registration
+                // cannot leave a watcher behind, including when the OS cannot create the dispatch thread.
+                semaphores_.reserve(1 + pending_.size() + watchers_.size() + 1);
+                values_.reserve(1 + pending_.size() + watchers_.size() + 1);
+                watchers_.push_back({sem, &value, completed});
+                try {
+                    if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
+                } catch (...) {
+                    watchers_.pop_back();
+                    return false;
+                }
+            } catch (const std::bad_alloc&) {
+                return false;
+            } catch (const std::length_error&) {
+                return false;
+            }
+            publish_fence_completion(value, completed);
+            signal_wakeup_locked();
+        }
+        cv_.notify_one();
+        return true;
+    }
+
     // Wakes run() when another path marks the device lost so pending waits complete and stop()/cancel() never hang.
     void notify_device_lost() {
         {
@@ -665,6 +739,9 @@ public:
         {
             std::unique_lock lock(mutex_);
             fn = signal_event_;
+            // No mirror pointer can be queried or published after this erasure. The wait snapshot may still
+            // name its semaphore; the existing epoch join below retires that snapshot before destruction.
+            std::erase_if(watchers_, [sem](const auto& watch) { return watch.semaphore == sem; });
             std::size_t write = 0;
             for (std::size_t i = 0; i < pending_.size(); ++i) {
                 if (pending_[i].semaphore == sem) {
@@ -697,6 +774,7 @@ public:
             std::lock_guard lock(mutex_);
             if (stop_) return;
             stop_ = true;
+            watchers_.clear();
             signal_wakeup_locked();
         }
         cv_.notify_all();
@@ -704,6 +782,17 @@ public:
     }
 
 private:
+    struct CompletionWatch {
+        VkSemaphore semaphore;
+        std::atomic<std::uint64_t>* value;
+        std::uint64_t observed;
+    };
+
+    void publish_lost_watchers_locked() {
+        for (const auto& watch : watchers_) publish_fence_completion(*watch.value, UINT64_MAX);
+        watchers_.clear();
+    }
+
     static void dispatch_entries(std::vector<Entry>& entries, SignalEventFn signal_event) {
         for (Entry& e : entries) {
             if (e.callback) e.callback();
@@ -783,8 +872,11 @@ private:
     void run() {
         std::unique_lock lock(mutex_);
         while (true) {
-            cv_.wait(lock, [this] { return stop_ || !pending_.empty() || device_lost_.load(std::memory_order_acquire); });
+            cv_.wait(lock, [this] {
+                return stop_ || !pending_.empty() || !watchers_.empty() || device_lost_.load(std::memory_order_acquire);
+            });
             if (device_lost_.load(std::memory_order_acquire)) {
+                publish_lost_watchers_locked();
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
                 dispatch_outside_lock(lock, drained, signal_event_);
@@ -800,15 +892,24 @@ private:
                 semaphores_.push_back(e.semaphore);
                 values_.push_back(e.value);
             }
+            for (const auto& watch : watchers_) {
+                semaphores_.push_back(watch.semaphore);
+                values_.push_back(watch.observed + 1);
+            }
+
+            // The native wait must keep a private immutable snapshot. Registration may reserve the staging
+            // vectors while this mutex is unlocked, but cannot invalidate these local vectors' Vulkan pointers.
+            auto wait_semaphores = std::move(semaphores_);
+            auto wait_values = std::move(values_);
 
             waiting_ = true;
             lock.unlock();
 
             VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
             wi.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
-            wi.semaphoreCount = static_cast<std::uint32_t>(semaphores_.size());
-            wi.pSemaphores = semaphores_.data();
-            wi.pValues = values_.data();
+            wi.semaphoreCount = static_cast<std::uint32_t>(wait_semaphores.size());
+            wi.pSemaphores = wait_semaphores.data();
+            wi.pValues = wait_values.data();
             // A bounded slice, not UINT64_MAX. Under GPU paravirtualization (measured in Windows Sandbox on an
             // RTX 5060 Ti) this wait is a kernel wait the OS cannot interrupt: a process that exits while a wait
             // is pending (d3d12_queue_wait_timeout's _Exit, or quitting with a fence outstanding) never finishes
@@ -818,17 +919,51 @@ private:
 
             lock.lock();
             waiting_ = false;
+            if (semaphores_.capacity() < wait_semaphores.capacity()) semaphores_.swap(wait_semaphores);
+            if (values_.capacity() < wait_values.capacity()) values_.swap(wait_values);
             ++epoch_;
             epoch_cv_.notify_all();
 
             if (res == VK_ERROR_DEVICE_LOST || device_lost_.load(std::memory_order_acquire)) {
                 device_lost_.store(true, std::memory_order_release);
+                publish_lost_watchers_locked();
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
                 dispatch_outside_lock(lock, drained, signal_event_);
                 return;
             }
             if (stop_) return;
+
+            bool watch_lost = false;
+            std::size_t watch_write = 0;
+            for (std::size_t i = 0; i < watchers_.size(); ++i) {
+                auto watch = watchers_[i];
+                std::uint64_t completed = 0;
+                const VkResult queried = vk_.vkGetSemaphoreCounterValue(device_, watch.semaphore, &completed);
+                if (queried == VK_ERROR_DEVICE_LOST) { watch_lost = true; break; }
+                if (queried != VK_SUCCESS) {
+                    // Keep the last proven value on a non-device-loss error. Do not leave a permanently ready
+                    // stale threshold spinning the worker or publish an invented terminal completion value.
+                    static std::atomic<unsigned> failures{0};
+                    if (failures.fetch_add(1, std::memory_order_relaxed) < 8)
+                        std::fprintf(stderr, "[rt] fence: completion mirror stopped after native counter query %d\n",
+                                     int(queried));
+                    continue;
+                }
+                publish_fence_completion(*watch.value, completed);
+                if (completed == UINT64_MAX) continue;
+                watch.observed = completed;
+                watchers_[watch_write++] = watch;
+            }
+            if (watch_lost) {
+                device_lost_.store(true, std::memory_order_release);
+                publish_lost_watchers_locked();
+                std::vector<Entry> drained = std::move(pending_);
+                pending_.clear();
+                dispatch_outside_lock(lock, drained, signal_event_);
+                return;
+            }
+            watchers_.resize(watch_write);
 
             std::vector<Entry> ready;
             bool lost = false;
@@ -853,6 +988,7 @@ private:
                 for (Entry& e : pending_) ready.push_back(std::move(e));
                 pending_.clear();
                 device_lost_.store(true, std::memory_order_release);
+                publish_lost_watchers_locked();
                 dispatch_outside_lock(lock, ready, signal_event_);
                 return;
             }
@@ -867,6 +1003,7 @@ private:
     VkDevice device_;
     const VulkanDeviceFunctions& vk_;
     std::atomic<bool>& device_lost_;
+    std::vector<CompletionWatch> watchers_;  // cells are accessed only while mutex_ is held
     SignalEventFn signal_event_ = nullptr;
     VkSemaphore wakeup_sem_ = VK_NULL_HANDLE;
     std::uint64_t wakeup_val_ = 0;
@@ -996,6 +1133,7 @@ public:
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
         replay_.draw = vk.vkCmdDraw;
         replay_.draw_mesh_tasks = vk.vkCmdDrawMeshTasksEXT;  // null unless VK_EXT_mesh_shader is enabled
+        replay_.draw_mesh_tasks_indirect = vk.vkCmdDrawMeshTasksIndirectEXT;
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
             const auto it = graphics_pipelines_.find(id);
@@ -1111,13 +1249,15 @@ public:
         for (const auto& [key, framebuffer] : resolve_framebuffers_)
             vk.vkDestroyFramebuffer(device_, framebuffer, nullptr);
         for (const auto& [key, pass] : resolve_passes_) vk.vkDestroyRenderPass(device_, pass, nullptr);
-        for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
+        views_.for_each([&](VkImageView view) { vk.vkDestroyImageView(device_, view, nullptr); });
     }
 
     VulkanContext(const VulkanContext&) = delete;
     VulkanContext& operator=(const VulkanContext&) = delete;
 
     bool loaded() const { return loaded_; }
+    // Call before any submission; the feature must actually be enabled on the logical device.
+    void set_indirect_first_instance(bool enabled) { replay_.indirect_first_instance = enabled; }
     void configure_predication(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties& memory,
                                VkDeviceSize max_range, std::uint32_t family) {
         std::unique_lock lock(resource_mutex_);
@@ -1199,7 +1339,10 @@ public:
         }
     }
 
-    void remove_resource(ResourceId id) {
+    // External-host imports detach before waiting: a concurrent unrelated execution must not capture another
+    // global host-image barrier after the retirement snapshot. The tracker lock joins CPU-side submit/ticket
+    // publication by executions which already captured the binding, then views can be destroyed after the wait.
+    void remove_resource(ResourceId id, bool immediate_views = false) {
         VkImage img = VK_NULL_HANDLE;
         std::shared_ptr<SparseResource> sparse_resource;
         {
@@ -1208,7 +1351,10 @@ public:
             if (it == resources_.end()) return;
             img = it->second.image;
             unindex_buffer(id, it->second);
+            if (it->second.host_readonly_image || it->second.mutable_host_shadow)
+                host_images_.erase(it->second.host_image_address, &*it);
             resources_.erase(it);
+            replay_.has_host_readonly_images = !host_images_.empty();
             if (auto sparse = sparse_resources_.find(id); sparse != sparse_resources_.end()) {
                 sparse_resource = std::move(sparse->second);
                 sparse_resources_.erase(sparse);
@@ -1218,24 +1364,25 @@ public:
             std::lock_guard lock(storage_mutex_);  // a buffer destroyed before any submission is not filled
             std::erase_if(zero_pending_, [id](const PendingZero& zero) { return zero.id == id; });
         }
+        if (immediate_views) {
+            { std::lock_guard tlock(tracker_mutex_); tracker_.forget(id); }
+            wait_retire_ticket(submitted_retire_ticket());
+        }
         if (img) {
             std::lock_guard vlock(views_mutex_);
             for (auto f = resolve_framebuffers_.begin(); f != resolve_framebuffers_.end();) {
                 if (std::get<0>(f->first) == img || std::get<1>(f->first) == img) {
-                    defer_destroy(DeferredDeletionQueue::Kind::framebuffer, f->second);
+                    if (immediate_views) vk.vkDestroyFramebuffer(device_, f->second, nullptr);
+                    else defer_destroy(DeferredDeletionQueue::Kind::framebuffer, f->second);
                     f = resolve_framebuffers_.erase(f);
                 } else {
                     ++f;
                 }
             }
-            for (auto v = views_.begin(); v != views_.end();) {
-                if (std::get<0>(v->first) == img) {
-                    defer_destroy(DeferredDeletionQueue::Kind::image_view, v->second);
-                    v = views_.erase(v);
-                } else {
-                    ++v;
-                }
-            }
+            views_.erase_image(img, [&](VkImageView view) {
+                if (immediate_views) vk.vkDestroyImageView(device_, view, nullptr);
+                else defer_destroy(DeferredDeletionQueue::Kind::image_view, view);
+            });
         }
         if (sparse_resource)
             defer_destroy(DeferredDeletionQueue::Kind::sparse_resource,
@@ -1268,6 +1415,12 @@ public:
     // (timestampValidBits 0). Set by the device before any queue uses it.
     double timestamp_period() const { return timestamp_period_; }
     void set_timestamp_period(double period) { timestamp_period_ = period; }
+    // Actual VkQueueFamilyProperties, populated before queues are created. An absent family has no proved support.
+    std::uint32_t timestamp_valid_bits(std::uint32_t family) const {
+        const auto found = timestamp_valid_bits_.find(family);
+        return found == timestamp_valid_bits_.end() ? 0 : found->second;
+    }
+    void set_timestamp_valid_bits(std::uint32_t family, std::uint32_t bits) { timestamp_valid_bits_[family] = bits; }
     // True where a timestamp resolve must be ordered explicitly after the timestamps it copies (MoltenVK on Apple
     // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
     bool order_timestamp_copies() const { return order_timestamp_copies_; }
@@ -1301,6 +1454,12 @@ public:
     std::uint64_t heap_base() {
         std::shared_lock lock(resource_mutex_);
         return replay_.heap_base;
+    }
+
+    bool contains_buffer_range(std::uint64_t address, std::uint64_t bytes) {
+        std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        return buffer_vas_.find(address, hit, bytes) && hit.size - (address - hit.start) >= bytes;
     }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
@@ -1545,6 +1704,13 @@ public:
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
     std::mutex& submit_mutex() { return submit_mutex_; }
+    std::uintptr_t frame_draw_image_id(ResourceId id) {
+        std::shared_lock lock(resource_mutex_);
+        const auto* binding = resolve(id);
+        return binding ? binding->draw_activity_image : 0;
+    }
+
+    FrameDrawActivity& frame_draw_activity() { return frame_draw_activity_; }
 
     void mark_device_lost() noexcept {
         device_lost_.store(true, std::memory_order_release);
@@ -1566,6 +1732,9 @@ public:
     void enqueue_fence_callback(VkSemaphore sem, std::uint64_t value, std::function<void()> cb) {
         if (fence_dispatcher_) fence_dispatcher_->enqueue_callback(sem, value, std::move(cb));
     }
+    bool watch_fence_completion(VkSemaphore sem, std::atomic<std::uint64_t>& value) {
+        return fence_dispatcher_ && fence_dispatcher_->watch_completion(sem, value);
+    }
     void cancel_fence_waits(VkSemaphore sem) {
         if (fence_dispatcher_) fence_dispatcher_->cancel(sem);
     }
@@ -1585,22 +1754,34 @@ private:
         if (addressable(b)) buffer_vas_.erase(b.va, id);
     }
     // resources_[id] = binding, with the VA index kept in step (a re-registered ID drops its old range first).
-    void set_resource_locked(ResourceId id, const ResourceBinding& binding) {
-        auto [it, inserted] = resources_.try_emplace(id, binding);
-        if (addressable(binding)) {
-            try {
-                buffer_vas_.insert(binding.va, binding.size, id);
-            } catch (...) {
-                if (inserted) resources_.erase(it);
-                throw;
+    void set_resource_locked(ResourceId id, ResourceBinding binding) {
+        auto [it, inserted] = resources_.try_emplace(id);
+        if (binding.image && FrameDrawActivity::enabled()) {
+            binding.draw_activity_image = inserted || it->second.image != binding.image
+                ? ++next_activity_image_ : it->second.draw_activity_image;
+        }
+        const bool was_host_image = !inserted && (it->second.host_readonly_image || it->second.mutable_host_shadow);
+        const bool host_image = binding.host_readonly_image || binding.mutable_host_shadow;
+        const bool changed_key = it->second.host_image_address != binding.host_image_address;
+        bool appended = false;
+        try {
+            if (host_image && (!was_host_image || changed_key)) {
+                host_images_.insert(binding.host_image_address, &*it);
+                appended = true;
             }
+            if (addressable(binding)) buffer_vas_.insert(binding.va, binding.size, id);
+        } catch (...) {
+            if (appended) host_images_.erase(binding.host_image_address, &*it);
+            if (inserted) resources_.erase(it);
+            throw;
         }
-        if (!inserted) {
-            // A same-VA insert updates its size in place; removing the old key would remove the new range.
-            if (addressable(it->second) && (!addressable(binding) || it->second.va != binding.va))
-                unindex_buffer(id, it->second);
-            it->second = binding;
-        }
+        // A same-VA insert updates its size in place; removing the old key would remove the new range.
+        if (addressable(it->second) && (!addressable(binding) || it->second.va != binding.va))
+            unindex_buffer(id, it->second);
+        if (was_host_image && (!host_image || changed_key)) host_images_.erase(it->second.host_image_address, &*it);
+        static_assert(std::is_nothrow_move_assignable_v<ResourceBinding>);
+        it->second = std::move(binding);
+        replay_.has_host_readonly_images = !host_images_.empty();
     }
 
     const ResourceBinding* resolve(ResourceId id) const {
@@ -1611,9 +1792,9 @@ private:
     // Called from prepare; protected by views_mutex_ so concurrent shared_lock readers are safe.
     VkImageView view(const ResourceBinding& r, const VkImageSubresourceRange& range) {
         std::lock_guard lock(views_mutex_);
-        const auto key = std::make_tuple(r.image, range.aspectMask, range.baseMipLevel, range.baseArrayLayer,
-                                         range.layerCount, r.format);
-        if (const auto it = views_.find(key); it != views_.end()) return it->second;
+        const ViewCache::Key key{r.image, range.aspectMask, range.baseMipLevel, range.baseArrayLayer, range.layerCount,
+                                 static_cast<std::uint32_t>(r.format)};
+        if (const VkImageView cached = views_.find(key)) return cached;
         VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         info.image = r.image;
         info.viewType = r.line ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;  // 1D images take no 2D view
@@ -1627,7 +1808,12 @@ private:
             info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;
         if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
-        views_[key] = view;
+        try {
+            views_.insert(key, view);
+        } catch (const std::bad_alloc&) {
+            vk.vkDestroyImageView(device_, view, nullptr);
+            return VK_NULL_HANDLE;
+        }
         return view;
     }
 
@@ -1702,12 +1888,17 @@ private:
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
     alignas(64) std::mutex submit_mutex_;
+    FrameDrawActivity frame_draw_activity_;
+    std::uintptr_t next_activity_image_ = 0;  // under resource_mutex_
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    // Node addresses survive unordered_map rehash; resource_mutex_ protects the index and its lifetime.
+    using HostImages = HostImageIndex<decltype(resources_)::value_type>;
+    HostImages host_images_;
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
@@ -1727,7 +1918,8 @@ private:
     VkSemaphore storage_init_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t storage_init_value_ = 0;
     std::uint64_t storage_init_version_ = 0;
-    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
+    using ViewCache = ImageViewCache<VkImage, VkImageView>;
+    ViewCache views_;
     // depth_resolve_framebuffer's caches, under views_mutex_ like views_.
     std::map<std::tuple<VkFormat, std::uint32_t, VkImageLayout, VkImageLayout, VkResolveModeFlagBits>, VkRenderPass>
         resolve_passes_;
@@ -1745,6 +1937,7 @@ private:
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
+    std::unordered_map<std::uint32_t, std::uint32_t> timestamp_valid_bits_;
     bool order_timestamp_copies_ = false;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     ReplayFunctions replay_;
@@ -1865,7 +2058,13 @@ public:
     }
 
     VulkanQueue(VulkanContext& context, VkQueue queue, std::uint32_t family, QueueKind kind = QueueKind::direct)
-        : context_(context), queue_(queue), kind_(kind), family_(family) {
+        : VulkanQueue(context, queue, family, kind, true) {}
+
+private:
+    friend class VulkanPresenter;
+    // A presenter's private uploader uses the same VkQueue and retirement machinery, with no guest waits.
+    VulkanQueue(VulkanContext& context, VkQueue queue, std::uint32_t family, QueueKind kind, bool guest_queue)
+        : context_(context), queue_(queue), kind_(kind), family_(family), guest_queue_(guest_queue) {
         auto& vk = context.vk;
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1876,7 +2075,7 @@ public:
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
         ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_) == VK_SUCCESS;
         try {
-            context_.holds().attach(this);
+            if (guest_queue_) context_.holds().attach(this);
         } catch (...) {
             // A failed registration leaves no queue to run the destructor for these Vulkan handles.
             if (progress_) vk.vkDestroySemaphore(context.device(), progress_, nullptr);
@@ -1885,11 +2084,14 @@ public:
         }
     }
 
+public:
     ~VulkanQueue() {
         auto& vk = context_.vk;
-        context_.holds().detach(this);  // no thread releases into this queue from here on
-        report_held_at_teardown();
-        context_.holds().pump_ready();  // presents queued behind what was just dropped can run
+        if (guest_queue_) {
+            context_.holds().detach(this);  // no thread releases into this queue from here on
+            report_held_at_teardown();
+            context_.holds().pump_ready();  // presents queued behind what was just dropped can run
+        }
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
@@ -1918,6 +2120,7 @@ public:
         for (auto& slot : buffers_) {
             destroy_khr_stages(slot.khr_instances);
             destroy_khr_as_queries(slot.khr_as_queries);
+            destroy_timestamp_queries(slot.timestamp_queries);
             free_events_.insert(free_events_.end(), slot.events.begin(), slot.events.end());
         }
         for (VkEvent event : free_events_) vk.vkDestroyEvent(context_.device(), event, nullptr);
@@ -1927,6 +2130,30 @@ public:
     VulkanQueue& operator=(const VulkanQueue&) = delete;
 
     bool ok() const { return ok_; }
+
+    template<typename Range, typename Apply>
+    bool alias_host_pages(std::span<const Range> ranges, std::size_t page_size, Apply apply) {
+        std::lock_guard state(state_mutex_);
+        if (!ok_ || context_.is_device_lost() || must_hold()) return false;
+        // Consume any earlier queue waits whose signals have actually been submitted. No memory is remapped
+        // behind a hold whose producer still needs to call into this queue.
+        if (!waits_.empty() && !submit(VK_NULL_HANDLE, VK_NULL_HANDLE, 0)) return false;
+        std::unique_lock resources(context_.resource_mutex_);
+        std::lock_guard tracker(context_.tracker_mutex_);
+        for (const auto& range : ranges) {
+            if (!page_size || range.page_count > (UINT64_MAX - range.destination) / page_size) return false;
+            const std::uint64_t end = range.destination + range.page_count * page_size;
+            for (const auto& [id, binding] : context_.resources_) {
+                if (binding.imported_host_size && range.destination < binding.imported_host_base + binding.imported_host_size &&
+                    binding.imported_host_base < end) return false;
+            }
+        }
+        // No new resource-using submission can enter while the physical views change. Vulkan imports must keep
+        // their original host backing intact, even when every earlier access has completed.
+        const auto ticket = context_.submitted_retire_ticket();
+        if (ticket && context_.wait_retire_ticket(ticket) < ticket) return false;
+        return apply();
+    }
 
     // Entries kept between executions. Execute only uses the first lists.size(); a larger count is retained storage,
     // not work the next submission will replay (vk_queue_test checks both halves of that contract).
@@ -2008,19 +2235,23 @@ public:
     // held instead, and the call succeeds: the batch is replayed by the thread that submits the Signal (or the CPU
     // Signal), which is also where its errors are reported (stderr, and take_held_failure()).
     //
-    // `pin`, called only when the batch is held, returns what has to stay alive until the batch has run: the COM layer
-    // passes the pipeline states and root signatures the lists named (the application may release them and Reset
-    // the lists as soon as the call returns).
+    // `pin` returns what must stay alive through GPU retirement, including an immediately submitted batch. The
+    // application may Reset/release its lists as soon as this call returns. Held batches also retain the snapshot
+    // while waiting for their submission.
     using PinFn = std::function<std::shared_ptr<void>()>;
 
     ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
         ReplayResult result = ReplayResult::success;
         bool held = false;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
+        std::vector<std::shared_ptr<void>> direct_pins;
         {
             std::lock_guard state(state_mutex_);
             if (!must_hold()) {
-                result = execute_now(lists);
+                if (pin) direct_pins.push_back(pin());
+                const auto before = submitted_;
+                result = execute_now(lists, direct_pins);
+                retire_pins(direct_pins, submitted_ > before ? submitted_ : 0);
             } else if (context_.is_device_lost()) {
                 result = ReplayResult::unsupported;
             } else {
@@ -2141,6 +2372,12 @@ private:
             entry.used = 0;
             khr_as_query_pool_.push_back(entry);
         }
+        pools.clear();
+    }
+
+    void destroy_timestamp_queries(std::vector<VkQueryPool>& pools) {
+        for (VkQueryPool pool : pools)
+            if (pool) context_.vk.vkDestroyQueryPool(context_.device(), pool, nullptr);
         pools.clear();
     }
 
@@ -2284,7 +2521,13 @@ private:
         return ReplayResult::success;
     }
 
-    ReplayResult execute_now(std::span<const CommandList* const> lists) {
+    FrameProfile submit_profile_;
+    HostShadowProfile shadow_profile_;
+    std::vector<const DescriptorHeapMirror*> bound_descriptor_heaps_;
+    std::vector<VulkanContext::HostImages::Node> selected_host_images_;
+    ReplayResult execute_now(std::span<const CommandList* const> lists, std::vector<std::shared_ptr<void>>& pins,
+                             std::span<const ResourceId> present_sources = {}) {
+        const auto profile_start = FrameProfile::now();
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
@@ -2302,6 +2545,13 @@ private:
                 queue->recycle_khr_as_queries(as_queries);
             }
         } khr_guard{this};
+        // These pools belong to this execution, not the recorded list. Before a command slot exists, no submitted
+        // work can use them; after handoff, the slot retains them until its own timeline says the GPU is finished.
+        struct TimestampGuard {
+            VulkanQueue* queue;
+            std::vector<VkQueryPool> pools;
+            ~TimestampGuard() { queue->destroy_timestamp_queries(pools); }
+        } timestamp_guard{this};
         std::function<void(bool)> bindless_commit;
         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
         // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
@@ -2327,7 +2577,7 @@ private:
                 if (active && scratch) scratch->retire(progress, 0);
             }
         } scratch_guard{context_.scratch_.get(), progress_, false};
-        const bool transfer_only = family_ == context_.transfer_only_family_;
+        const bool transfer_only = !guest_queue_ || family_ == context_.transfer_only_family_;
         if (!transfer_only) bindless_commit = context_.bindless_commit_;
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
@@ -2337,6 +2587,69 @@ private:
         // use only the first lists.size() entries, so stale entries are never prepared, queried or emitted.
         if (prepared.size() < lists.size()) prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
+        std::optional<FrameDrawTargets> frame_draws;
+        if (FrameDrawActivity::enabled()) replay.frame_draws = &frame_draws.emplace();
+        replay.execution_pins = &pins;
+        HostImageReads image_reads;
+        if (!context_.host_images_.empty()) replay.image_reads = &image_reads;
+        // prepare() holds resource_mutex_ shared. Validate the exact live coherent import and read the CPU's real
+        // word on every execution, never a recording-time snapshot. The caller admits only a generation whose
+        // satisfied floor cannot fall before the GPU reaches its HOST_WRITE acquire barrier; this does not wait.
+        replay.host_memory_acquire = [this](std::uint64_t address, std::uint64_t reference) {
+            if constexpr (!std::atomic_ref<std::uint64_t>::is_always_lock_free) {
+                return false;
+            } else {
+                if (!address || address % sizeof(std::uint64_t) ||
+                    address % std::atomic_ref<std::uint64_t>::required_alignment ||
+                    address > UINT64_MAX - sizeof(std::uint64_t)) return false;
+                BufferVaIndex<ResourceId>::Hit hit{};
+                if (!context_.buffer_vas_.find(address, hit, sizeof(std::uint64_t))) return false;
+                const ResourceBinding* binding = context_.resolve(hit.id);
+                if (!binding || binding->image || !binding->buffer || !binding->coherent_host_import ||
+                    !binding->host_readable || !binding->host || address < binding->va) return false;
+                if (binding->control_allocation_matches &&
+                    !binding->control_allocation_matches(binding->va, binding->control_allocation)) return false;
+                const std::uint64_t offset = address - binding->va;
+                if (offset > binding->size || sizeof(std::uint64_t) > binding->size - offset) return false;
+                const auto* host = binding->host + offset;
+                if (reinterpret_cast<std::uintptr_t>(host) != address) return false;
+                auto* word = reinterpret_cast<std::uint64_t*>(const_cast<std::uint8_t*>(host));
+                const auto observed = std::atomic_ref<std::uint64_t>(*word).load(std::memory_order_acquire);
+                static std::atomic<unsigned> observations{0};
+                if (observations.fetch_add(1, std::memory_order_relaxed) < 16)
+                    std::fprintf(stderr, "[rt] VulkanQueue: startup host acquire address=0x%llx reference=%llu "
+                                         "observed=%llu satisfied=%u\n",
+                        static_cast<unsigned long long>(address), static_cast<unsigned long long>(reference),
+                        static_cast<unsigned long long>(observed), unsigned(observed >= reference));
+                return observed >= reference;
+            }
+        };
+        const auto& timestamp_vk = context_.vk;
+        const double timestamp_period = context_.timestamp_period();
+        // The timestamp write itself can run on a transfer-only queue, but vkCmdResetQueryPool cannot. Keep this
+        // command-reset implementation off that family until a host-reset path is explicitly supported.
+        if (!transfer_only && context_.timestamp_valid_bits(family_) && timestamp_period > 0 &&
+            std::isfinite(timestamp_period) && timestamp_vk.vkCreateQueryPool && timestamp_vk.vkDestroyQueryPool &&
+            timestamp_vk.vkCmdResetQueryPool &&
+            timestamp_vk.vkCmdWriteTimestamp && timestamp_vk.vkCmdCopyQueryPoolResults) {
+            replay.timestamp_query = [this, &timestamp_guard]() -> VkQueryPool {
+                VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                info.queryCount = 1;
+                VkQueryPool pool = VK_NULL_HANDLE;
+                if (context_.vk.vkCreateQueryPool(context_.device(), &info, nullptr, &pool) != VK_SUCCESS)
+                    return VK_NULL_HANDLE;
+                try {
+                    timestamp_guard.pools.push_back(pool);
+                } catch (const std::bad_alloc&) {
+                    context_.vk.vkDestroyQueryPool(context_.device(), pool, nullptr);
+                    return VK_NULL_HANDLE;
+                }
+                return pool;
+            };
+        } else {
+            replay.timestamp_query = {};
+        }
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                             : 0;
@@ -2351,9 +2664,56 @@ private:
             };
         }
         std::uint64_t captures = 0;
+        bool runs_shaders = false, has_commands = false;
+        const auto explicit_import = [&](ResourceId id) {
+            if (!id) return;
+            if (const auto* image = context_.resolve(id); image && image->host_readonly_image) {
+                if (image->host_image_address) image_reads.add(image->host_image_address);
+                else { image_reads.all = true; image_reads.reasons |= HostImageReads::unnamed; }
+            }
+        };
         for (const auto* list : lists)
-            for (const auto& command : list->commands())
+            for (const auto& command : list->commands()) {
                 if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
+                runs_shaders |= std::holds_alternative<Dispatch>(command) || std::holds_alternative<Draw>(command) ||
+                                std::holds_alternative<ExecuteIndirect>(command);
+                has_commands = true;
+                if (!replay.image_reads || image_reads.all) continue;
+                // Shader keys are collected during prepare from the frozen table. Other image readers
+                // name their resources directly. Preserve the full refresh for unknown operations.
+                if (const auto [dst, src] = copy_ids(command); dst || src) {
+                    explicit_import(src);
+                    explicit_import(dst);
+                } else if (const auto* draw = std::get_if<Draw>(&command)) {
+                    if (draw->views)
+                        for (const auto& target : draw->views->render_targets) explicit_import(target.resource);
+                    explicit_import(draw->depth.resource);
+                } else if (const auto* barrier = std::get_if<TextureBarrier>(&command)) {
+                    explicit_import(barrier->resource);
+                } else if (const auto* barrier = std::get_if<TransitionBarrier>(&command)) {
+                    explicit_import(barrier->resource);
+                } else if (const auto* clear = std::get_if<ClearRenderTarget>(&command)) {
+                    explicit_import(clear->target.resource);
+                } else if (const auto* clear = std::get_if<ClearDepthStencil>(&command)) {
+                    explicit_import(clear->target.resource);
+                } else if (const auto* barrier = std::get_if<UavBarrier>(&command)) {
+                    // A global UAV visibility barrier reads no texture contents.
+                    explicit_import(barrier->resource);
+                } else {
+                    image_reads.all = !std::holds_alternative<Dispatch>(command) &&
+                        !std::holds_alternative<WriteTimestamp>(command) &&
+                        !std::holds_alternative<WriteImmediate>(command) &&
+                        !std::holds_alternative<CopyAddress>(command) &&
+                        !std::holds_alternative<HostMemoryAcquire>(command) &&
+                        !std::holds_alternative<DebugMarker>(command) &&
+                        !std::holds_alternative<GlobalBarrier>(command) &&
+                        !std::holds_alternative<BufferBarrier>(command);
+                    static_assert(std::variant_size_v<Command> <= 58);
+                    if (image_reads.all) image_reads.reasons |= std::uint64_t{1} << command.index();
+                }
+            }
+        // An empty internal submission deliberately initializes a newly imported native image.
+        if (!has_commands) { image_reads.all = true; image_reads.reasons |= HostImageReads::empty; }
         std::unique_ptr<PredicateReducer::Batch> batch;
         std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_batch;
@@ -2473,35 +2833,14 @@ private:
         // Without the compute helper a split query could not be summed: leave statistics queries whole, as before
         // (QueryReplay::plan refuses a list whose statistics query holds a mesh draw then).
         if (statistics_segments && can_resolve_occlusion) {
+            // Vulkan forbids legacy clipping counters while mesh work executes (07076). Native D3D12 counts
+            // clipped/culled mesh primitives in those fields; neither zero nor MSPrimitives is an equivalent.
+            // Refuse the complete submission before emit until those counters have a faithful implementation.
+            for (std::size_t i = 0; i < lists.size(); ++i)
+                if (std::find(prepared[i].statistics_mesh.begin(), prepared[i].statistics_mesh.end(), 1) !=
+                    prepared[i].statistics_mesh.end()) return ReplayResult::unsupported;
             if (!segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
                 return ReplayResult::unsupported;
-            for (const auto& list : prepared)
-                statistics->mesh.insert(statistics->mesh.end(), list.statistics_mesh.begin(),
-                                        list.statistics_mesh.end());
-            if (std::find(statistics->mesh.begin(), statistics->mesh.end(), 1) == statistics->mesh.end()) {
-                statistics->mesh.clear();
-            } else {
-                // The counters a mesh draw allows (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076): the
-                // fragment and compute invocations, and no other (D3D-291).
-                VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-                info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
-                info.queryCount = statistics_segments;
-                info.pipelineStatistics = kMeshStatisticsFlags;
-                if (context_.vk.vkCreateQueryPool(statistics->device, &info, nullptr, &statistics->mesh_pool) !=
-                    VK_SUCCESS)
-                    return ReplayResult::unsupported;
-                // The mesh-primitives count of a mesh segment (D3D-MESH-CLIPPING-COUNTER): a query of its own type,
-                // which the pipeline-statistics pool cannot hold. The device needs the meshShaderQueries feature,
-                // or the clipping field of a mesh segment stays 0.
-                if (context_.mesh_queries) {
-                    VkQueryPoolCreateInfo primitives{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-                    primitives.queryType = VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT;
-                    primitives.queryCount = statistics_segments;
-                    if (context_.vk.vkCreateQueryPool(statistics->device, &primitives, nullptr,
-                                                      &statistics->primitives_pool) != VK_SUCCESS)
-                        return ReplayResult::unsupported;
-                }
-            }
         }
         // QueryReplay::plan() reads QueryPool::ended / occlusion and QueryReplay::commit() writes them after
         // resource_lock is unlocked. Hold tracker_mutex_ across plan -> emit -> submit -> commit so concurrent queues
@@ -2527,8 +2866,43 @@ private:
                 return ReplayResult::unsupported;
         }
 
+        // The resource lock keeps the selected map nodes alive through both shadow passes. Allocate
+        // the bounded selection before acquiring a command slot, so a failed allocation can be retried.
+        std::span<const VulkanContext::HostImages::Node> selected;
+        try {
+            if (present_sources.empty()) {
+                selected = context_.host_images_.select(image_reads.all, image_reads.addresses, selected_host_images_);
+            } else {
+                selected_host_images_.clear();
+                for (auto id : present_sources) {
+                    const auto it = context_.resources_.find(id);
+                    if (it != context_.resources_.end() && it->second.host_readonly_image &&
+                        std::none_of(selected_host_images_.begin(), selected_host_images_.end(),
+                                     [id](const auto& node) { return node.entry->first == id; })) {
+                        selected_host_images_.push_back({it->second.host_image_address, &*it});
+                    }
+                }
+                selected = selected_host_images_;
+            }
+        } catch (const std::bad_alloc&) {
+            return ReplayResult::unsupported;
+        }
         CommandSlot* slot = acquire();
         if (!slot) return ReplayResult::unsupported;
+        slot->timestamp_queries = std::move(timestamp_guard.pools);
+        timestamp_guard.pools.clear();
+        struct TimestampSlotGuard {
+            VulkanQueue* queue;
+            CommandSlot* slot;
+            ~TimestampSlotGuard() {
+                // Successful submit() assigns a real queue ticket. On any earlier failure these queries were never
+                // submitted; reset the buffer before destroying its recorded objects and make the slot reusable.
+                if (slot->timestamp_queries.empty() || (slot->ticket && slot->ticket != UINT64_MAX)) return;
+                if (slot->ticket == UINT64_MAX &&
+                    queue->context_.vk.vkResetCommandBuffer(slot->buffer, 0) == VK_SUCCESS) slot->ticket = 0;
+                queue->destroy_timestamp_queries(slot->timestamp_queries);
+            }
+        } timestamp_slot_guard{this, slot};
         slot->khr_instances = std::move(khr_guard.stages);  // freed when this slot is reused
         khr_guard.stages.clear();
         slot->khr_as_queries = std::move(khr_guard.as_queries);
@@ -2555,6 +2929,146 @@ private:
         const auto discard = [&] {
             if (context_.vk.vkResetCommandBuffer(command_buffer, 0) == VK_SUCCESS) slot->ticket = 0;
         };
+        // Validate/freeze CPU shadow sources before bindless_prepare_ can publish a new descriptor generation.
+        // A source mutation must not strand a generation whose table upload was recorded but never submitted.
+        // tracker_mutex_ also serializes scratch/snapshot access between queues on this device.
+        if (!tracker_lock.owns_lock()) tracker_lock.lock();
+        const auto profile_prepared = FrameProfile::now();
+        HostShadowProfile::Samples shadow_samples{};
+        const bool profile_host = shadow_profile_.enabled();
+        const auto shadow_begin = profile_host ? HostShadowProfile::now() : HostShadowProfile::Time{};
+        struct MutableUpload {
+            ResourceId id;
+            const ResourceBinding* image;
+            std::shared_ptr<MutableHostShadow> owner;
+        };
+        std::vector<MutableUpload> mutable_uploads;
+        const auto shadow_refused = [](const char* reason, const ResourceBinding* image = nullptr,
+                                        std::uint32_t layer = 0, std::uint32_t mip = 0,
+                                        const VkBufferImageCopy* region = nullptr) {
+            static const bool enabled = [] {
+                const char* value = std::getenv("LEONIDA_HOST_SHADOW_DIAGNOSTICS");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            static std::atomic<unsigned> reports{0};
+            if (enabled && reports.fetch_add(1, std::memory_order_relaxed) < 32)
+                std::fprintf(stderr, "[rt] VulkanQueue: host shadow refused reason=%s format=%d "
+                    "size=%ux%ux%u layers=%u mips=%u volume=%u line=%u samples=%u layer_bytes=%llu "
+                    "layer=%u mip=%u region=%ux%ux%u offset=%llu row_texels=%u\n", reason,
+                    image ? int(image->format) : 0, image ? image->width : 0, image ? image->height : 0,
+                    image ? image->depth : 0, image ? image->array_layers : 0, image ? image->mip_levels : 0,
+                    image ? unsigned(image->volume) : 0, image ? unsigned(image->line) : 0,
+                    image ? image->samples : 0,
+                    static_cast<unsigned long long>(image ? image->host_shadow_layer_bytes : 0), layer, mip,
+                    region ? region->imageExtent.width : 0, region ? region->imageExtent.height : 0,
+                    region ? region->imageExtent.depth : 0,
+                    static_cast<unsigned long long>(region ? region->bufferOffset : 0),
+                    region ? region->bufferRowLength : 0);
+            return ReplayResult::unsupported;
+        };
+        for (const auto& node : selected) {
+            const auto& [id, image] = *node.entry;
+            if (image.mutable_host_shadow) {
+                const auto& shadow = image.mutable_host_shadow;
+                if (!image.host_readonly_image || !image.image || !image.host_shadow_buffer ||
+                    !image.host_shadow_layer_bytes || image.aspects != VK_IMAGE_ASPECT_COLOR_BIT ||
+                    (image.line && (image.volume || image.height != 1 || image.depth != 1 || image.array_layers != 1)) ||
+                    image.samples != 1 || !image.array_layers ||
+                    (image.volume && (image.array_layers != 1 || !image.depth)) ||
+                    !image.width || !image.height || !image.mip_levels || image.mip_levels > 32 ||
+                    !context_.vk.vkCmdCopyBufferToImage || !context_.vk.vkCmdPipelineBarrier ||
+                    !shadow->capture || !shadow->stage || !shadow->commit)
+                    return shadow_refused("mutable-binding", &image);
+                if (image.array_layers > UINT32_MAX / image.mip_levels ||
+                    image.host_shadow_layer_bytes > UINT64_MAX / image.array_layers ||
+                    shadow->regions.size() != std::size_t(image.array_layers) * image.mip_levels)
+                    return shadow_refused("mutable-regions", &image);
+                const auto block = block_format(image.format, VK_IMAGE_ASPECT_COLOR_BIT);
+                if ((block.block != 1 && block.block != 4) || (image.line && block.block != 1) ||
+                    block.bytes > 16 || !std::has_single_bit(block.bytes))
+                    return shadow_refused("mutable-block-format", &image);
+                for (std::uint32_t layer = 0; layer < image.array_layers; ++layer) {
+                    const VkDeviceSize layer_start = VkDeviceSize(layer) * image.host_shadow_layer_bytes;
+                    for (std::uint32_t mip = 0; mip < image.mip_levels; ++mip) {
+                        const auto& region = shadow->regions[std::size_t(layer) * image.mip_levels + mip];
+                        const std::uint32_t width = std::max(1u, image.width >> mip);
+                        const std::uint32_t height = std::max(1u, image.height >> mip);
+                        const std::uint32_t depth = image.volume ? std::max(1u, image.depth >> mip) : 1;
+                        if (region.imageSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+                            region.imageSubresource.mipLevel != mip || region.imageSubresource.baseArrayLayer != layer ||
+                            region.imageSubresource.layerCount != 1 || region.imageOffset.x || region.imageOffset.y ||
+                            region.imageOffset.z || region.imageExtent.width != width || region.imageExtent.height != height ||
+                            region.imageExtent.depth != depth || region.bufferOffset % std::max(4u, block.bytes) ||
+                            (region.bufferRowLength &&
+                             (region.bufferRowLength < width || region.bufferRowLength % block.block)) ||
+                            region.bufferImageHeight || region.bufferOffset < layer_start ||
+                            region.bufferOffset - layer_start > image.host_shadow_layer_bytes)
+                            return shadow_refused("mutable-region-bounds", &image, layer, mip, &region);
+                        const VkDeviceSize row_texels = region.bufferRowLength ? region.bufferRowLength : width;
+                        const VkDeviceSize pitch = ((row_texels + block.block - 1) / block.block) * block.bytes;
+                        const VkDeviceSize last_row = ((VkDeviceSize(width) + block.block - 1) / block.block) * block.bytes;
+                        const VkDeviceSize rows = ((VkDeviceSize(height) + block.block - 1) / block.block) * depth;
+                        const VkDeviceSize room = image.host_shadow_layer_bytes - (region.bufferOffset - layer_start);
+                        if (last_row > room || (rows > 1 && pitch > (room - last_row) / (rows - 1)))
+                            return shadow_refused("mutable-staging-bounds", &image, layer, mip, &region);
+                    }
+                }
+                bool dirty = false;
+                const auto capture_start = profile_host ? HostShadowProfile::now() : HostShadowProfile::Time{};
+                if (!shadow->capture(dirty)) return shadow_refused("mutable-capture", &image);
+                if (profile_host) {
+                    const bool large_r8 = image.format == VK_FORMAT_R8_UNORM && image.width >= 1920 && image.height >= 1080;
+                    const auto kind = large_r8 ? HostShadowProfile::large_r8 :
+                                      block.block == 4 ? HostShadowProfile::bc : HostShadowProfile::other_mutable;
+                    HostShadowProfile::capture(shadow_samples, kind, capture_start,
+                                               image.host_shadow_layer_bytes * image.array_layers, dirty);
+                }
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, image.mip_levels, 0, image.array_layers};
+                for (const auto& piece : detail::current(&context_.tracker_, id, range, VK_IMAGE_LAYOUT_UNDEFINED))
+                    if ((piece.layout != VK_IMAGE_LAYOUT_UNDEFINED && piece.layout != VK_IMAGE_LAYOUT_GENERAL) ||
+                        (!dirty && piece.layout == VK_IMAGE_LAYOUT_UNDEFINED))
+                        return shadow_refused("mutable-tracked-layout", &image);
+                if (!dirty) continue;
+                try { mutable_uploads.push_back({id, &image, shadow}); }
+                catch (const std::bad_alloc&) { return shadow_refused("mutable-upload-allocation", &image); }
+                continue;
+            }
+            if (!image.host_readonly_image || !image.host_shadow_prepare) continue;
+            if (!image.host_shadow_buffer || !image.host_shadow_layer_bytes || !image.array_layers ||
+                image.array_layers > 96 || !context_.vk.vkCmdCopyBufferToImage ||
+                !context_.vk.vkCmdPipelineBarrier) return shadow_refused("immutable-binding", &image);
+            const auto capture_start = profile_host ? HostShadowProfile::now() : HostShadowProfile::Time{};
+            if (!image.host_shadow_prepare()) return shadow_refused("immutable-prepare", &image);
+            if (profile_host)
+                HostShadowProfile::capture(shadow_samples, HostShadowProfile::immutable, capture_start,
+                                           image.host_shadow_layer_bytes * image.array_layers, false);
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, image.array_layers};
+            for (const auto& piece : detail::current(&context_.tracker_, id, range, VK_IMAGE_LAYOUT_UNDEFINED))
+                if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED && piece.layout != VK_IMAGE_LAYOUT_GENERAL)
+                    return shadow_refused("immutable-tracked-layout", &image);
+        }
+        const auto wait_begin = profile_host ? HostShadowProfile::now() : HostShadowProfile::Time{};
+        bool host_writes_safe = false;
+        const auto retire_before_host_write = [&] {
+            if (host_writes_safe) return true;
+            const auto ticket = context_.submitted_retire_ticket();
+            host_writes_safe = !ticket || context_.wait_retire_ticket(ticket) >= ticket;
+            return host_writes_safe;
+        };
+        if (!refresh_descriptor_heaps(lists, bound_descriptor_heaps_, retire_before_host_write)) return shadow_refused("descriptor-retirement");
+        if (!mutable_uploads.empty()) {
+            // A persistent staging buffer cannot be changed while an older GPU copy reads it. tracker_mutex_
+            // excludes new resource-using submissions, and QueueHolds never submits waits for unsent signals.
+            // Join only already accepted native work; no pending/held operation is pumped while queue locks are held.
+            if (!retire_before_host_write()) return shadow_refused("mutable-retirement");
+        }
+        const auto stage_begin = profile_host ? HostShadowProfile::now() : HostShadowProfile::Time{};
+        for (const auto& upload : mutable_uploads) upload.owner->stage();
+        if (profile_host)
+            shadow_profile_.record(shadow_samples, present_sources.empty() ? image_reads.reasons : 0,
+                                   image_reads.unbounded_names, selected.size(),
+                                   shadow_begin, wait_begin, stage_begin, HostShadowProfile::now());
+        const auto profile_shadows = FrameProfile::now();
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (context_.vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
@@ -2591,16 +3105,91 @@ private:
             tracker_lock.unlock();
             return ReplayResult::unsupported;
         }
-        replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
-        const bool bindless_uploaded = std::exchange(context_.bindless_upload_pending_, false);
-        auto next_tracker = context_.tracker_;
+        replay.bindless_set = guest_queue_ && context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
+        const bool bindless_uploaded = guest_queue_ && std::exchange(context_.bindless_upload_pending_, false);
+        auto next_tracker = context_.tracker_.pending_changes();
+        bool initialized_host_images = false;
+        for (const auto& upload : mutable_uploads) {
+            const auto& image = *upload.image;
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, image.mip_levels, 0, image.array_layers};
+            const auto pieces = detail::current(&next_tracker, upload.id, range, VK_IMAGE_LAYOUT_UNDEFINED);
+            VkBufferMemoryBarrier source{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            source.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            source.srcQueueFamilyIndex = source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            source.buffer = image.host_shadow_buffer;
+            source.size = VK_WHOLE_SIZE;
+            context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &source, 0, nullptr);
+            for (const auto& piece : pieces) {
+                const bool first = piece.layout == VK_IMAGE_LAYOUT_UNDEFINED;
+                detail::image_barrier(replay, command_buffer, image, piece.range, piece.layout,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, first ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                    first ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            }
+            context_.vk.vkCmdCopyBufferToImage(command_buffer, image.host_shadow_buffer, image.image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, std::uint32_t(upload.owner->regions.size()), upload.owner->regions.data());
+            detail::image_barrier(replay, command_buffer, image, range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            next_tracker.set(upload.id, range, VK_IMAGE_LAYOUT_GENERAL);
+            initialized_host_images = true;
+        }
+        // These images are the caller's coherent CPU bytes, including before their first use. A shader can
+        // reach them without naming a resource in its command, so unknown reads include every live import.
+        // GENERAL keeps subsequent CPU writes legal; the application fences previous GPU reads before writing.
+        for (const auto& node : selected) {
+            const auto& [id, image] = *node.entry;
+            if (image.mutable_host_shadow) continue;
+            if (!image.host_readonly_image) continue;
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, image.array_layers};
+            const auto pieces = detail::current(&next_tracker, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
+            if (image.host_shadow_prepare) {
+                for (const auto& piece : pieces) {
+                    if (piece.layout == VK_IMAGE_LAYOUT_GENERAL) continue;
+                    VkBufferMemoryBarrier source{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                    source.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+                    source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    source.srcQueueFamilyIndex = source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    source.buffer = image.host_shadow_buffer;
+                    source.size = VK_WHOLE_SIZE;
+                    context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &source, 0, nullptr);
+                    detail::image_barrier(replay, command_buffer, image, piece.range, VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    // Separate regions retain four-byte offsets even for one- or two-byte color texels.
+                    std::array<VkBufferImageCopy, 96> copies{};
+                    for (std::uint32_t index = 0; index < piece.range.layerCount; ++index) {
+                        auto& copy = copies[index];
+                        const auto layer = piece.range.baseArrayLayer + index;
+                        copy.bufferOffset = image.host_shadow_layer_bytes * layer;
+                        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+                        copy.imageExtent = {image.width, image.height, image.volume ? image.depth : 1};
+                    }
+                    context_.vk.vkCmdCopyBufferToImage(command_buffer, image.host_shadow_buffer, image.image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, piece.range.layerCount, copies.data());
+                    detail::image_barrier(replay, command_buffer, image, piece.range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                    initialized_host_images = true;
+                }
+                next_tracker.set(id, range, VK_IMAGE_LAYOUT_GENERAL);
+                continue;
+            }
+            for (const auto& piece : pieces) {
+                const bool first = piece.layout == VK_IMAGE_LAYOUT_UNDEFINED;
+                initialized_host_images |= first;
+                detail::image_barrier(replay, command_buffer, image, piece.range, piece.layout,
+                    VK_IMAGE_LAYOUT_GENERAL, first ? 0 : VK_ACCESS_HOST_WRITE_BIT,
+                    first ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_HOST_BIT,
+                    VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            }
+            next_tracker.set(id, range, VK_IMAGE_LAYOUT_GENERAL);
+        }
         // Bindless images that may already be visible to shaders are initialized on a submission that runs shaders.
         // initialize() zeroes committed storage images and only transitions sparse images.
-        bool runs_shaders = false;
-        for (const CommandList* list : lists)
-            for (const auto& command : list->commands())
-                runs_shaders |= std::holds_alternative<Dispatch>(command) || std::holds_alternative<Draw>(command) ||
-                                std::holds_alternative<ExecuteIndirect>(command);
         std::vector<ResourceId> storage_images;
         std::vector<VulkanContext::PendingZero> zero_buffers;
         {
@@ -2623,7 +3212,7 @@ private:
             if (kind_ != QueueKind::copy && runs_shaders)
                 storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
             if (!storage_images.empty()) context_.storage_pending_.clear();
-            zero_buffers.swap(context_.zero_pending_);  // any queue can fill a buffer
+            if (guest_queue_) zero_buffers.swap(context_.zero_pending_);  // any guest queue can fill a buffer
         }
         for (const auto& zero : zero_buffers)
             context_.vk.vkCmdFillBuffer(command_buffer, zero.buffer, 0, VK_WHOLE_SIZE, 0);
@@ -2651,10 +3240,14 @@ private:
             readback_stages |= list.readback_src_stages;
         }
         close_labels(command_buffer, replay, open_labels);
-        // Only flush GPU writes to the host domain when this batch actually wrote to a readback buffer.
+        // Include shader/AS writes: descriptors and device addresses can reach CPU-visible memory without a copy
+        // to a known readback resource. Fence completion alone does not make those writes visible to the host.
         if (wrote_readback) {
             const VkPipelineStageFlags2 allowed = queue_supported_stages(kind_);
-            VkPipelineStageFlags2 src_stages = readback_stages & allowed;
+            // ALL_COMMANDS is valid for every queue, but queue_supported_stages omits that aggregate bit.
+            VkPipelineStageFlags2 src_stages =
+                (readback_stages & VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT) ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+                                                                      : readback_stages & allowed;
             if (!src_stages) src_stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             const bool copy_only =
                 (src_stages & ~(VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT)) == 0;
@@ -2688,14 +3281,15 @@ private:
             waits_.push_back(progress_);
             wait_values_.push_back(submitted_);
         }
-        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
+        const auto profile_emit = FrameProfile::now();
+        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0, replay.frame_draws);
         if (!submitted && (!storage_images.empty() || !zero_buffers.empty())) {
             // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);
             context_.storage_pending_.insert(storage_images.begin(), storage_images.end());
             context_.zero_pending_.insert(context_.zero_pending_.end(), zero_buffers.begin(), zero_buffers.end());
         }
-        if (submitted && (!storage_images.empty() || !zero_buffers.empty())) {
+        if (submitted && (initialized_host_images || !storage_images.empty() || !zero_buffers.empty())) {
             std::lock_guard lock(context_.storage_mutex_);
             context_.storage_init_semaphore_ = progress_;
             context_.storage_init_value_ = submitted_;
@@ -2714,12 +3308,40 @@ private:
             wait_values_.pop_back();
         }
         if (submitted) {
-            context_.tracker_ = std::move(next_tracker);
+            context_.tracker_.commit_changes(std::move(next_tracker));
+            for (const auto& upload : mutable_uploads) upload.owner->commit();
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
             slot->counted_dispatch = std::move(counted_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
+            // Correlate recorded IR with this accepted native submission. These are command counts, not a claim
+            // that predicated or indirect draws produced pixels.
+            static std::atomic<unsigned> batch_traces{0};
+            if (batch_traces.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::size_t total = 0, timestamps = 0, immediate = 0, host_acquires = 0;
+                std::size_t clear_rt = 0, clear_ds = 0, clear_uav = 0, draws = 0, dispatches = 0, indirect = 0;
+                for (const auto* list : lists) {
+                    total += list->commands().size();
+                    for (const auto& command : list->commands()) {
+                        timestamps += std::holds_alternative<WriteTimestamp>(command);
+                        immediate += std::holds_alternative<WriteImmediate>(command);
+                        host_acquires += std::holds_alternative<HostMemoryAcquire>(command);
+                        clear_rt += std::holds_alternative<ClearRenderTarget>(command);
+                        clear_ds += std::holds_alternative<ClearDepthStencil>(command);
+                        clear_uav += std::holds_alternative<ClearUnorderedAccess>(command);
+                        draws += std::holds_alternative<Draw>(command);
+                        dispatches += std::holds_alternative<Dispatch>(command);
+                        indirect += std::holds_alternative<ExecuteIndirect>(command);
+                    }
+                }
+                std::fprintf(stderr, "[rt] VulkanQueue: accepted batch IR family=%u progress=%p ticket=%llu "
+                                     "lists=%zu total=%zu timestamp=%zu write_immediate=%zu host_acquire=%zu "
+                                     "clear_rt=%zu clear_ds=%zu clear_uav=%zu draw=%zu dispatch=%zu indirect=%zu\n",
+                    family_, reinterpret_cast<void*>(progress_), static_cast<unsigned long long>(submitted_),
+                    lists.size(), total, timestamps, immediate, host_acquires, clear_rt, clear_ds, clear_uav,
+                    draws, dispatches, indirect);
+            }
         } else {
             discard();
         }
@@ -2735,6 +3357,8 @@ private:
         // the queue (it keeps a single upload obligation).
         if (bindless_commit) bindless_commit(submitted);
         tracker_lock.unlock();
+        submit_profile_.record("prepare,shadows,record,submit", profile_start, profile_prepared,
+                               profile_shadows, profile_emit);
         return submitted ? ReplayResult::success : ReplayResult::unsupported;
     }
 
@@ -2847,7 +3471,7 @@ private:
             for (const CommandList& list : op.lists) lists.push_back(&list);
             // The pipeline states and root signatures of the lists are in op.pins (see execute()): they live until
             // the batch has been recorded and then, with the fences, until its submission has completed (below).
-            const ReplayResult result = execute_now(lists);
+            const ReplayResult result = execute_now(lists, op.pins);
             if (result != ReplayResult::success) {
                 int none = static_cast<int>(ReplayResult::success);
                 held_failure_.compare_exchange_strong(none, static_cast<int>(result));
@@ -2954,6 +3578,7 @@ private:
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
         std::vector<KhrAsQueryPool> khr_as_queries;   // KHR postbuild COMPACTED_SIZE query pools, same lifetime
+        std::vector<VkQueryPool> timestamp_queries;  // fresh native marker queries, retained until this slot completes
     };
 
     struct PendingBindings {
@@ -3095,6 +3720,14 @@ private:
         std::uint64_t done = 0;
         const VkResult result = context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
         if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+        if (result == VK_SUCCESS && done) {
+            static std::atomic<unsigned> observations{0};
+            if (observations.fetch_add(1, std::memory_order_relaxed) < 32)
+                std::fprintf(stderr, "[rt] VulkanQueue: native completion observed family=%u queue=%p "
+                                     "progress=%p done=%llu\n",
+                    family_, reinterpret_cast<void*>(queue_), reinterpret_cast<void*>(progress_),
+                    static_cast<unsigned long long>(done));
+        }
         // A failed timeline query cannot be used as a resource-retirement or command-buffer reuse ticket.
         return result == VK_SUCCESS ? done : 0;
     }
@@ -3116,6 +3749,7 @@ private:
             slot.segments.clear();
             recycle_khr_stages(slot.khr_instances);
             recycle_khr_as_queries(slot.khr_as_queries);
+            destroy_timestamp_queries(slot.timestamp_queries);
             for (VkEvent event : slot.events)
                 if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
                 else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);
@@ -3201,7 +3835,8 @@ private:
         return event;
     }
 
-    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
+    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
+                const FrameDrawTargets* frame_draws = nullptr) {
         if (context_.is_device_lost()) return false;
         const std::uint64_t ticket = submitted_ + 1;
         if (last_sparse_) {
@@ -3252,6 +3887,15 @@ private:
             submit.pSignalSemaphores = signals;
             res = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
             if (res == VK_SUCCESS) {
+                if (frame_draws)
+                    context_.frame_draw_activity().submit(reinterpret_cast<std::uintptr_t>(queue_), *frame_draws);
+                static std::atomic<unsigned> submissions{0};
+                if (submissions.fetch_add(1, std::memory_order_relaxed) < 32)
+                    std::fprintf(stderr, "[rt] VulkanQueue: native submit accepted family=%u queue=%p "
+                                         "progress=%p ticket=%llu command_buffer=%p command_buffers=%u\n",
+                        family_, reinterpret_cast<void*>(queue_), reinterpret_cast<void*>(progress_),
+                        static_cast<unsigned long long>(ticket), reinterpret_cast<void*>(command_buffer),
+                        submit.commandBufferCount);
                 context_.record_submit_locked(progress_, ticket);
                 if (signals_fence) context_.holds().signaled(fence, value);
             }
@@ -3275,6 +3919,7 @@ private:
     VkQueue queue_;
     QueueKind kind_ = QueueKind::direct;
     std::uint32_t family_;
+    bool guest_queue_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done
     std::uint64_t submitted_ = 0;

@@ -242,6 +242,19 @@ def _imports(img: PeImage, kind: str, index: int, delay: bool = False) -> list[d
     return entries
 
 
+def runtime_sidecars(path: str) -> tuple[str, ...]:
+    """Local DLLs imported by this build. Older and minimal loaders can omit these dependencies."""
+    with open(path, "rb") as stream:
+        data = stream.read()
+    if data[:2] != b"MZ":
+        return ()
+    image = PeImage(data)
+    imports = _imports(image, "normal", DIR_IMPORT) + _imports(image, "delay", DIR_DELAY_IMPORT, delay=True)
+    names = {entry["dll"].lower() for entry in imports}
+    local = ("gta6rt_bcpack.dll", "gta6rt_root_signature.dll", "leonida_audio_core.dll", "leonida_texture_core.dll")
+    return tuple(name for name in local if name in names)
+
+
 def _exports(img: PeImage) -> list[str]:
     rva, size = img.directory(DIR_EXPORT)
     if not rva or size < 40:
@@ -497,12 +510,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("image", nargs="+")
     ap.add_argument("--game-dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
+    ap.add_argument("--runtime-sidecars", action="store_true", help="print the linked local runtime DLLs")
     a = ap.parse_args(argv)
     missing = [img for img in a.image if not os.path.exists(img)]
     if missing:
         for img in missing:
             print(f"ERROR: {img}: does not exist", file=sys.stderr)
         return 2
+    if a.runtime_sidecars:
+        if len(a.image) != 1:
+            ap.error("--runtime-sidecars takes one runtime executable")
+        try:
+            for name in runtime_sidecars(a.image[0]):
+                print(name)
+        except (PeFormatError, OSError) as e:
+            print(f"Cannot read the runtime imports from {a.image[0]}: {e}", file=sys.stderr)
+            return 1
+        return 0
     if os.path.isfile(a.out):
         print(f"cannot create output directory {a.out}: path is a file, not a directory", file=sys.stderr)
         return 1

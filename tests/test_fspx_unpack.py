@@ -30,7 +30,7 @@ def prologue():
     """Three 12-byte VOP3 opcode-0x180 words with literals, the shape the DLL's programs start with."""
     out = b""
     for lo in (0x1111, 0x2222, 0x0000):
-        out += struct.pack("<III", 0xD5800000 | lo, 0x03FF0000, 0x12345678)
+        out += struct.pack("<III", 0xD5800000 | lo, 0x03FF0100, 0x12345678)
     return out
 
 
@@ -144,6 +144,19 @@ class Kind0AndCode(unittest.TestCase):
         self.assertEqual(fspx_unpack.code_range(program(with_prologue=False)), (0, 12 + 4))
         self.assertEqual(fspx_unpack.code_range(program(endpgm=False))[1], None)
 
+    def test_short_prologue(self):
+        # Two VOP3 opcode-0x180 words (0 and 3), then code: the 24-byte prologue of some pipeline-library programs.
+        code = prologue()[:24] + V_MOV * 3 + ENDPGM
+        self.assertEqual(fspx_unpack.code_range(code), (24, 24 + 12 + 4))
+        without_literal = bytearray(code)
+        struct.pack_into("<I", without_literal, 4, 0)
+        self.assertEqual(fspx_unpack.code_range(without_literal)[0], 0)
+        # Only word 0 is not a prologue.
+        code = prologue()[:12] + V_MOV * 6 + ENDPGM
+        self.assertEqual(fspx_unpack.code_range(code)[0], 0)
+        # The long one still wins when word 6 is a prologue word too.
+        self.assertEqual(fspx_unpack.code_range(program())[0], 36)
+
     def test_unaligned_endpgm_bytes_are_not_the_end(self):
         code = prologue() + b"\0\0" + ENDPGM + b"\0\0" + V_MOV + ENDPGM
         start, end = fspx_unpack.code_range(code)
@@ -234,6 +247,33 @@ class Cli(unittest.TestCase):
             listing = f.read()
         self.assertIn("0 invalid words", listing)
         self.assertIn("\ts_endpgm", listing)
+
+    def test_python_backend_preserves_dot4_half_selects_and_dispatch_wave_mode(self):
+        import shader_ir
+        # Hand-encoded VOP3P dot4 from the documented synthetic hardware probe,
+        # followed by a synthetic VOPC compare. No package words or LLVM needed.
+        dot4 = struct.pack("<II", 0xCC165008, 0x0C0E0501)
+        cmp_word = (0x3E << 25) | (0xC2 << 17) | (6 << 9) | 128
+        code_bytes = dot4 + struct.pack("<I", cmp_word) + ENDPGM
+        with tempfile.TemporaryDirectory() as t:
+            for wave32, expected_mask in ((True, "vcc_lo"), (False, "vcc")):
+                src = os.path.join(t, f"wave{32 if wave32 else 64}.fspx")
+                with open(src, "wb") as f:
+                    f.write(make_fspx([(0, kind0(wave32=wave32)), (6, code_bytes)]))
+                out = os.path.join(t, f"out{wave32}")
+                env = dict(os.environ, LLVM_MC=os.path.join(t, "missing-llvm-mc"))
+                result = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out,
+                                         "--disasm", "--backend", "python"],
+                                        capture_output=True, text=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                listing_path = os.path.join(out, "disasm", os.path.splitext(os.path.basename(src))[0] + ".s")
+                info = shader_ir.parse_file(listing_path)
+                self.assertEqual(info["invalid"], 0)
+                self.assertEqual([i["op"] for i in info["insns"]],
+                                 ["v_dot4_i32_i8", "v_cmp_eq_u32_e32", "s_endpgm"])
+                self.assertIn("op_sel:[0,1,0]", info["insns"][0]["mods"])
+                self.assertIn("op_sel_hi:[1,0,1]", info["insns"][0]["mods"])
+                self.assertEqual(info["insns"][1]["args"][0]["t"], expected_mask)
 
     def test_dll_like_file(self):
         c = Containers().container()

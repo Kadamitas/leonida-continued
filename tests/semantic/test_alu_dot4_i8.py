@@ -27,6 +27,7 @@ translator refuses a set bit and takes an all-zero field as the plain instructio
     python -m unittest discover -s tests/semantic -p test_alu_dot4_i8.py
 """
 import os
+import struct
 import sys
 import unittest
 
@@ -163,6 +164,25 @@ class Dot4I8(unittest.TestCase):
                 ]
                 spv = support.translate_lines("ps_dot4_op_sel", lines)
                 self.assertEqual(support.mrt0_words(spv), [measured] * 4)
+
+    def test_binary_half_select_decode_keeps_the_following_export(self):
+        import rdna2_decode
+
+        # Synthetic raw instructions from the documented hardware-probe rule:
+        # three literal moves, dot4 with swapped S1 halves, export, then endpgm.
+        # A decoder that drops the dot4 or cuts the path before the export fails.
+        for a, b, addend, measured in MEASURED_OP_SEL:
+            words = []
+            for register, value in ((1, a), (2, b), (3, addend)):
+                words.extend(((0x3F << 25) | (register << 17) | (1 << 9) | 0xFF, value))
+            words.extend((0xCC165008, 0x0C0E0501,
+                          (0x3E << 26) | (1 << 12) | (1 << 11) | 0xF,
+                          0x08080808, 0xBF810000))
+            listing, invalid = rdna2_decode.disasm_bytes(struct.pack(f"<{len(words)}I", *words), mcpu="gfx1030")
+            self.assertEqual(invalid, 0)
+            self.assertIn("op_sel:[0,1,0]", listing)
+            spv = support.translate_listing("ps_dot4_binary", ("; ps_dot4_binary\n" + listing).encode())
+            self.assertEqual(support.mrt0_words(spv), [measured] * 4)
 
     def test_the_neg_reference_reproduces_the_hardware_words(self):
         for neg_lo, neg_hi, a, b, addend, measured in MEASURED_NEG:

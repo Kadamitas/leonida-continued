@@ -3,14 +3,15 @@
 // One JSON object per line, flushed per event so the file survives a crash. Off by default; every entry point is a
 // single relaxed load when it is off. Events:
 //   {"seq":1,"t":0.000,"kind":"trace_open"}
-//   {"seq":2,"t":0.001,"kind":"map","module":"a.dll","base":"0x...","size":"0x2000","relocated":false}
-//   {"seq":3,"t":0.002,"kind":"tls_callback","module":"a.dll","at":"a.dll+0x1200","reason":1}
-//   {"seq":4,"t":0.002,"kind":"dllmain","module":"a.dll","result":1}
-//   {"seq":5,"t":0.010,"kind":"unimplemented_call","import":"x.dll!Foo","caller":"a.dll+0x3f10"}   (first call only)
-//   {"seq":6,"t":0.011,"kind":"debug_string","text":"..."}
-//   {"seq":7,"t":0.020,"kind":"exception","code":"0xc0000005","at":"a.dll+0x4a00","access":"read","address":"0x0",
+//   {"seq":2,"t":0.001,"kind":"tls_index0","owner":"gta6rt.exe","moved_to":4}   (first executable mapped, once)
+//   {"seq":3,"t":0.001,"kind":"map","module":"a.dll","base":"0x...","size":"0x2000","relocated":false}
+//   {"seq":4,"t":0.002,"kind":"tls_callback","module":"a.dll","at":"a.dll+0x1200","reason":1}
+//   {"seq":5,"t":0.002,"kind":"dllmain","module":"a.dll","result":1}
+//   {"seq":6,"t":0.010,"kind":"unimplemented_call","import":"x.dll!Foo","caller":"a.dll+0x3f10"}   (first call only)
+//   {"seq":7,"t":0.011,"kind":"debug_string","text":"..."}
+//   {"seq":8,"t":0.020,"kind":"exception","code":"0xc0000005","at":"a.dll+0x4a00","access":"read","address":"0x0",
 //        "stack":["a.dll+0x4a00","a.dll+0x2210"]}
-//   {"seq":8,"t":0.030,"kind":"exit","code":0}
+//   {"seq":9,"t":0.030,"kind":"exit","code":0}
 //
 // The exception handler is vectored, logs and returns EXCEPTION_CONTINUE_SEARCH: it never changes what the process
 // does (except LEONIDA_SKIP_INT3, below).
@@ -183,6 +184,21 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
+#if defined(_M_X64) || defined(__x86_64__)
+            wchar_t capture[2]{};
+            if (r.ExceptionCode == EXCEPTION_BREAKPOINT && info.ContextRecord &&
+                GetEnvironmentVariableW(L"LEONIDA_TRACE_BREAKPOINT_CONTEXT", capture, 2) == 1 && capture[0] == L'1') {
+                const CONTEXT& c = *info.ContextRecord;
+                f += ",\"rax\":" + quote(hex(c.Rax)) + ",\"rbx\":" + quote(hex(c.Rbx)) +
+                     ",\"rcx\":" + quote(hex(c.Rcx)) + ",\"rdx\":" + quote(hex(c.Rdx)) +
+                     ",\"rsi\":" + quote(hex(c.Rsi)) + ",\"rdi\":" + quote(hex(c.Rdi)) +
+                     ",\"r8\":" + quote(hex(c.R8)) + ",\"r9\":" + quote(hex(c.R9)) +
+                     ",\"r10\":" + quote(hex(c.R10)) + ",\"r11\":" + quote(hex(c.R11)) +
+                     ",\"r12\":" + quote(hex(c.R12)) + ",\"r15\":" + quote(hex(c.R15)) +
+                     ",\"r13\":" + quote(hex(c.R13)) + ",\"r14\":" + quote(hex(c.R14)) +
+                     ",\"thread_id\":" + std::to_string(GetCurrentThreadId());
+            }
+#endif
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
         }

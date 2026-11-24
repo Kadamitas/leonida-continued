@@ -521,3 +521,14 @@ pipeline is created with the runtime's resource contract. It does not prove:
 
 No shader data, names or caches are committed. The caches live in the work directory and are inputs
 to a later run, not part of the repository.
+
+## Runtime startup cache checkpoints
+
+`LEONIDA_PIPELINE_CACHE_WRITE=1` makes the Vulkan runtime checkpoint its native pipeline cache after each
+successful compute pipeline creation. This retains completed work if a later cold driver compilation exceeds
+the title's startup watchdog. The default leaves the cache read-only. Each snapshot must be complete and at
+most 256 MiB; the runtime closes a staging file before replacing `pipeline_cache.bin` beside its executable.
+A failed or incomplete snapshot leaves the previous seed intact and does not change the pipeline result.
+The existing adapter, driver and cache UUID check still applies when the next run loads it. Keep a separate
+backup of a full corpus cache when selecting a smaller startup seed. This changes neither the watchdog nor
+the title's exception handling, and successful pipeline creation alone does not prove rendered output.

@@ -166,6 +166,7 @@ class SpirvOptTests(unittest.TestCase):
        %head = OpLabel
         %phi = OpPhi %uint %v0 %entry %phi %cont
           %i = OpPhi %uint %c0 %entry %inext %cont
+      %unused = OpPhi %uint %v0 %entry %unused_next %cont
                OpLoopMerge %exit %cont None
                OpBranch %body
        %body = OpLabel
@@ -178,6 +179,7 @@ class SpirvOptTests(unittest.TestCase):
                OpUnreachable
        %cont = OpLabel
       %inext = OpIAdd %uint %i %c1
+ %unused_next = OpBitwiseXor %uint %unused %i
                OpBranch %head
        %exit = OpLabel
         %res = OpCompositeConstruct %v4uint %phi %v0 %c0 %c1
@@ -186,6 +188,11 @@ class SpirvOptTests(unittest.TestCase):
                OpFunctionEnd
 """
         _validate(spvasm)
+        first_pass = spirv_opt.optimize(spvasm, max_passes=1)
+        _validate(first_pass)
+        self.assertNotIn("%unused", first_pass)
+        self.assertIn("%i = OpPhi", first_pass)
+        self.assertIn("%inext = OpIAdd", first_pass)
         opt = spirv_opt.optimize(spvasm)
         _validate(opt)
         # Trivial self-referential %phi must collapse to %v0, duplicate %v1 = OpLoad %in0 CSEs to %v0,

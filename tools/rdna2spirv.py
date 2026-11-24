@@ -7253,7 +7253,18 @@ class Gen:
         args = [dict(a) for a in ins["args"]]
         if len(args) < 2:
             raise Unsupported("DPP operands")
-        if args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
+        # A VOPC compare in DPP form (docs/design.md, "DPP on a VOPC compare"): src0 comes through the same lane
+        # selection and the result is a mask bit, not a VGPR. Only the forms where every lane writes its bit are
+        # taken: what a lane that DPP leaves unwritten does to its VCC bit is not measured.
+        compare = base_op(ins["op"]).startswith("v_cmp")
+        if compare:
+            if base_op(ins["op"]).startswith("v_cmpx"):
+                raise Unsupported("DPP on v_cmpx")
+            if len(args) != 3:
+                raise Unsupported("DPP compare operands")
+            if row_mask != 0xF or bank_mask != 0xF or not (dpp8 is not None or bound):
+                raise Unsupported("DPP compare with lanes that keep their mask bit")
+        elif args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
             raise Unsupported("DPP destination")
         if args[1].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
@@ -7432,6 +7443,10 @@ class Gen:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
         args[1] = {"k": "ssa", "v": src0}
+        if compare:
+            # Every lane is enabled and an invalid source reads 0 (checked above), so the compare's own EXEC guard
+            # is the only one: the mask write is the plain compare's.
+            return self._insn({**ins, "args": args})
         previous = self.dpp_guard
         self.dpp_guard = write
         try:
@@ -7575,6 +7590,17 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpBitReverse %uint {x}")
             self.dst(a[0], r)
+        elif (op == "s_bitreplicate_b64_b32" and self.wave64 and len(a) == 2 and not mods
+              and a[0]["k"] == "special" and a[0].get("t") in ("exec", "vcc") and a[1]["k"] == "imm"
+              and not a[1].get("neg") and not a[1].get("abs")):
+            # Source bit i supplies mask bits 2i and 2i+1, including both logical halves of an emulated wave64.
+            # The scalar instruction writes its full destination independently of EXEC and preserves SCC.
+            index, shifted, bit, mask = (self.tmp() for _ in range(4))
+            self.emit(f"{index} = OpShiftRightLogical %uint {self.wave_lane()} {self.cu(1)}")
+            self.emit(f"{shifted} = OpShiftRightLogical %uint {self.cu(a[1]['v'] & 0xFFFFFFFF)} {index}")
+            self.emit(f"{bit} = OpBitwiseAnd %uint {shifted} {self.cu(1)}")
+            self.emit(f"{mask} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            self.mask_dst(a[0], mask)
         elif op in ("s_quadmask_b32", "s_quadmask_b64", "s_bitreplicate_b64_b32"):
             # RDNA2 ISA SOP1, on scalar data (a lane-mask operand stays Unsupported: each invocation holds only its
             # own lane's bit, and these ops read the other lanes of its quad or move bits between lanes):
@@ -8347,12 +8373,16 @@ class Gen:
         elif op in ("s_flbit_i32_b64", "s_flbit_i32_i64"):
             # Leading-bit count of a 64-bit value, from bit 63 down: b64 counts the zeros before the first 1; i64
             # counts the bits before the first one that differs from the sign bit (b64 of ~S0 when S0 < 0). -1 when
-            # there is none (0, and for i64 also -1). SCC is not written. The pair is 64-bit data (as for
-            # s_lshl_b64); a lane-mask source stays Unsupported (#210).
+            # there is none (0, and for i64 also -1). SCC is not written. Reconstruct a known full wave64 mask
+            # across both logical halves. Ordinary SGPR pairs are data, as for s_lshl_b64.
             x = a[1]
-            if self.holds_lane_mask(x):
+            full_mask = ((x["k"] == "special" and x.get("t") in ("exec", "vcc"))
+                         or (x["k"] == "sgpr" and x.get("n") == 2))
+            if op == "s_flbit_i32_b64" and self.wave64 and full_mask and self.holds_lane_mask(x):
+                lo, hi = self.wave_mask(x)
+            elif self.holds_lane_mask(x) or self.any_mask_word(x):
                 raise Unsupported(op + " of a lane mask")
-            if x["k"] == "sgpr" and x.get("n") == 2:
+            elif x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
                 v = x["v"] & 0xFFFFFFFFFFFFFFFF
@@ -18599,6 +18629,10 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     if g.cs:
         m["local_size"] = list(g.cs["size"])
         m["user_sgprs"] = g.cs["user"]
+        if g.cs.get("tg_size"):
+            m["tg_size_sgpr"] = {"register": g.cs["user"] + len(g.cs["tgid"]), "wave_size": 64 if g.wave64 else 32,
+                                 "fields": {"wave_count": 0x3f, "wave_index": 0xfc0,
+                                            "wave_index_high": 0x1f00000, "first_wave": 0x80000000}}
     if getattr(g, "msc_layout", None):
         # --mesh-compute: dispatch it as compute (same grid), then draw the slots with tools/mesh_compute_vs.py.
         lay = dict(g.msc_layout)

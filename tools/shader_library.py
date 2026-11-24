@@ -265,6 +265,7 @@ def main(argv=None) -> int:
     ap.add_argument("--save", help="write the reassembled library file here (must not overlap --out paths)")
     ap.add_argument("--stages", default="cs,ps,vs,ms",
                     help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot)")
+    ap.add_argument("--programs", help="optional comma-separated program indices to export")
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
     ap.add_argument("--mcpu", default="gfx1013", help="llvm-mc CPU for --disasm (default gfx1013)")
     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
@@ -291,6 +292,14 @@ def main(argv=None) -> int:
             finally:
                 m.close()
     lib = parse(b)
+    requested = None
+    if a.programs is not None:
+        try:
+            requested = {int(value.strip(), 0) for value in a.programs.split(",")}
+        except ValueError:
+            ap.error("--programs must contain comma-separated integer indices")
+        if not requested or min(requested) < 0 or max(requested) >= lib["header"]["programs"]:
+            ap.error("--programs contains an index outside the program table")
     if not a.out:
         with open(a.save, "wb") as f:
             f.write(b)
@@ -303,7 +312,29 @@ def main(argv=None) -> int:
     index_path = os.path.join(a.out, "index.json")
     names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
     want = None if a.stages == "all" else set(a.stages.split(","))
-    selected = [i for i in names if want is None or lib["stage"].get(i, set()) & want]
+    selected = [i for i in names if (requested is None or i in requested)
+                and (want is None or lib["stage"].get(i, set()) & want)]
+    # Resolve all output names before validating paths. One program may run with several dispatch states.
+    state_ids = {}
+    for record in lib["compute"]:
+        state_ids.setdefault(record["program"], set()).add(record["state"])
+    variants = {}
+    compute_names = {}
+    for i in selected:
+        by_state = {}
+        for state_id in sorted(state_ids.get(i, {None}), key=lambda n: -1 if n is None else n):
+            state = blob(b, lib, state_id) if state_id is not None else None
+            if state is not None and len(state) != 28:
+                raise LibraryError(f"compute program {i} dispatch state is {len(state)} bytes, expected 28")
+            by_state.setdefault(state, []).append(state_id)
+        variants[i] = []
+        for state, aliases in by_state.items():
+            name = names[i]
+            if len(by_state) > 1:
+                name += "_no_state" if state is None else f"_state_{aliases[0]:05d}"
+            variants[i].append((state, aliases[0], name))
+            for alias in aliases:
+                compute_names[i, alias] = name
     carve_errors = []
     sources = carve_digests(a.carve, errors=carve_errors) if a.carve else None
 
@@ -322,15 +353,15 @@ def main(argv=None) -> int:
         if disasm_dir:
             yield disasm_dir
         for i in selected:
-            name = names[i]
-            yield os.path.join(fspx_dir, name + ".code")
-            yield os.path.join(fspx_dir, name + ".json")
-            # Extraction writes the compute state or removes a stale sidecar at this path.
-            yield os.path.join(fspx_dir, name + ".state")
-            if sources is not None and carved_sources(i):
-                yield os.path.join(a.out, name + ".dxbc")
-            if disasm_dir and code_range(program(b, lib, i))[1]:
-                yield os.path.join(disasm_dir, name + ".s")
+            for _, _, name in variants[i]:
+                yield os.path.join(fspx_dir, name + ".code")
+                yield os.path.join(fspx_dir, name + ".json")
+                # Extraction writes the compute state or removes a stale sidecar at this path.
+                yield os.path.join(fspx_dir, name + ".state")
+                if sources is not None and carved_sources(i):
+                    yield os.path.join(a.out, name + ".dxbc")
+                if disasm_dir and code_range(program(b, lib, i))[1]:
+                    yield os.path.join(disasm_dir, name + ".s")
 
     if a.save:
         for path in extraction_paths():
@@ -345,50 +376,48 @@ def main(argv=None) -> int:
     if a.save:
         with open(a.save, "wb") as f:
             f.write(b)
-    cs_state = {c["program"]: c["state"] for c in lib["compute"]
-                if c["program"] is not None and c["state"] is not None}
     index, written, work = [], 0, []
     for i in selected:
         stages = lib["stage"].get(i)
         st = "+".join(sorted(stages)) if stages else "unused"
         code = program(b, lib, i)
         start, end = code_range(code)
-        meta = {"program": i, "stage": st, "offset": lib["programs"][i][0], "size": len(code),
-                "code": {"start": start, "end": end, "prologue": start == fspx_unpack.PROLOGUE_SIZE}}
-        state = blob(b, lib, cs_state[i]) if i in cs_state else None
-        if state is not None:
-            meta.update(fspx_unpack.decode_kind0(state))
-        name = names[i]
-        entry = {"file": name + ".dxbc", "stage": st, "program": i}
-        digests = sorted(lib["digest"].get(i, ()))
-        meta["digest"] = [d.hex() for d in digests]
-        if sources is not None:
-            found = carved_sources(i)
-            entry["source"] = meta["source"] = sorted({n for n, _ in found})
-            if found:
-                # The source container's signatures and PSV0 describe the stage's D3D12 interface, which the
-                # pipeline build keeps; the translator reads them from <name>.dxbc next to its folder.
-                with open(found[0][1], "rb") as f:
-                    container = f.read()
-                with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
-                    f.write(container)
-        for k in ("threads", "wave32"):
-            if k in meta:
-                entry[k] = meta[k]
-        with open(os.path.join(fspx_dir, name + ".code"), "wb") as f:
-            f.write(code)
-        state_path = os.path.join(fspx_dir, name + ".state")
-        if state is not None:
-            with open(state_path, "wb") as f:   # kind 0 as it is: its SHA-256 is the index's fspx_state_sha256
-                f.write(state)
-        elif os.path.exists(state_path):
-            os.unlink(state_path)   # a program that lost its compute record must not keep an old state key
-        with open(os.path.join(fspx_dir, name + ".json"), "w", encoding="utf-8", newline="\n") as f:
-            json.dump(meta, f, indent=1)
-        if disasm and end:
-            work.append((entry, name, code[start:end], start, end))
-        index.append(entry)
-        written += 1
+        for state, state_id, name in variants[i]:
+            meta = {"program": i, "stage": st, "offset": lib["programs"][i][0], "size": len(code),
+                    "code": {"start": start, "end": end, "prologue": start == fspx_unpack.PROLOGUE_SIZE}}
+            if state is not None:
+                meta.update(fspx_unpack.decode_kind0(state))
+                meta["state_blob"] = state_id
+            entry = {"file": name + ".dxbc", "stage": st, "program": i}
+            digests = sorted(lib["digest"].get(i, ()))
+            meta["digest"] = [d.hex() for d in digests]
+            if sources is not None:
+                found = carved_sources(i)
+                entry["source"] = meta["source"] = sorted({n for n, _ in found})
+                if found:
+                    # The source container's signatures and PSV0 describe the stage's D3D12 interface, which the
+                    # pipeline build keeps; the translator reads them from <name>.dxbc next to its folder.
+                    with open(found[0][1], "rb") as f:
+                        container = f.read()
+                    with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
+                        f.write(container)
+            for k in ("threads", "wave32"):
+                if k in meta:
+                    entry[k] = meta[k]
+            with open(os.path.join(fspx_dir, name + ".code"), "wb") as f:
+                f.write(code)
+            state_path = os.path.join(fspx_dir, name + ".state")
+            if state is not None:
+                with open(state_path, "wb") as f:   # kind 0 as it is: its SHA-256 is the index's fspx_state_sha256
+                    f.write(state)
+            elif os.path.exists(state_path):
+                os.unlink(state_path)   # a program that lost its compute record must not keep an old state key
+            with open(os.path.join(fspx_dir, name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(meta, f, indent=1)
+            if disasm and end:
+                work.append((entry, name, code[start:end], start, end))
+            index.append(entry)
+            written += 1
 
     def one(job):
         entry, name, code, start, end = job
@@ -412,7 +441,7 @@ def main(argv=None) -> int:
         "layout": lib["layout"],
         "graphics": [{"hash": g["hash"], "state": g["state"], "input_layout": g["input_layout"],
                       "stages": named(g["stages"])} for g in lib["graphics"]],
-        "compute": [{"hash": c["hash"], "state": c["state"], "program": names.get(c["program"])}
+        "compute": [{"hash": c["hash"], "state": c["state"], "program": compute_names.get((c["program"], c["state"]), names.get(c["program"]))}
                     for c in lib["compute"]],
     }
     with open(summary_path, "w", encoding="utf-8", newline="\n") as f:

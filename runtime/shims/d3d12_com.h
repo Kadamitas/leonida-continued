@@ -12,6 +12,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -29,11 +30,18 @@
 #include "../src/subgroup_size.h"
 
 namespace leonida {
+struct CopyAddress;
+struct DescriptorHeapMirror;
 class VulkanPresenter;
 struct PresentPlanes;
 }
 
+namespace rt::xmem { struct PhysicalPageAliasRange; }
+
 namespace rt::d3d12 {
+
+// Console fence slot 12 exposes the host-readable value of the same native timeline.
+const std::atomic<std::uint64_t>* fence_completion_address(IUnknown* fence);
 
 // How a queue answers GetClockCalibration. With `calibrated` (vkGetCalibratedTimestampsKHR or its EXT alias, on a
 // device whose time domains include DEVICE and QUERY_PERFORMANCE_COUNTER) both clocks are read in one call. Without
@@ -50,14 +58,39 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out,
                              IUnknown* device = nullptr, const QueueClock& clock = {},
                              std::shared_ptr<void> queue_lease = {});
+HRESULT copy_console_page_mappings(IUnknown* queue, std::span<const xmem::PhysicalPageAliasRange> ranges);
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
                             void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);
+// Records a GPU-ordered marker on an owned, open non-bundle list. Its imported backing stays alive through
+// list Reset/release and queue-held or submitted work. False leaves the recording unchanged.
+bool record_host_marker(ID3D12GraphicsCommandList* list, std::shared_ptr<void> backing,
+                         std::uint64_t address, std::uint32_t value);
+// The timestamp is produced on the GPU at execution, not captured on the CPU while recording.
+bool record_host_timestamp(ID3D12GraphicsCommandList* list, std::shared_ptr<void> backing, std::uint64_t address);
+bool record_address_copy(ID3D12GraphicsCommandList* list, const leonida::CopyAddress& copy, std::shared_ptr<void> backing);
+HRESULT record_console_address_copy(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                    std::uint64_t dst, std::uint64_t src, std::uint64_t bytes);
+// Satisfied-only startup acquire; its console caller restricts the reference to the proved CPU publication range.
+bool record_host_memory_acquire(ID3D12GraphicsCommandList* list, std::shared_ptr<void> backing,
+                                 std::uint64_t address, std::uint64_t reference);
+// Checks ownership and recording state before accepting console graphics state that matches pipeline defaults.
+bool can_record_graphics_state(ID3D12GraphicsCommandList* list);
+// The Vulkan device's bounded console adapter imports coherent caller pages and validates list/device ownership
+// before recording the marker above. No CPU write substitutes for GPU execution.
+HRESULT record_console_marker(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                               std::uint64_t address, std::uint32_t value);
+HRESULT record_console_timestamp(ID3D12Device* device, ID3D12GraphicsCommandList* list, std::uint64_t address);
+HRESULT record_console_memory_acquire(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                       std::uint64_t address, std::uint64_t reference);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
                                  IUnknown* device = nullptr);
 bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride);
+// The console creation adapter calls this before publishing an own dispatch/12-byte signature. The tag is then
+// immutable and limits recording to one group-count record without a count buffer. Foreign signatures refuse it.
+bool tag_console_group_dispatch_signature(ID3D12CommandSignature* signature);
 
 // ID3D12Device1::SetEventOnMultipleFenceCompletion on fences from create_fence: sets `event` once every fence
 // (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL) or any fence (_ANY) has reached its value; a null event blocks until then.
@@ -157,6 +190,9 @@ struct VulkanDeviceInfo {
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
     bool maintenance8 = false;
+    // VK_KHR_maintenance5, enabled where its VK_FORMAT_A8_UNORM_KHR can be sampled and is a colour attachment the GPU
+    // can blend: A8_UNORM render targets are then stored in that format (other A8_UNORM textures stay R8_UNORM).
+    bool a8_render_target = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
@@ -233,6 +269,21 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
                                        D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
                                        REFIID riid, void** out);
 
+// Adopts XMem backing for an owned Vulkan heap. In addition to calling the descriptor APIs, a console
+// title copies descriptor bytes directly from its CPU handles. Those handles must name the actual descriptor bytes.
+bool adopt_console_descriptor_cpu_backing(ID3D12DescriptorHeap* heap, void* backing, std::uint64_t bytes,
+                                          void (*release)(void*, std::uint64_t));
+
+// Console slot 61: the observed basic 27-word sampler description, with native descriptor and sampler creation.
+HRESULT create_console_sampler(ID3D12Device* device, std::span<const std::uint32_t, 27> description,
+                                 D3D12_CPU_DESCRIPTOR_HANDLE destination);
+
+// Console slot 70: a buffer SRV from resource metadata and a title VA, without a resource interface.
+HRESULT create_shader_resource_view_at_address(ID3D12Device* device, const D3D12_RESOURCE_DESC& resource,
+                                               const D3D12_SHADER_RESOURCE_VIEW_DESC& view,
+                                               D3D12_GPU_VIRTUAL_ADDRESS address,
+                                               D3D12_CPU_DESCRIPTOR_HANDLE destination);
+
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 // The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.
@@ -245,9 +296,27 @@ bool device_supports_ray_tracing(ID3D12Device* device);
 // Xbox device slot 133 (the console's CreatePlacedResourceX): a buffer on the caller's own pages at `address`, which
 // becomes its console VA. The pages are imported with VK_EXT_external_memory_host, so what the CPU writes there is
 // what the GPU reads. A buffer description only; E_NOTIMPL on a device that is not the Vulkan layer, without the
-// extension, or for a texture.
+// extension, or for an unsupported texture. Single-row ROW_MAJOR RGBA8 textures use the strict image path
+// below; multirow console textures still need a measured pitch contract and are refused. The extended form
+// preserves the console initial barrier layout and optional clear value. The old helper supplies UNDEFINED.
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
-                                      std::uint32_t layout, REFIID riid, void** out);
+                                      std::uint32_t initial_layout, const D3D12_CLEAR_VALUE* clear,
+                                      REFIID riid, void** out);
+inline HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
+                                             std::uint32_t layout, REFIID riid, void** out) {
+    return create_buffer_at_host_address(device, address, desc, layout, nullptr, riid, out);
+}
+inline HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
+                                             REFIID riid, void** out) {
+    return create_buffer_at_host_address(device, address, desc, UINT32_MAX, nullptr, riid, out);
+}
+// Explicit CPU layout, not a declaration of a console export. The caller owns and fences this committed span
+// through final Release. Only single-mip/slice ROW_MAJOR RGBA8 textures without GPU-write flags are supported.
+// Import succeeds only when Vulkan's linear image offset is zero and row pitch exactly matches row_pitch.
+// A zero pitch is permitted only for Height==1, where there is no inter-row layout to infer. No staging fallback.
+HRESULT create_readonly_texture_at_host_address(ID3D12Device* device, void* address, std::size_t accessible_bytes,
+                                                 std::uint64_t row_pitch, const D3D12_RESOURCE_DESC& desc,
+                                                 REFIID riid, void** out);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 
@@ -393,6 +462,7 @@ struct RootArgumentLayout {
         std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
+        std::vector<rt::rootsig::DescriptorRange> ranges;
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
@@ -412,6 +482,8 @@ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12Pi
 // device identity pointer, or nullptr when `heap` is null or belongs to another implementation.
 IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP_DESC& desc,
                                D3D12_GPU_VIRTUAL_ADDRESS& gpu_base);
+
+const leonida::DescriptorHeapMirror* descriptor_heap_mirror(ID3D12DescriptorHeap* heap);
 
 // Reads the shader-visible descriptor heap GPU base addresses currently bound on `list` (0 when unbound).
 // Returns false when `list` is not one of this module's command lists.

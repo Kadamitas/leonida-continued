@@ -322,6 +322,28 @@ UnimplementedPolicy unimplemented_policy() {
 
 void set_unimplemented_policy(UnimplementedPolicy p) { g_policy.store(static_cast<int>(p)); }
 
+void unimplemented_proxy_effect(const char* kind, unsigned slot, uint64_t caller,
+                                 uint64_t rcx, uint64_t rdx, uint64_t r8, uint64_t r9) {
+    if (unimplemented_policy() != UnimplementedPolicy::Stop) return;
+    startup_trace::event("unimplemented_proxy_call", "\"object_kind\":" + startup_trace::quote(kind) +
+        ",\"slot\":" + std::to_string(slot) + ",\"caller\":" + startup_trace::quote(module_offset(caller)) +
+        ",\"rcx\":" + startup_trace::quote(startup_trace::hex(rcx)) +
+        ",\"rdx\":" + startup_trace::quote(startup_trace::hex(rdx)) +
+        ",\"r8\":" + startup_trace::quote(startup_trace::hex(r8)) +
+        ",\"r9\":" + startup_trace::quote(startup_trace::hex(r9)));
+    std::fprintf(stderr, "[rt] STOP: unimplemented proxy %s slot %u\n[rt]   caller   %s\n"
+                         "[rt]   rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx\n"
+                         "[rt]   effect/return contract unknown; terminating with exit code %d\n",
+        kind, slot, describe_address(caller).c_str(), static_cast<unsigned long long>(rcx),
+        static_cast<unsigned long long>(rdx), static_cast<unsigned long long>(r8),
+        static_cast<unsigned long long>(r9), kStopExitCode);
+    std::fflush(stderr);
+    if (IsDebuggerPresent()) __debugbreak();
+    // There is no safe guessed return class after continuing a debugger at an unmodelled effect.
+    TerminateProcess(GetCurrentProcess(), kStopExitCode);
+    ExitProcess(kStopExitCode);
+}
+
 ReturnClass classify_import(const std::string& dll, const std::string& name) { return classify(lower_ascii(dll), name); }
 
 void set_unimplemented_test_hook(TestHook hook) { g_test_hook.store(hook); }
@@ -390,6 +412,11 @@ struct BundledLoaderEntry {
     const BundledModuleOps* ops;
 };
 
+struct XMemHooksEntry {
+    const void* owner;
+    const XMemAllocationHooks* hooks;
+};
+
 // Immortal: late mapped-DLL detach or atexit handlers may call GetProcAddress/FreeLibrary during process teardown.
 std::mutex& bundled_loader_mutex() {
     static auto* m = new std::mutex;
@@ -398,6 +425,16 @@ std::mutex& bundled_loader_mutex() {
 
 std::vector<BundledLoaderEntry>& bundled_loaders() {
     static auto* v = new std::vector<BundledLoaderEntry>;
+    return *v;
+}
+
+std::mutex& xmem_hooks_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<XMemHooksEntry>& xmem_hooks_entries() {
+    static auto* v = new std::vector<XMemHooksEntry>;
     return *v;
 }
 
@@ -481,6 +518,30 @@ bool owns_bundled_module_handle(void* module) {
     for (const auto& entry : snapshot_bundled_loaders())
         if (entry.ops->owns_handle(entry.ctx, module)) return true;
     return false;
+}
+
+void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks) {
+    if (!owner || !hooks) return;
+    std::lock_guard lock(xmem_hooks_mutex());
+    xmem_hooks_entries().push_back({owner, hooks});
+}
+
+void remove_xmem_allocation_hooks(const void* owner) {
+    std::lock_guard lock(xmem_hooks_mutex());
+    auto& list = xmem_hooks_entries();
+    for (auto it = list.begin(); it != list.end();) {
+        if (it->owner == owner) {
+            it = list.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+const XMemAllocationHooks* xmem_allocation_hooks() {
+    std::lock_guard lock(xmem_hooks_mutex());
+    const auto& list = xmem_hooks_entries();
+    return list.empty() ? nullptr : list.back().hooks;
 }
 
 Table::Table(const Entry* entries, size_t count) {

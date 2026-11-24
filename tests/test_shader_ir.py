@@ -303,6 +303,10 @@ class ParseFileTests(unittest.TestCase):
         self.assertEqual([i["pc"] for i in info["insns"]], [0x100, 0x102, 0x104])
         self.assertEqual(info["invalid"], 1)
 
+    def test_python_listing_keeps_invalid_word_count_without_llvm_messages(self):
+        path = self.write("; sample code 0x0..0x8 (fspx), gfx1013, 2 invalid words\n")
+        self.assertEqual(shader_ir.parse_file(path)["invalid"], 2)
+
     def test_tab_between_mnemonic_and_operands(self):
         path = self.write(
             "; sample code 0x0..0x4 (header)\n"

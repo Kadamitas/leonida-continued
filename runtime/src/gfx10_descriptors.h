@@ -32,6 +32,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <span>
 
 namespace leonida::gfx10 {
 
@@ -146,6 +147,10 @@ inline ImageWords encode(const Image& image) {
 // TYPE names an image, so these eight dwords are a T# and not a V# followed by something else.
 inline constexpr bool is_image(const ImageWords& words) { return detail::get(words[3], 28, 4) >= 8; }
 
+inline constexpr std::uint64_t image_base_address(const ImageWords& words) {
+    return ((std::uint64_t(detail::get(words[1], 0, 8)) << 32) | words[0]) << 8;
+}
+
 inline constexpr float image_min_lod(const ImageWords& words) {
     return float(detail::get(words[1], 8, 12)) / 256.0f;
 }
@@ -157,7 +162,7 @@ inline bool decode(const ImageWords& words, Image& out) {
     if (!is_image(words)) return false;
     Image image{};
     image.type = ImageType(get(words[3], 28, 4));
-    image.address = ((std::uint64_t(get(words[1], 0, 8)) << 32) | words[0]) << 8;
+    image.address = image_base_address(words);
     image.min_lod = image_min_lod(words);
     image.format = get(words[1], 20, 9);
     image.width = (get(words[1], 30, 2) | (get(words[2], 0, 12) << 2)) + 1;
@@ -218,6 +223,7 @@ struct FormatRow {
 };
 
 inline constexpr Swizzle channels_r{select_x, select_zero, select_zero, select_one};
+inline constexpr Swizzle channels_a{select_zero, select_zero, select_zero, select_x};
 inline constexpr Swizzle channels_rg{select_x, select_y, select_zero, select_one};
 inline constexpr Swizzle channels_rgb{select_x, select_y, select_z, select_one};
 inline constexpr Swizzle channels_rgba = identity_swizzle;
@@ -227,6 +233,10 @@ inline constexpr Swizzle channels_abgr{select_w, select_z, select_y, select_x};
 
 inline constexpr FormatRow format_table[] = {
     {1, VK_FORMAT_R8_UNORM, channels_r},                          // GFX10_FORMAT_8_UNORM
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    // An A8 render target's image (VulkanDeviceInfo::a8_render_target): the T# names its one channel X.
+    {1, VK_FORMAT_A8_UNORM_KHR, channels_a},                      // GFX10_FORMAT_8_UNORM
+#endif
     {2, VK_FORMAT_R8_SNORM, channels_r},                          // GFX10_FORMAT_8_SNORM
     {3, VK_FORMAT_R8_USCALED, channels_r},                        // GFX10_FORMAT_8_USCALED
     {4, VK_FORMAT_R8_SSCALED, channels_r},                        // GFX10_FORMAT_8_SSCALED
@@ -325,7 +335,54 @@ inline constexpr FormatRow format_table[] = {
 // The format of the console's separate stencil surface: what a T# of a depth-stencil texture's stencil plane names.
 inline constexpr std::uint32_t stencil_format = 5;  // GFX10_FORMAT_8_UINT
 
+// The table indexed both ways, built at compile time, so the lookups below cost one load instead of a scan of
+// the table (they run for every view a descriptor names: CreateShaderResourceView, the T# -> set 0 binding).
+// Each keeps the scan's answer: the first row in table order. Codes are 9 bits (T# word 1 bits 28:20); the
+// Vulkan formats of the core range are below 256, and the few above it (VK_EXT_4444_formats) fall back to the scan.
+namespace detail {
+inline constexpr std::uint8_t no_row = 0xFF;
+inline constexpr std::uint32_t code_count = 512, dense_vulkan_formats = 256;
+static_assert(std::size(format_table) < no_row, "a row index must fit in a byte");
+
+struct FormatIndex {
+    std::array<std::uint8_t, dense_vulkan_formats> by_vulkan{};  // first row of a format
+    std::array<std::uint8_t, code_count> first{};                // first row of a code
+    std::array<std::uint8_t, code_count> count{};                // rows of the code, all adjacent to `first`
+};
+
+inline constexpr FormatIndex build_format_index() {
+    FormatIndex index{};
+    index.by_vulkan.fill(no_row);
+    index.first.fill(no_row);
+    for (std::size_t i = 0; i < std::size(format_table); ++i) {
+        const FormatRow& row = format_table[i];
+        if (std::uint32_t(row.vulkan) < dense_vulkan_formats && index.by_vulkan[row.vulkan] == no_row)
+            index.by_vulkan[row.vulkan] = std::uint8_t(i);
+        if (index.first[row.gfx10] == no_row) index.first[row.gfx10] = std::uint8_t(i);
+        ++index.count[row.gfx10];
+    }
+    return index;
+}
+inline constexpr FormatIndex format_index = build_format_index();
+
+// The rows of one code are adjacent, so [first, first + count) is every row of the code, in table order.
+inline constexpr bool codes_adjacent() {
+    for (std::size_t i = 0; i < std::size(format_table); ++i) {
+        const std::uint32_t code = format_table[i].gfx10;
+        if (code >= code_count) return false;
+        if (i < format_index.first[code] || i >= std::size_t(format_index.first[code]) + format_index.count[code])
+            return false;
+    }
+    return true;
+}
+static_assert(codes_adjacent(), "keep the rows of a GFX10 code together in format_table");
+} // namespace detail
+
 inline constexpr const FormatRow* format_row(VkFormat format) {
+    if (std::uint32_t(format) < detail::dense_vulkan_formats) {
+        const std::uint8_t i = detail::format_index.by_vulkan[std::uint32_t(format)];
+        return i == detail::no_row ? nullptr : &format_table[i];
+    }
     for (const FormatRow& row : format_table)
         if (row.vulkan == format) return &row;
     return nullptr;
@@ -334,9 +391,9 @@ inline constexpr const FormatRow* format_row(VkFormat format) {
 // The Vulkan format with the code's bits, in the hardware's channel order where Vulkan has such a format.
 // VK_FORMAT_UNDEFINED: not in the table. A code that depth and colour formats share gives the colour format.
 inline constexpr VkFormat vulkan_format(std::uint32_t gfx10_format) {
-    for (const FormatRow& row : format_table)
-        if (row.gfx10 == gfx10_format) return row.vulkan;
-    return VK_FORMAT_UNDEFINED;
+    if (gfx10_format >= detail::code_count) return VK_FORMAT_UNDEFINED;
+    const std::uint8_t i = detail::format_index.first[gfx10_format];
+    return i == detail::no_row ? VK_FORMAT_UNDEFINED : format_table[i].vulkan;
 }
 
 // 0 (GFX10_FORMAT_INVALID): not in the table.
@@ -380,8 +437,12 @@ inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_
     if (image->gfx10 == gfx10_format) return image_format;
     if (is_depth_stencil_format(image_format)) return VK_FORMAT_UNDEFINED;
     const FormatRow* fallback = nullptr;
-    for (const FormatRow& row : format_table) {
-        if (row.gfx10 != gfx10_format || is_depth_stencil_format(row.vulkan)) continue;
+    if (gfx10_format >= detail::code_count) return VK_FORMAT_UNDEFINED;
+    const std::size_t first = detail::format_index.first[gfx10_format];
+    const std::size_t end = first + detail::format_index.count[gfx10_format];
+    for (std::size_t i = first; i < end; ++i) {  // empty for a code not in the table
+        const FormatRow& row = format_table[i];
+        if (is_depth_stencil_format(row.vulkan)) continue;
         if (row.channels == image->channels) return row.vulkan;
         if (!fallback) fallback = &row;
     }
@@ -433,6 +494,12 @@ enum class MipFilter : std::uint32_t {  // SQ_TEX_MIP_FILTER
     linear = 2,
 };
 
+enum class VolumeFilter : std::uint32_t {  // SQ_TEX_Z_FILTER
+    inherit_xy = 0,
+    point = 1,
+    linear = 2,
+};
+
 enum class CompareFunction : std::uint32_t {  // SQ_TEX_DEPTH_COMPARE; the same values as VkCompareOp
     never = 0,
     less = 1,
@@ -465,6 +532,7 @@ struct Sampler {
     Filter mag_filter = Filter::point;
     Filter min_filter = Filter::point;
     MipFilter mip_filter = MipFilter::none;
+    VolumeFilter volume_filter = VolumeFilter::inherit_xy;
     std::uint32_t max_anisotropy = 1;
     CompareFunction compare = CompareFunction::never;  // never: not a comparison sampler, as radv writes it
     float min_lod = 0.0f;                              // 0..15 in steps of 1/256
@@ -497,7 +565,7 @@ inline constexpr std::uint32_t kCompareNever = 1u << 12;
 //          DEPTH_COMPARE_FUNC [14:12], FORCE_UNNORMALIZED [15], FILTER_MODE [30:29]
 //   WORD1  MIN_LOD [11:0], MAX_LOD [23:12]                       (4.8 fixed, clamped to 0..15)
 //   WORD2  LOD_BIAS [13:0] (signed 5.8 fixed, clamped to -32..31), XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22],
-//          MIP_FILTER [27:26]
+//          Z_FILTER [25:24], MIP_FILTER [27:26]
 //   WORD3  BORDER_COLOR_PTR [11:0], BORDER_COLOR_TYPE [31:30]
 // Mesa also sets tuning fields from the anisotropy (ANISO_THRESHOLD, ANISO_BIAS, PERF_MIP, ANISO_OVERRIDE) and
 // TRUNC_COORD for point filters. They are not written here, and decode() ignores them.
@@ -514,7 +582,7 @@ inline SamplerWords encode(const Sampler& sampler) {
                field(detail::unsigned_fixed(sampler.max_lod, 0, 15), 12, 12);
     words[2] = field(detail::signed_fixed(sampler.lod_bias, -32, 31), 0, 14) |
                field(std::uint32_t(sampler.mag_filter), 20, 2) | field(std::uint32_t(sampler.min_filter), 22, 2) |
-               field(std::uint32_t(sampler.mip_filter), 26, 2);
+               field(std::uint32_t(sampler.volume_filter), 24, 2) | field(std::uint32_t(sampler.mip_filter), 26, 2);
     const bool marked = sampler.integer_border && sampler.border_color != BorderColor::table;
     words[3] = field(marked ? kIntegerBorderPtr : sampler.border_color_index, 0, 12) |
                field(std::uint32_t(sampler.border_color), 30, 2);
@@ -543,6 +611,7 @@ inline Sampler decode(const SamplerWords& words) {
     sampler.lod_bias = float(std::int32_t(bias ^ 0x2000u) - 0x2000) / 256.0f;  // sign-extend 14 bits
     sampler.mag_filter = Filter(get(words[2], 20, 2));
     sampler.min_filter = Filter(get(words[2], 22, 2));
+    sampler.volume_filter = VolumeFilter(get(words[2], 24, 2));
     sampler.mip_filter = MipFilter(get(words[2], 26, 2));
     sampler.border_color_index = get(words[3], 0, 12);
     sampler.border_color = BorderColor(get(words[3], 30, 2));
@@ -689,6 +758,27 @@ inline BufferWords encode(const Buffer& buffer) {
                field(buffer.swizzle[3], 9, 3) | field(buffer.format, 12, 7) |
                field(std::uint32_t(buffer.oob_select), 28, 2);
     return words;
+}
+
+inline BufferWords constant_buffer_words(std::uint64_t address, std::uint32_t bytes) {
+    Buffer buffer{};
+    buffer.address = address;
+    buffer.num_records = bytes;
+    buffer.format = format_from_vulkan(VK_FORMAT_R32_UINT);
+    buffer.oob_select = OobSelect::raw;
+    return encode(buffer);
+}
+
+// For shaders whose only access to this CBV is a complete, indexed float4 row. Raw SRVs
+// can have the same encoding, so the caller must establish the binding type before using this.
+inline bool stage_indexed_cbv(BufferWords& words, const Buffer& view, std::span<const std::uint8_t> padding) {
+    if (!view.num_records || view.num_records > 65536 || view.num_records % 16 || padding.size() != 16 ||
+        words != constant_buffer_words(view.address, view.num_records) ||
+        std::any_of(padding.begin(), padding.end(), [](std::uint8_t byte) { return byte != 0; })) return false;
+    words[1] |= 16u << 16;
+    words[2] /= 16;
+    words[3] &= ~0x30000000u;  // bounds-check a full row against its record count and stride
+    return true;
 }
 
 // False when TYPE is not a buffer's (an image's TYPE has its top bit set) or a DST_SEL is reserved.

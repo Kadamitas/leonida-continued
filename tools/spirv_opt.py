@@ -967,15 +967,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 insts = [e for i, e in enumerate(insts) if i not in dead_stores]
                 changed = True
 
-        # 4. Backward pure Dead-Code Elimination (DCE) + dead Function-scope OpVariable removal.
-        use_count: dict[str, int] = {}
-        for _res, op, args, _ in insts:
-            if op is None or not args:
-                continue
-            for tok in args:
-                if tok.startswith("%"):
-                    use_count[tok] = use_count.get(tok, 0) + 1
-
+        # 4. Trace the operands of instructions that must execute, including loop-carried phi inputs.
         def is_pure_dce_candidate(res: str, op: str, args: list[str]) -> bool:
             if op in _PURE_OPS or op == "OpPhi":
                 return True
@@ -989,20 +981,25 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 return True
             return False
 
-        dce_dead: set[int] = set()
-        for idx in range(len(insts) - 1, -1, -1):
-            res, op, args, _ = insts[idx]
-            if res is None or op is None:
+        candidates: dict[str, list[str]] = {}
+        roots: set[str] = set()
+        for res, op, args, _ in insts:
+            if op is None:
                 continue
-            if use_count.get(res, 0) == 0 and is_pure_dce_candidate(res, op, args):
-                dce_dead.add(idx)
-                deleted_ids.add(res)
-                for tok in args:
-                    if tok.startswith("%"):
-                        use_count[tok] = use_count.get(tok, 0) - 1
+            if res is not None and is_pure_dce_candidate(res, op, args):
+                candidates[res] = args
+            else:
+                roots.update(args)
 
-        if dce_dead:
-            insts = [e for i, e in enumerate(insts) if i not in dce_dead]
+        # Removing an ID from candidates marks it live before following its operands. An unused
+        # phi and its backedge value can refer to one another without either being live.
+        work = list(roots.intersection(candidates))
+        while work:
+            args = candidates.pop(work.pop(), ())
+            work.extend(arg for arg in args if arg in candidates)
+        if candidates:
+            deleted_ids.update(candidates)
+            insts = [entry for entry in insts if entry[0] not in candidates]
             changed = True
 
         if not changed:

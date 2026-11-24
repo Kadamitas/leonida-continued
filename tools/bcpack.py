@@ -16,6 +16,7 @@ provisional entries and inspect which ones were used.
 
 See `docs/textures.md` for the bitstream specification and provenance.
 """
+import functools
 import os
 import struct
 import sys
@@ -282,7 +283,9 @@ def _decode_lanes_raw(raw, widths, nsym):
                     elif out_rem[i] == 0 and not nxt:
                         done[i] = True
                     elif st == L:
-                        fail("fragment did not end at its home state", i)
+                        # A non-final fragment that ran out of bytes at the home state with symbols still owed:
+                        # st == L neither decodes nor reads the next header, so the lane could never move again.
+                        fail("fragment ended at its home state with symbols still to decode", i)
                 elif st == L or (out_rem[i] == 0 and not nxt and st > L):
                     fail("fragment did not end at its home state", i)
 
@@ -310,13 +313,57 @@ def _decode_lanes_raw(raw, widths, nsym):
 _NATIVE = []
 
 
+@functools.lru_cache(maxsize=1)
+def _runtime_decoder(path):
+    import ctypes
+    # On Windows a path beginning with a single slash can depend on the current drive.
+    if not os.path.isabs(path) or (os.name == "nt" and not os.path.splitdrive(path)[0]):
+        return None
+    try:
+        fn = ctypes.CDLL(path).leonida_bcpack_decode_strict_v1
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def _decode_blocks_runtime(raw, codec, out_size, path):
+    """The runtime's strict C ABI returns bytes on success. Python supplies the usual errors on refusal."""
+    # Match ttpf_mips.MAX_OUTPUT. The reference can reject a malformed header before allocating
+    # the declared result. Leave very high expansion ratios to that path as well.
+    if (type(codec) is not int or type(out_size) is not int or
+            not 0 < out_size <= 256 * 1024 * 1024 or out_size % BLOCK_BYTES[codec]):
+        return None
+    fn = _runtime_decoder(path)
+    if fn is None:
+        return None
+    import ctypes
+    if isinstance(raw, memoryview) and raw.format == "B" and raw.ndim == 1 and raw.c_contiguous:
+        if type(raw.obj) is bytes and raw.nbytes == len(raw.obj):
+            raw = raw.obj
+        else:
+            raw = bytes(raw)
+    elif type(raw) is bytearray:
+        raw = bytes(raw)  # a snapshot while ctypes releases the GIL
+    elif type(raw) is not bytes:
+        return None
+    if len(raw) < 2 * len(LANE_WIDTHS[codec]) or out_size > 64 * len(raw):
+        return None
+    try:
+        out = ctypes.create_string_buffer(out_size)
+    except (MemoryError, OverflowError):
+        return None
+    return out.raw if fn(raw, len(raw), codec, out, out_size) == 0 else None
+
+
 def _native_unpack():
     """`(unpack_model, tables)` of the optional Rust lane decoder, or None.
 
     `tools/bcpack_calibration` (built with Cargo, see its README.md) exports
     `unpack_model`, a port of `_decode_lanes_raw` that is fed this module's
     probability tables, so it accepts the same streams and gives the same
-    symbols. Set `LEONIDA_BCPACK_NATIVE=0` to use Python only.
+    symbols. Start Python with `LEONIDA_BCPACK_NATIVE=0` to use the reference decoder.
     """
     if not _NATIVE:
         found = None
@@ -1464,12 +1511,20 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
     built-in history reference raises `BcpackProvisionalError` and the returned
     set is always empty. `history` may point to a locally generated JSON file,
     directory, or dict supplying initial history tables for BC6H/BC7 (and
-    optional overrides for BC1-BC5).
+    optional overrides for BC1-BC5). Set `LEONIDA_BCPACK_LIBRARY` to the absolute
+    path of the runtime's shared BCPack library to use it for strict built-in
+    history. Start Python with `LEONIDA_BCPACK_NATIVE=0` to use the reference decoder.
     """
     rebuilder = _REBUILDERS.get(codec)
     if rebuilder is None:
         name = CODEC_NAMES.get(codec, str(codec))
         raise BcpackUnsupportedCodec(f"BCPack block rebuilder for codec {codec} ({name}) is not implemented yet")
+    if history is None and not allow_provisional and os.environ.get("LEONIDA_BCPACK_NATIVE") != "0":
+        path = os.environ.get("LEONIDA_BCPACK_LIBRARY")
+        if path:
+            fast = _decode_blocks_runtime(raw, codec, out_size, path)
+            if fast is not None:
+                return fast, set()
     fast = _decode_blocks_native(raw, codec, out_size, history)
     if fast is not None:
         return fast, set()

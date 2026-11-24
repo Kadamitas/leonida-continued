@@ -10,6 +10,7 @@
 #include <array>
 #include <utility>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <memory>
@@ -372,6 +373,16 @@ struct ResolveSubresource {
     std::optional<ResolveRegion> region = std::nullopt;
 };
 
+// A table set through an owned shader-visible view heap. These are locations and bounds only: descriptor bytes
+// remain application-owned and are read, if needed, at execution. The list's existing heap pins retain the owner.
+struct DescriptorTableBinding {
+    std::uint64_t gpu_va = 0;
+    std::uintptr_t cpu_address = 0;
+    std::uint64_t remaining_bytes = 0;
+    std::uint32_t dword = 0;
+};
+using DescriptorTableBindings = std::vector<DescriptorTableBinding>;
+
 // Dispatch, with what it uses captured when it is recorded: the pipeline (an opaque id the replay resolves) and
 // the 32 user-data dwords the root arguments produced (s0..s31 of the translated shader, section 3.5).
 struct Dispatch {
@@ -380,6 +391,7 @@ struct Dispatch {
     std::uint32_t x;
     std::uint32_t y;
     std::uint32_t z;
+    std::shared_ptr<const DescriptorTableBindings> descriptor_tables;
 };
 
 // D3D12_VIEWPORT.
@@ -450,6 +462,7 @@ struct Draw {
     std::uint32_t first_instance = 0;
     bool mesh = false;
     std::shared_ptr<const DrawViewports> viewports;  // non-null when >1 viewport or >1 scissor was bound
+    std::shared_ptr<const DescriptorTableBindings> descriptor_tables;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -493,6 +506,26 @@ struct WriteImmediate {
     std::uint64_t address;
     std::uint32_t value;
     std::uint32_t mode;
+};
+
+// A physical console texture can be the source of a raw byte copy. Snapshot its stored tiled bytes
+// at submission. A null callback denotes an ordinary GPU-addressed buffer source.
+struct CopyAddress {
+    std::uint64_t dst, src, bytes;
+    bool (*snapshot)(std::uint64_t, std::span<std::byte>);
+};
+
+// A real bottom-of-pipe GPU timestamp resolved as one UINT64 at a GPU virtual address. Replay allocates its
+// query pool for each execution, so recording or submitting the same list on different queues cannot reuse it.
+struct WriteTimestamp {
+    std::uint64_t address;
+};
+
+// An observed startup CPU-generation acquire, not a general memory wait. Preflight must freshly prove the
+// predicate; the console adapter restricts it to a reference that known later CPU publications cannot invalidate.
+struct HostMemoryAcquire {
+    std::uint64_t address;
+    std::uint64_t reference;
 };
 
 // D3D12_SUBRESOURCE_RANGE_UINT64 of a dependent resource: [begin, end) in bytes of one subresource
@@ -597,6 +630,7 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
+    dispatch_mesh = 10,
 };
 
 struct ExecuteIndirect {
@@ -612,6 +646,12 @@ struct ExecuteIndirect {
     // as it is.
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
+    // Graphics indirect commands capture the list's immutable state, as a direct Draw/DispatchMesh does.
+    Draw draw_state{};
+    // Explicit low-level replay-test escape hatch: the caller owns rendering and all graphics bindings.
+    // Production COM recording never sets this, including when its graphics state is incomplete.
+    bool raw_draw = false;
+    std::shared_ptr<const DescriptorTableBindings> descriptor_tables;  // compute dispatches only
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
@@ -664,12 +704,35 @@ struct AccelerationStructurePostbuild {
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
+                             WriteImmediate, WriteTimestamp, HostMemoryAcquire, CopyAddress, AtomicCopyBuffer, BeginQuery, EndQuery,
+                             ResolveQueries, DebugMarker,
                              ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
                              AccelerationStructurePostbuild>;
 
+// A hook can place CPU descriptor handles outside the coherent GPU arena. The heap and both
+// allocations are retained by the recording list and by the submission's COM pins.
+struct DescriptorHeapMirror {
+    const void* title = nullptr;
+    void* arena = nullptr;
+    std::size_t bytes = 0;
+};
+
 class CommandList {
 public:
+    bool use_descriptor_heap(const DescriptorHeapMirror* heap) {
+        if (closed_) return false;
+        if (!heap || std::find(descriptor_heaps_.begin(), descriptor_heaps_.end(), heap) != descriptor_heaps_.end())
+            return true;
+        try {
+            descriptor_heaps_.push_back(heap);
+            return true;
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+    }
+
+    std::span<const DescriptorHeapMirror* const> descriptor_heaps() const { return descriptor_heaps_; }
+
     // D3D12 split barriers: the begin half only marks the resource unusable until the end half, so the transition
     // is recorded once, at the end. A full barrier (flags 0) is recorded where it is issued.
     bool transition(const TransitionBarrier& barrier, std::uint32_t flags = 0) {
@@ -798,6 +861,23 @@ public:
         return append(write);
     }
 
+    bool write_timestamp(std::uint64_t address) {
+        if (!address || address % 8 || address > UINT64_MAX - 7) return false;
+        return append(WriteTimestamp{address});
+    }
+
+    bool copy_address(const CopyAddress& copy) {
+        if (!copy.dst || !copy.src || !copy.bytes || ((copy.dst | copy.src | copy.bytes) & 3) ||
+            copy.dst > UINT64_MAX - copy.bytes || copy.src > UINT64_MAX - copy.bytes ||
+            (copy.dst < copy.src + copy.bytes && copy.src < copy.dst + copy.bytes)) return false;
+        return append(copy);
+    }
+
+    bool host_memory_acquire(std::uint64_t address, std::uint64_t reference) {
+        if (!address || address % 8 || address > UINT64_MAX - 7) return false;
+        return append(HostMemoryAcquire{address, reference});
+    }
+
     // AtomicCopyBufferUINT/UINT64: both offsets aligned to the copy's size and each dependency on a named resource with
     // a non-empty, non-inverted range (zero dependencies is accepted by the Windows 11 WARP and RTX 5090 D3D12
     // runtimes). A copy of a value onto itself (vkCmdCopyBuffer forbids the overlap) is refused too.
@@ -914,6 +994,7 @@ public:
     bool reset() {
         if (!closed_) return false;
         commands_.clear();
+        descriptor_heaps_.clear();
         active_.clear();
         closed_ = false;
         return true;
@@ -957,8 +1038,35 @@ private:
     }
 
     std::vector<Command> commands_;
+    std::vector<const DescriptorHeapMirror*> descriptor_heaps_;
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
     bool closed_ = false;
 };
+
+// The caller holds the device-wide submission tracker through vkQueueSubmit. Compare against
+// the arena itself so direct CPU edits, including A -> B -> A, need no second full-heap shadow.
+// An unchanged or unbound heap never waits for previous work.
+template<typename Wait>
+bool refresh_descriptor_heaps(std::span<const CommandList* const> lists,
+                              std::vector<const DescriptorHeapMirror*>& bound, Wait wait) {
+    bound.clear();
+    try {
+        for (const auto* list : lists)
+            for (const auto* heap : list->descriptor_heaps())
+                if (std::find(bound.begin(), bound.end(), heap) == bound.end()) bound.push_back(heap);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    bool retired = false;
+    for (const auto* heap : bound) {
+        if (std::memcmp(heap->title, heap->arena, heap->bytes) == 0) continue;
+        if (!retired) {
+            if (!wait()) return false;
+            retired = true;
+        }
+        std::memcpy(heap->arena, heap->title, heap->bytes);
+    }
+    return true;
+}
 
 } // namespace leonida

@@ -19,6 +19,7 @@ SCRIPT = ROOT / "scripts" / "first_look.ps1"
 PE_INSPECT_STUB = (
     "from pathlib import Path\n"
     "import sys\n"
+    "if '--runtime-sidecars' in sys.argv: sys.exit(0)\n"
     "report = Path(sys.argv[-1]) / (Path(sys.argv[1]).name + '.json')\n"
     "report.write_text('{\"imports\":[],\"sections\":[]}', encoding='utf-8', newline='\\n')\n"
 )

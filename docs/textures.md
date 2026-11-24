@@ -894,6 +894,11 @@ Byte-to-lane interleaving is fixed by a deterministic per-cycle scheduler:
 6. Once every active lane has a symbol in its output slot, one synchronized element is
    emitted and all slots clear.
 
+A non-final fragment with no input bytes left, state exactly `RANS_L`, and symbols still owed cannot advance:
+it can neither decode a symbol nor read the next fragment header. The Python decoder rejects this malformed state
+instead of looping forever ([#7230](https://github.com/ItsNotRexed/Leonida/pull/7230)). The synthetic timeout regression
+in `tests/test_bcpack.py` checks both the lane decoder and the public block decoder on this case.
+
 ### 3. Per-codec lane layouts and block rebuilders
 
 | Codec | Format | Lanes | Default lane widths | Elements / block | Block rebuilder |

@@ -33,6 +33,16 @@ constexpr uint16_t kMaxQueueCapacity = 0x2000;  // DSTORAGE_MAX_QUEUE_CAPACITY (
 constexpr size_t kRequestMaxName = 64;          // DSTORAGE_REQUEST_MAX_NAME (PC value)
 constexpr uint64_t kMaxRequestBytes = 1ull << 30;           // DSTORAGE_MAX_REQUEST_SIZE: source + destination
 constexpr uint32_t kMax4kPageDestinationSize = 32u << 20;  // DSTORAGE_MAX_4K_PAGE_DESTINATION_SIZE
+// This CPU shim's explicit staging limit, not an Xbox ABI constant. The zlib
+// output before BCPack must fit it even for a physical-page destination.
+constexpr uint32_t kMaxBcpackIntermediateSize = 32u << 20;
+
+#ifdef LEONIDA_DSTORAGE_TEST_HOOKS
+namespace test {
+enum class AllocationStage : uint32_t { source = 1, inflate = 2, bcpack = 3, physical_page_array = 4, source_page_array = 5 };
+void fail_next_allocation(AllocationStage stage, bool length_error = false);
+}  // namespace test
+#endif
 
 enum DSTORAGE_PRIORITY : int8_t {
     DSTORAGE_PRIORITY_LOW = -1,

@@ -25,7 +25,7 @@ enum class DsTriggerMode { Off, Rumble, Resistance };
 
 // The keyboard pad: one extra virtual gamepad driven by the keyboard. Focused reads keys only while a window of this
 // process is in the foreground; Always reads them whatever has focus (console tools such as gameinput_probe).
-enum class KeyboardPadMode { Off, Focused, Always };
+enum class KeyboardPadMode { Off, Focused, Always, Isolated };
 
 struct Config {
     // LEONIDA_PROMPTS=auto|xbox|playstation|ps5|ps4|ps3|nintendo|keyboard: a family that active_input() reports

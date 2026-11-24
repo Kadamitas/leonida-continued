@@ -11,7 +11,7 @@
 //   dimension: 0 = 2D, 1 = 2D array, 2 = 3D, 3 = 1D (the translator's STORE_DIMS); class: 0 = float, 1 = uint, 2 = sint.
 //   bindings 20/21: sampled multisample 2D images / 2D arrays, 256 each (runtime SRVs).
 //   bindings 22/23 and 24/25 are their UINT and SINT equivalents on devices supporting those classes.
-// These are the default counts (BindlessFeatures::counts). size_bindings() sizes the 2D, sampler and storage arrays
+// These are the default counts (BindlessFeatures::counts). size_bindings() grows image, sampler and storage arrays
 // from the device's limits instead; the shaders declare runtime arrays, so any count works for them.
 //
 // A shader turns a T# or S# into an index through the hash table (descriptor_table.h) and uses that index in
@@ -51,7 +51,6 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
-#include <unordered_map>
 #include <vector>
 
 namespace leonida {
@@ -195,9 +194,10 @@ struct SetLayout {
     SetLayout& operator=(const SetLayout&) = delete;
 };
 
-// What size_bindings() grows to where the device's limits allow. At 32-64 bytes a descriptor the whole set is then
-// 3-6 MiB (93793 descriptors on an RTX 5070).
+// What size_bindings() grows to where the device's limits allow.
 inline constexpr std::uint32_t max_2d_images = 65536;
+inline constexpr std::uint32_t max_2d_array_images = 8192;
+inline constexpr std::uint32_t max_3d_images = 2048;
 inline constexpr std::uint32_t max_storage_indices = 4096;  // in each storage array, at most its dimension's images
 // A full D3D12 shader-visible sampler heap (2048) and room for literal and static S#s, within what the device can
 // create (maxSamplerAllocationCount, at least 4000) less the samplers that are not in the set.
@@ -206,7 +206,7 @@ inline constexpr std::uint32_t reserved_samplers = 64;
 // Growth leaves this many descriptors of each limit to the other sets of a pipeline layout.
 inline constexpr std::uint32_t growth_headroom = 64;
 
-// Sizes the 2D image, sampler and storage arrays from the device's limits: the update-after-bind ones with
+// Sizes the 2D, 2D-array, 3D, sampler and storage bindings from the device's limits: the update-after-bind ones with
 // features.update_after_bind, the plain ones otherwise. Every binding is visible to every stage, so the per-stage
 // limits apply to the whole set; fragment outputs count as stage resources (D3D12 allows eight render targets) and
 // standalone samplers do not, though they count in an update-after-bind pool.
@@ -215,7 +215,7 @@ inline constexpr std::uint32_t growth_headroom = 64;
 //   3. Growth towards the maximums above, in the same order, within maxPerSetDescriptors. That limit only says
 //      what is sure to work (vkGetDescriptorSetLayoutSupport may allow more), so it never shrinks step 1.
 // A storage array holds the smaller of the storage count and its dimension's images: add_image never gives a
-// storage view an index past the sampled array. The other bindings keep their default counts.
+// storage view an index past the sampled array. The other sampled arrays keep their default counts.
 // layout_supported, when given, answers vkGetDescriptorSetLayoutSupport for set 0 at the counts in its argument:
 // step 3 then also grows past maxPerSetDescriptors where the device says the layout works (Intel's Xe-LP reports
 // 6159 and supports the full sizes, D3D-219). It is asked only once the sum is above maxPerSetDescriptors.
@@ -243,10 +243,14 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     auto& counts = features.counts;
     counts = default_counts();
     std::uint32_t images = 1, samplers = 1, storage = 1;
+    std::uint32_t array_images = counts[sampled_binding(ImageDimension::dim_2d_array)];
+    std::uint32_t volume_images = counts[sampled_binding(ImageDimension::dim_3d)];
     // Until the end the 2D storage arrays are not capped by the 2D images, which grow after them: capping can only
     // take descriptors away.
     const auto apply = [&](bool final) {
         counts[sampled_binding(ImageDimension::dim_2d)] = images;
+        counts[sampled_binding(ImageDimension::dim_2d_array)] = array_images;
+        counts[sampled_binding(ImageDimension::dim_3d)] = volume_images;
         counts[sampler_binding] = samplers;
         for (std::uint32_t d = 0; d < 4; ++d) {
             const auto dimension = ImageDimension(d);
@@ -305,9 +309,54 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     grow(samplers, std::max(samplers, std::min(max_samplers, creatable)), growth_headroom, set_limit);
     grow(images, std::max(images, max_2d_images), growth_headroom, set_limit);
     grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
+    grow(array_images, max_2d_array_images, growth_headroom, set_limit);
+    grow(volume_images, max_3d_images, growth_headroom, set_limit);
     apply(true);
     return full;
 }
+
+// Both ranges hand out the lowest free index. Remember how far each search got so filling a
+// fresh array visits each slot once. A release reopens that range at the earliest possible hole.
+class DescriptorIndices {
+public:
+    void reset(std::uint32_t count, std::uint32_t storage_count) {
+        used_.assign(count, 0);
+        split_ = std::min(count, std::max(1u, storage_count));
+        low_ = std::min(1u, count);
+        high_ = split_;
+        free_ = count - low_;  // index zero is the fallback
+    }
+
+    std::uint32_t allocate(bool sampled_only) {
+        if (sampled_only) {
+            if (const auto index = take(high_, static_cast<std::uint32_t>(used_.size()))) return index;
+        }
+        return take(low_, split_);
+    }
+
+    bool contains(std::uint32_t index) const { return index && index < used_.size() && used_[index]; }
+    std::uint32_t available() const { return free_; }
+
+    void release(std::uint32_t index) {
+        if (!contains(index)) return;
+        used_[index] = 0;
+        auto& next = index < split_ ? low_ : high_;
+        next = std::min(next, index);
+        ++free_;
+    }
+
+private:
+    std::uint32_t take(std::uint32_t& next, std::uint32_t end) {
+        while (next < end && used_[next]) ++next;
+        if (next == end) return 0;
+        used_[next] = 1;
+        --free_;
+        return next++;
+    }
+
+    std::vector<std::uint8_t> used_;
+    std::uint32_t split_ = 0, low_ = 0, high_ = 0, free_ = 0;
+};
 
 } // namespace bindless
 
@@ -350,11 +399,10 @@ public:
     std::uint32_t sampler_capacity() const { return features_.counts[bindless::sampler_binding]; }
     // How many more images of a dimension, or samplers, add_image and add_sampler can take before they return 0.
     std::uint32_t free_images(ImageDimension dimension) const {
-        const auto& used = image_used_[std::uint32_t(dimension)];
-        return std::uint32_t(std::count(used.begin(), used.end(), std::uint8_t(0)));
+        return image_indices_[std::uint32_t(dimension)].available();
     }
     std::uint32_t free_samplers() const {
-        return std::uint32_t(std::count(sampler_used_.begin(), sampler_used_.end(), std::uint8_t(0)));
+        return sampler_indices_.available();
     }
     // Set 0 of every pipeline layout made for translated shaders.
     VkDescriptorSetLayout layout() const { return layout_; }
@@ -402,10 +450,7 @@ public:
                             const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
         const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui;
         if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class))) return 0;
-        auto& used = image_used_[std::uint32_t(dimension)];
-        const std::uint32_t low_end = std::min(std::uint32_t(used.size()), storage_capacity(dimension));
-        std::uint32_t index = stores ? 0 : allocate(used, low_end, std::uint32_t(used.size()));
-        if (!index) index = allocate(used, 1, low_end);
+        const auto index = image_indices_[std::uint32_t(dimension)].allocate(!stores);
         if (index) write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
         return index;
     }
@@ -413,30 +458,29 @@ public:
     // New views or a new layout for an index add_image returned (a texture's state changed, say).
     void update_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
                       const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
-        const auto& used = image_used_[std::uint32_t(dimension)];
-        if (index && index < used.size() && used[index])
+        if (image_indices_[std::uint32_t(dimension)].contains(index))
             write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
     }
 
     // Returns the index to the fallback and frees it. The caller removes the image's keys with erase_key() first.
     void remove_image(ImageDimension dimension, std::uint32_t index) {
-        auto& used = image_used_[std::uint32_t(dimension)];
-        if (!index || index >= used.size() || !used[index]) return;
+        auto& indices = image_indices_[std::uint32_t(dimension)];
+        if (!indices.contains(index)) return;
         write_image(dimension, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {}, 0);
-        used[index] = 0;
+        indices.release(index);
     }
 
     // 0 when the sampler array is full.
     std::uint32_t add_sampler(VkSampler sampler) {
-        const std::uint32_t index = allocate(sampler_used_, 1, std::uint32_t(sampler_used_.size()));
+        const auto index = sampler_indices_.allocate(false);
         if (index) write_sampler(index, sampler);
         return index;
     }
 
     void remove_sampler(std::uint32_t index) {
-        if (!index || index >= sampler_used_.size() || !sampler_used_[index]) return;
+        if (!sampler_indices_.contains(index)) return;
         write_sampler(index, fallback_sampler_);
-        sampler_used_[index] = 0;
+        sampler_indices_.release(index);
     }
 
     // T# and S# keys to the indices above: the table of binding 2 (descriptor_table.h). Changes reach the shaders
@@ -507,7 +551,8 @@ public:
         if (replaced) {
             write_shadow();  // includes the pending writes just folded in
         } else if (!pending_.empty()) {
-            std::vector<VkWriteDescriptorSet> writes(pending_.size());
+            auto& writes = pending_writes_;
+            writes.resize(pending_.size());
             for (std::size_t i = 0; i < pending_.size(); ++i) {
                 writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 writes[i].dstSet = set_;
@@ -519,8 +564,8 @@ public:
             }
             vk_.vkUpdateDescriptorSets(device_, std::uint32_t(writes.size()), writes.data(), 0, nullptr);
         }
+        for (const Pending& pending : pending_) pending_at_[pending.binding][pending.index] = 0;
         pending_.clear();
-        pending_slots_.clear();
         return written;
     }
 
@@ -599,16 +644,6 @@ private:
 
     static constexpr std::uint32_t dimensions = 6, classes = 3;
 
-    // The first free index in [begin, end), marked used; 0 when there is none.
-    static std::uint32_t allocate(std::vector<std::uint8_t>& used, std::uint32_t begin, std::uint32_t end) {
-        for (std::uint32_t i = begin; i < end; ++i) {
-            if (used[i]) continue;
-            used[i] = 1;
-            return i;
-        }
-        return 0;
-    }
-
     std::uint32_t memory_type(std::uint32_t allowed, VkMemoryPropertyFlags wanted) const {
         for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i)
             if ((allowed & (1u << i)) && (memory_.memoryTypes[i].propertyFlags & wanted) == wanted) return i;
@@ -627,14 +662,13 @@ private:
             if (b == bindless::table_binding || !bindless::binding_enabled(b, features_)) continue;
             shadow_[b].assign(features_.counts[b], VkDescriptorImageInfo{});
             shadow_written_[b].assign(features_.counts[b], 0);
+            pending_at_[b].assign(features_.counts[b], 0);
         }
 
         for (std::uint32_t d = 0; d < dimensions; ++d) {
-            image_used_[d].assign(image_capacity(ImageDimension(d)), 0);
-            image_used_[d][0] = 1;
+            image_indices_[d].reset(image_capacity(ImageDimension(d)), storage_capacity(ImageDimension(d)));
         }
-        sampler_used_.assign(sampler_capacity(), 0);
-        sampler_used_[0] = 1;
+        sampler_indices_.reset(sampler_capacity(), sampler_capacity());
         return true;
     }
 
@@ -972,12 +1006,13 @@ private:
     // A slot has one pending write: a later one takes its place. So a view or sampler that is removed before the
     // next flush(), and may be destroyed by then, is never written.
     void queue(std::uint32_t binding, std::uint32_t index, const VkDescriptorImageInfo& info) {
-        const std::uint64_t slot = (std::uint64_t(binding) << 32) | index;
-        const auto [at, added] = pending_slots_.try_emplace(slot, pending_.size());
-        if (added)
-            pending_.push_back({binding, index, info});
-        else
-            pending_[at->second].info = info;
+        auto& position = pending_at_[binding][index];
+        if (position) {
+            pending_[position - 1].info = info;
+            return;
+        }
+        pending_.push_back({binding, index, info});
+        position = static_cast<std::uint32_t>(pending_.size());
     }
 
     void write_sampler(std::uint32_t index, VkSampler sampler) {
@@ -1024,10 +1059,11 @@ private:
     std::array<VkImageView, bindless::bindings.size()> fallback_by_binding_{};
     VkSampler fallback_sampler_ = VK_NULL_HANDLE;
     bool fallbacks_ready_ = false;
-    std::array<std::vector<std::uint8_t>, dimensions> image_used_;
-    std::vector<std::uint8_t> sampler_used_;
+    std::array<bindless::DescriptorIndices, dimensions> image_indices_;
+    bindless::DescriptorIndices sampler_indices_;
     std::vector<Pending> pending_;
-    std::unordered_map<std::uint64_t, std::size_t> pending_slots_;  // binding and index -> place in pending_
+    std::array<std::vector<std::uint32_t>, bindless::bindings.size()> pending_at_;  // one-based position, zero if absent
+    std::vector<VkWriteDescriptorSet> pending_writes_;
     DescriptorTable table_{64};
     TableBuffers table_buffers_;
     bool table_uploaded_ = false;  // the table's current contents are in table_buffers_.table

@@ -506,9 +506,11 @@ int main() {
             auto run_indirect_count = [&](std::uint64_t count_offset, std::uint8_t exp_r, std::uint8_t exp_g,
                                           std::uint8_t exp_b) -> int {
                 leonida::CommandList ir;
-                ir.execute_indirect({leonida::IndirectKind::draw, sizeof(D3D12_DRAW_ARGUMENTS), 2u,
-                                     rt::d3d12::resource_id(arg_buf), 0, rt::d3d12::resource_id(count_buf),
-                                     count_offset});
+                leonida::ExecuteIndirect command{leonida::IndirectKind::draw, sizeof(D3D12_DRAW_ARGUMENTS), 2u,
+                                                rt::d3d12::resource_id(arg_buf), 0,
+                                                rt::d3d12::resource_id(count_buf), count_offset};
+                command.raw_draw = true; // this low-level fixture owns the render scope and pipeline below
+                ir.execute_indirect(command);
                 ir.close();
 
                 VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};

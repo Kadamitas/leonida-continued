@@ -34,7 +34,7 @@ void main(uint3 group : SV_GroupID) {
 )";
 
 bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count, bool gpu_update,
-         std::array<UINT, 2>& result, bool shim) {
+         std::array<UINT, 2>& result, bool shim, bool direct_control = false) {
     Ref<ID3D12RootSignature> root;
     D3D12_ROOT_PARAMETER param{};
     param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -110,7 +110,14 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
     list->SetComputeRootSignature(root.p);
     list->SetPipelineState(pso.p);
     list->SetComputeRootUnorderedAccessView(0, output->GetGPUVirtualAddress());
-    list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, counts.p, kCountOffset);
+    const auto execute = [&](UINT known_count) {
+        if (direct_control) {
+            for (UINT i = 0; i < std::min(known_count, kMaximum); ++i) list->Dispatch(i + 1, 1, 1);
+        } else {
+            list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, counts.p, kCountOffset);
+        }
+    };
+    execute(count);
     if (gpu_update) {
         auto to_copy = transition(counts.p, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                                   D3D12_RESOURCE_STATE_COPY_DEST);
@@ -120,7 +127,7 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
                                       D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         list->ResourceBarrier(1, &to_indirect);
         // Repeat with a count produced by a GPU copy after the previous indirect dispatch.
-        list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, counts.p, kCountOffset);
+        execute(3);
     }
     const auto to_copy = transition(output.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -232,18 +239,31 @@ int main() {
     // command. WARP must match it too, with one measured exception: in-box WARP 10.0.22621.5415 (Windows 11 23H2)
     // reuses the first count for the second ExecuteIndirect after the GPU copy overwrites it (0 -> 3 gives 0/0,
     // 1 -> 3 gives 2/2). That case is reported, not failed, when WARP gives exactly the stale-count result.
-    unsigned cases = 0, stale_host = 0;
+    unsigned cases = 0, stale_host = 0, failures = 0;
+    // An opt-in control isolates the original test shader/root-UAV path from count gating, without changing the
+    // oracle. Both methods must produce the same six groups and ten weighted additions for count3.
+    if (GetEnvironmentVariableA("LEONIDA_INDIRECT_DIAGNOSTIC", nullptr, 0)) {
+        std::array<UINT, 2> native_result{}, layer_result{};
+        const bool native_ok = run(host.p, native_code, 3, false, native_result, false, true);
+        const bool layer_ok = run(layer.p, container, 3, false, layer_result, true, true);
+        const auto want = expected(3, false);
+        std::printf("direct Dispatch control: host %u/%u(ok%d), layer %u/%u(ok%d), expected %u/%u\n",
+            native_result[0], native_result[1], int(native_ok), layer_result[0], layer_result[1], int(layer_ok), want[0], want[1]);
+        if (!native_ok || !layer_ok || native_result != want || layer_result != want) ++failures;
+    }
     for (UINT count : {0u, 1u, 3u, 7u}) {
         for (bool update : {false, true}) {
             std::array<UINT, 2> native_result{}, layer_result{};
             const auto want = expected(count, update);
-            if (!run(host.p, native_code, count, update, native_result, false) ||
-                !run(layer.p, container, count, update, layer_result, true) || layer_result != want ||
+            const bool native_ok = run(host.p, native_code, count, update, native_result, false);
+            const bool layer_ok = run(layer.p, container, count, update, layer_result, true);
+            if (!native_ok || !layer_ok || layer_result != want ||
                 (native_result != want && !(update && native_result == expected(count, update, count)))) {
                 std::fprintf(stderr, "count %u update %d: host %u/%u, layer %u/%u, expected %u/%u\n",
                              count, int(update), native_result[0], native_result[1],
                              layer_result[0], layer_result[1], want[0], want[1]);
-                return 1;
+                ++failures;
+                continue;
             }
             if (native_result != want) {
                 std::printf("count %u update 1: host WARP build %s reused the first count (%u/%u, expected %u/%u); "
@@ -262,6 +282,7 @@ int main() {
         std::fprintf(stderr, "validation errors: %u\n", vk.validation_errors());
         return 1;
     }
+    if (failures) return 1;
     std::printf("counted ExecuteIndirect(DISPATCH): %u native WARP / Vulkan GPU comparisons passed; "
                 "count=0,1,max,>max, nonzero offsets and GPU count overwrite, no validation errors\n", cases);
     return 0;

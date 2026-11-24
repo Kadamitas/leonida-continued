@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <limits>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -27,7 +28,14 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override {
         const ULONG left = --refs_;
-        if (!left) delete static_cast<Derived*>(this);
+        if (!left) {
+            auto* object = static_cast<Derived*>(this);
+            if constexpr (requires { object->before_final_release(); }) {
+                static_assert(noexcept(object->before_final_release()));
+                object->before_final_release();
+            }
+            delete object;
+        }
         return left;
     }
 
@@ -120,6 +128,18 @@ public:
     }
 
 protected:
+    // A registry may retain only a raw pointer if its lookup lock also guards a before_final_release hook that
+    // unpublishes it before delete. Under that lock the object is still alive; refuse a final Release rather than
+    // resurrecting it. A successful pin uses the same counter as ordinary COM references.
+    bool try_add_ref_if_live() {
+        auto refs = refs_.load(std::memory_order_acquire);
+        while (refs && refs != (std::numeric_limits<ULONG>::max)()) {
+            if (refs_.compare_exchange_weak(refs, refs + 1, std::memory_order_acquire,
+                                            std::memory_order_relaxed)) return true;
+        }
+        return false;
+    }
+
     virtual ~Object() {
         for (auto& entry : data_)
             if (entry.object) entry.object->Release();

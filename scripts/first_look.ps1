@@ -49,6 +49,16 @@ function Find-RuntimeLoader($build, $folders) {
     }
 }
 
+function Get-MissingRuntimeFiles($loader) {
+    if (-not $loader) { return "gta6rt.exe" }
+    $folder = Split-Path -LiteralPath $loader
+    $linked = @(python -I (Join-Path $root "tools\pe_inspect.py") $loader --runtime-sidecars)
+    if ($LASTEXITCODE -ne 0) { throw "Could not read the runtime imports from $loader" }
+    foreach ($name in @("gta6rt_tls_host.dll") + $linked) {
+        if (-not (Test-Path -LiteralPath (Join-Path $folder $name) -PathType Leaf)) { $name }
+    }
+}
+
 $build = Join-Path $root "runtime\build"
 $configs = @("RelWithDebInfo", "Release", "MinSizeRel", "Debug")
 $folders = @("") + $configs
@@ -61,10 +71,9 @@ $newest = $sources | ForEach-Object { Get-ChildItem -LiteralPath $_ -Recurse -Fi
     Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
 $stale = $rt -and $newest -and ($newest.LastWriteTimeUtc -gt (Get-Item -LiteralPath $rt).LastWriteTimeUtc)
 if ($stale) { Write-Host "$rt is older than $($newest.Name): rebuilding it first" }
-$tlsName = "gta6rt_tls_host.dll"
-$hasTls = $rt -and (Test-Path -LiteralPath (Join-Path (Split-Path -LiteralPath $rt) $tlsName) -PathType Leaf)
-if (-not $hasTls -or $stale) {
-    if (-not $hasTls) { Write-Host "Missing runtime files: gta6rt.exe and $tlsName must be in the same folder; rebuilding the runtime" }
+$missing = @(Get-MissingRuntimeFiles $rt)
+if ($missing.Count -or $stale) {
+    if ($missing.Count) { Write-Host "Missing runtime files: $($missing -join ', '); rebuilding the runtime" }
     $cache = Join-Path $build "CMakeCache.txt"
     if ((Test-Path -LiteralPath $cache -PathType Leaf) -and
         (Select-String -LiteralPath $cache -Pattern '^CMAKE_GENERATOR:INTERNAL=Visual Studio ' -Quiet)) {
@@ -88,9 +97,8 @@ if (-not $hasTls -or $stale) {
         & (Join-Path $PSScriptRoot "build_runtime.ps1")
     }
     $rt = Find-RuntimeLoader $build $folders
-    if (-not $rt) { throw "runtime build did not produce gta6rt.exe in $build" }
-    $tlsHost = Join-Path (Split-Path -LiteralPath $rt) $tlsName
-    if (-not (Test-Path -LiteralPath $tlsHost -PathType Leaf)) { throw "runtime build did not produce $tlsHost" }
+    $missing = @(Get-MissingRuntimeFiles $rt)
+    if ($missing.Count) { throw "runtime build did not produce $($missing -join ', ') in $build" }
 }
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 & {

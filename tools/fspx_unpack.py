@@ -24,7 +24,7 @@ corpus uses, so tools/rdna2spirv.py can read it:
     DIR/fspx/<name>.json     the decoded kind-0 entry, the directory and the code range
     DIR/fspx/<name>.code     the kind-6 program
     DIR/fspx/<name>.state    the kind-0 entry as it is (its SHA-256 is the index's fspx_state_sha256)
-    DIR/disasm/<name>.s      with --disasm: tools/shader_disasm.py output for the code after the prologue
+    DIR/disasm/<name>.s      with --disasm: tools/shader_disasm.py output for the code after the prologue (36 or 24 bytes)
 """
 import argparse
 import json
@@ -46,6 +46,11 @@ KINDS = (0, 1, 6, 7)
 # kind-7 hash; llvm-mc rejects them. Measured on all 29 shaders of the 1.0.2.1 DLL (docs/fspx.md).
 PROLOGUE_WORDS = (0, 3, 6)
 PROLOGUE_SIZE = 36
+# Some programs of the pipeline library in shaders.rpf carry only two of those words (0 and 3): a 24-byte prologue, with
+# the code starting at word 6 (50 of the 2,684 library programs of 1.0.2.1, docs/fspx.md). Read from word 0 they never
+# decode.
+SHORT_PROLOGUE_WORDS = (0, 3)
+SHORT_PROLOGUE_SIZE = 24
 STAGE_COMPUTE = 5  # PSVRuntimeInfo1 ShaderStage (DirectX): 5 = compute
 
 
@@ -141,10 +146,19 @@ def decode_kind0(b: bytes) -> dict:
 
 
 def code_range(code: bytes):
-    """(start, end) of the instructions in a kind-6 program: after the 36-byte prologue when it is there, through
+    """(start, end) of the instructions in a kind-6 program: after the 36- or 24-byte prologue when it is there, through
     the first s_endpgm. end is None when the program has no s_endpgm."""
     words = struct.unpack_from(f"<{len(code) // 4}I", code)
-    start = PROLOGUE_SIZE if len(words) > 8 and all(words[k] >> 16 == 0xD580 for k in PROLOGUE_WORDS) else 0
+    def vop3_180(ks):
+        return all(words[k] >> 16 == 0xD580 for k in ks)
+    if len(words) > 8 and vop3_180(PROLOGUE_WORDS):
+        start = PROLOGUE_SIZE
+    elif (len(words) > 6 and vop3_180(SHORT_PROLOGUE_WORDS)
+          and all(words[k + 1] & 0xFFFE0100 == 0x03FE0100 for k in SHORT_PROLOGUE_WORDS)):
+        # The measured VOP3 records carry a literal in SRC2. Plain v_nop instructions also have opcode 0x180.
+        start = SHORT_PROLOGUE_SIZE
+    else:
+        start = 0
     pos = code.find(ENDPGM, start)
     while pos >= 0 and pos % 4:
         pos = code.find(ENDPGM, pos + 1)
@@ -169,7 +183,7 @@ def unpack_payload(payload: bytes):
     meta = {
         "version": struct.unpack_from("<I", payload, 4)[0],
         "directory": {str(k): [o, s] for k, (o, s) in sorted(entries.items())},
-        "code": {"start": start, "end": end, "prologue": start == PROLOGUE_SIZE},
+        "code": {"start": start, "end": end, "prologue": start > 0},
         **decode_kind0(blob[0]),
     }
     return (meta, blob), 0
@@ -179,7 +193,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the FSPX compute programs in FidelityFX shader containers.")
     ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
+    ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc unless --backend python)")
+    ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
+                    help="disassembler backend for --disasm: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
     ap.add_argument("--mcpu", default="gfx1030",
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
@@ -254,7 +270,9 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                asm, invalid, err = disasm.disasm(
+                    blob[6][start:end], a.mcpu, backend=a.backend, wave32=meta.get("wave32", True),
+                )
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)

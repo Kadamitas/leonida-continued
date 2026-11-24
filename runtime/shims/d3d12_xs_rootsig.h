@@ -5,6 +5,8 @@
 // every other flag bit preserved. The pointed-to parameter/sampler arrays are not modified.
 #pragma once
 
+#include "../src/root_signature_export.h"
+
 #include <d3d12.h>
 #include <cstdint>
 #include <vector>
@@ -16,8 +18,8 @@ constexpr uint32_t kXboxRootSignatureFlagHighByte = 0xFF000000u;
 // Always copies `in` to `out`. Returns true for the known 1.0/1.1/1.2 descriptor versions and clears the high flag
 // byte in the copy. Returns false for an unknown version, leaving the copy byte-for-byte identical to `in` so the
 // caller can forward it unchanged and log the unsupported version.
-bool copy_versioned_root_signature_desc_clear_xbox_flags(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& in,
-                                                         D3D12_VERSIONED_ROOT_SIGNATURE_DESC& out);
+GTA6RT_ROOTSIG_API bool copy_versioned_root_signature_desc_clear_xbox_flags(
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& in, D3D12_VERSIONED_ROOT_SIGNATURE_DESC& out);
 
 // Windows 10's built-in d3d12.dll serializes root signatures up to version 1.1: it rejects every 1.2 description,
 // even an empty one, with E_INVALIDARG, and reports HighestVersion 1.1. Version 1.2 differs from 1.1 only in
@@ -26,12 +28,13 @@ bool copy_versioned_root_signature_desc_clear_xbox_flags(const D3D12_VERSIONED_R
 // parameters and points its samplers at `samplers` (resized here; keep it alive while `out` is used). Returns false,
 // with `out` and `samplers` untouched, when `in` is not version 1.2 or a static sampler has non-zero Flags (a UINT
 // border colour or non-normalized coordinates, which 1.1 can't express).
-bool downgrade_root_signature_1_2_to_1_1(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& in,
-                                         std::vector<D3D12_STATIC_SAMPLER_DESC>& samplers,
-                                         D3D12_VERSIONED_ROOT_SIGNATURE_DESC& out);
+GTA6RT_ROOTSIG_API bool downgrade_root_signature_1_2_to_1_1(
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& in, std::vector<D3D12_STATIC_SAMPLER_DESC>& samplers,
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC& out);
 
 // Legacy D3D12SerializeRootSignature descriptor (version 1.0): copies and clears the high flag byte.
-void copy_root_signature_desc_clear_xbox_flags(const D3D12_ROOT_SIGNATURE_DESC& in, D3D12_ROOT_SIGNATURE_DESC& out);
+GTA6RT_ROOTSIG_API void copy_root_signature_desc_clear_xbox_flags(const D3D12_ROOT_SIGNATURE_DESC& in,
+                                                                  D3D12_ROOT_SIGNATURE_DESC& out);
 
 // D3D12CreateRootSignatureDeserializer path: the host deserializer accepts a correctly hashed blob whose RTS0
 // flags carry the Xbox high byte and hands the byte back, and CreateRootSignature then refuses it (E_FAIL on WARP
@@ -40,10 +43,10 @@ void copy_root_signature_desc_clear_xbox_flags(const D3D12_ROOT_SIGNATURE_DESC& 
 // true with the copy in `out`. Returns false (and leaves `out` empty) when no rewrite is needed or the container is
 // not valid to re-sign: no RTS0 chunk, no Xbox high byte, a malformed/truncated header, total_size != size, or a
 // non-zero incoming DXBC hash that does not match the input bytes.
-bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<uint8_t>& out);
+GTA6RT_ROOTSIG_API bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<uint8_t>& out);
 
 // The DXBC container hash of `blob` (bytes 20..size), as stored at bytes 4..19. Zeroes `out` when `blob` is null,
 // `size < 20`, or the hashed payload exceeds the 32-bit bit-count limit.
-void dxbc_checksum(const uint8_t* blob, size_t size, uint32_t out[4]);
+GTA6RT_ROOTSIG_API void dxbc_checksum(const uint8_t* blob, size_t size, uint32_t out[4]);
 
 }  // namespace rt::d3d12_xs
