@@ -2365,7 +2365,7 @@ public:
         const VkDeviceSize bytes = VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize;
         if (console_addressed_) {
             // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address. Report the requested title VA
-            // now; backing this range with title memory / ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§3.3 aliasing is tracked separately.
+            // now; backing this range with title memory / Ãƒâ€šÃ‚Â§3.3 aliasing is tracked separately.
             log_once("descriptor heap uses console address/size (not backed by title memory)", int(desc_.Type));
             cpu_ = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(console_address_));
             in_arena_ = false;
@@ -10372,7 +10372,7 @@ public:
             std::memcpy(data, &pc_opts, sizeof(pc_opts));
             if (size == kConsoleOptionsSize) {
                 // Console titles query D3D12_FEATURE_D3D12_OPTIONS with a 0x40-byte (16-dword) buffer
-                // (docs/d3d12_xs_surface.md Ã‚Â§7.1): fill the 0x3C-byte PC prefix and zero the trailing 4 bytes.
+                // (docs/d3d12_xs_surface.md §7.1): fill the 0x3C-byte PC prefix and zero the trailing 4 bytes.
                 std::memset(static_cast<std::uint8_t*>(data) + sizeof(pc_opts), 0, sizeof(UINT));
             }
             return d3d12_trace::result(method, S_OK);
