@@ -3340,6 +3340,15 @@ public:
         const Format format = texture_storage_format(desc_.Format, false);
         const auto volume = title_volume_shadow(desc_, format);
         const auto block = footprint_block(format, VK_IMAGE_ASPECT_COLOR_BIT);
+        if (physical && volume && title_sampled_volume_4ks_query(desc_)) {
+            // These single-mip float16 volumes share the thick-tile layout of the mutable 3D upload path.
+            // Cross-check both byte ranges before handing it the physical source and native destination.
+            const auto layout = leonida::volume_mips_4ks_layout(UINT(desc_.Width), desc_.Height,
+                desc_.DepthOrArraySize, 1, volume->element_bytes, 1);
+            if (!layout || layout->tiled_bytes != volume->tiled_bytes || layout->packed_bytes != volume->packed_bytes)
+                return E_NOTIMPL;
+            return enable_tiled_texture_shadow(source, *layout, 0, 0, true);
+        }
         const bool single_color = desc_.Width == 1 && desc_.Height == 1 && format.format != VK_FORMAT_UNDEFINED &&
             format.aspects == VK_IMAGE_ASPECT_COLOR_BIT && !format.typeless && !format.rgb96 &&
             block.bytes <= 16 && std::has_single_bit(block.bytes);
@@ -3354,7 +3363,6 @@ public:
         const std::size_t source_span = layers > 1 ? std::size_t(layers) * 4096 : bytes;
         const HRESULT staged = allocate_texture_shadow(source, source_span, upload_layer_bytes * layers, physical);
         if (FAILED(staged)) return staged;
-        if (physical && volume && title_sampled_volume_4ks_query(desc_)) sampled_tile_bytes_ = 4096;
         shadow_snapshot_.resize(bytes);
         shadow_scratch_.resize(bytes);
         image_address_ = reinterpret_cast<std::uintptr_t>(source);
@@ -3380,7 +3388,12 @@ public:
             }
             if (shadow_captured_) {
                 if (shadow_scratch_ == shadow_snapshot_) return true;
-                log_once("static tiled source changed; dynamic CPU texture updates remain unsupported", 0);
+                static std::atomic<unsigned> reports{};
+                if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+                    std::fprintf(stderr, "[rt] d3d12: static tiled source changed address=%p size=%llux%ux%u "
+                        "format=%u physical=%u source_bytes=%zu\n", shadow_source_,
+                        static_cast<unsigned long long>(desc_.Width), desc_.Height,
+                        unsigned(desc_.DepthOrArraySize), unsigned(desc_.Format), unsigned(physical), shadow_scratch_.size());
                 return false;
             }
             shadow_snapshot_ = shadow_scratch_;
@@ -3500,7 +3513,8 @@ public:
     }
 
     HRESULT enable_tiled_texture_shadow(const void* source, const leonida::Surface4ksLayout& layout,
-                                        UINT64 placed_bytes = 0, UINT64 guest_alignment = 0) {
+                                        UINT64 placed_bytes = 0, UINT64 guest_alignment = 0,
+                                        bool require_physical = false) {
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT layers = volume ? 1 : desc_.DepthOrArraySize;
         const std::size_t source_bytes = layout.tiled_bytes * layers;
@@ -3508,6 +3522,7 @@ public:
         if (placed_bytes && (placed_bytes < source_bytes || placed_bytes > SIZE_MAX)) return E_INVALIDARG;
         const auto source_span = placed_bytes ? std::size_t(placed_bytes) : source_bytes;
         const bool physical = rt::xmem::validate_sparse_texture(source, source_span) == rt::xmem::SparseTextureSnapshot::ready;
+        if (require_physical && !physical) return E_INVALIDARG;
         if (const HRESULT hr = allocate_texture_shadow(source, source_span, upload_bytes, physical); FAILED(hr))
             return hr;
         struct Capture {
@@ -13989,6 +14004,11 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                     resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1u : 2u,
                     static_cast<unsigned long long>(resource.Width), resource.Height, unsigned(resource.MipLevels),
                     unsigned(resource.Format), source_bytes, static_cast<unsigned long long>(linear_layout->mips[0].row_pitch));
+            else if (volume && physical_snapshot && title_sampled_volume_4ks_query(resource))
+                std::fprintf(stderr, "[rt] d3d12: physical 4KB_S sampled volume address=0x%llx "
+                    "size=%llux%ux%u format=%u bytes=%zu\n", static_cast<unsigned long long>(address),
+                    static_cast<unsigned long long>(resource.Width), resource.Height, unsigned(faces),
+                    unsigned(resource.Format), source_bytes);
             else
                 std::fprintf(stderr, "[rt] d3d12: EXPERIMENTAL static %s shadow created; upload at first submission, "
                                      "later CPU changes refused\n", volume ? "4KB_S 3D volume" :
