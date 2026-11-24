@@ -268,6 +268,14 @@ public:
             !allocator_ || allocator_->recording() != this ||
             (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
              type_ != D3D12_COMMAND_LIST_TYPE_COPY)) return false;
+        if (reference > 1 && !list_.commands().empty()) {
+            const auto prefix = list_.commands();
+            std::fprintf(stderr, "[rt] d3d12: generation wait requires mid-list continuation reference=%llu "
+                         "preceding=%zu first_ir=%zu last_ir=%zu\n",
+                         static_cast<unsigned long long>(reference), prefix.size(),
+                         prefix.front().index(), prefix.back().index());
+            return false;
+        }
         bool added = false;
         try {
             if (std::find(external_pins_.begin(), external_pins_.end(), backing) == external_pins_.end()) {

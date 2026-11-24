@@ -11851,7 +11851,7 @@ static HRESULT record_console_host_operation(ID3D12Device* device, ID3D12Graphic
     const std::uint64_t base = address & ~(bytes - 1);
     if (bytes > SIZE_MAX || base > UINTPTR_MAX - bytes || address - base > bytes - write_bytes)
         return E_INVALIDARG;
-    if (operation == ConsoleHostOperation::acquire && (value != 1 || bytes != 64 * 1024 || address != base))
+    if (operation == ConsoleHostOperation::acquire && (!value || value > 2 || bytes != 64 * 1024 || address != base))
         return E_NOTIMPL;
     const auto refused = [&](HRESULT hr, std::uint64_t at) {
         static std::atomic<unsigned> failures{0};

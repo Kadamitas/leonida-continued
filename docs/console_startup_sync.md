@@ -25,8 +25,11 @@ GREATER_EQUAL, reference 1, flags DWORD 1, and the observed CPU control-page rol
 to 1 before publishing it; reviewed later publications remain positive. An actual coherent 64-bit read during
 every replay must satisfy the predicate. Replay then records a HOST_WRITE-to-ALL_COMMANDS memory barrier at
 the command's position. An unsatisfied value fails preparation rather than being overwritten or signalled.
-This is not a general memory-wait implementation, does not admit later references, and does not establish all
-console flag-1 semantics. Later waits need ordered prefix/suffix submission and a real producer dependency.
+Reference 2 can use the same control cell at the head of a batch after the queue's previous submission and all
+explicit fence dependencies have retired. Only at that boundary can a fresh unsigned comparison consume a CPU
+publication that may subsequently regress. A wait after a recorded command reports the preceding command count
+and fails. An unretired predecessor or unsatisfied value also fails. Mid-list waits need an ordered GPU prefix
+and a deferred suffix. The remaining console flag-1 semantics are unverified.
 
 The separate `LEONIDA_XBOX_QUEUE_SUBMIT=immediate` experiment issues a real PC ExecuteCommandLists after
 validating and retaining the complete console list array. Console token pacing remains unverified. Recording

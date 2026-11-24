@@ -1809,9 +1809,8 @@ bool immediate_queue_submit_enabled() {
     return enabled;
 }
 
-// A bounded startup fast path, not a general GPU memory wait: the measured CPU-owned control cell starts at
-// generation 1. Replay must independently observe the already-satisfied predicate and import prior host writes.
-// Unsatisfied waits and later generations still refuse; the console flag's complete contract remains unverified.
+// The measured CPU-owned control cell starts at 1. Replay observes the startup floor or a later
+// generation at an already-retired queue boundary and imports prior host writes.
 bool satisfied_host_generation_enabled() {
     static const bool enabled = [] {
         char value[64]{};
@@ -2687,14 +2686,14 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             if (satisfied_host_generation_enabled() && self->device && self->device->console_lists &&
                 self->device->console_layout.load(std::memory_order_relaxed) == kConsoleLayoutNewer &&
                 a1 && a1 % 8 == 0 && a1 <= UINT64_MAX - 8 && static_cast<std::uint32_t>(a2) == 7 &&
-                a3 == 1 && static_cast<std::uint32_t>(a4) == 1) {
+                (a3 == 1 || a3 == 2) && static_cast<std::uint32_t>(a4) == 1) {
                 list_add_ref(self);
                 const std::unique_ptr<ListProxy, decltype(&list_release)> list_pin(self, &list_release);
                 const HRESULT hr = rt::d3d12::record_console_memory_acquire(self->device->real, self->real, a1, a3);
                 d3d12_trace::result("XboxList74SatisfiedStartupHostAcquire", hr);
                 if (SUCCEEDED(hr)) {
-                    static std::atomic<unsigned> waits{0};
-                    if (waits.fetch_add(1, std::memory_order_relaxed) < 16) report_wait("recorded");
+                    static std::atomic<unsigned> waits[2]{};
+                    if (waits[a3 - 1].fetch_add(1, std::memory_order_relaxed) < 16) report_wait("recorded");
                     return 0;
                 }
             }

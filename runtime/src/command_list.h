@@ -521,8 +521,8 @@ struct WriteTimestamp {
     std::uint64_t address;
 };
 
-// An observed startup CPU-generation acquire, not a general memory wait. Preflight must freshly prove the
-// predicate; the console adapter restricts it to a reference that known later CPU publications cannot invalidate.
+// A CPU-produced generation. The first generation has a stable floor; later values may decrease.
+// A fresh later-generation observation is only valid once the command's queue predecessors have retired.
 struct HostMemoryAcquire {
     std::uint64_t address;
     std::uint64_t reference;
@@ -1042,6 +1042,13 @@ private:
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
     bool closed_ = false;
 };
+
+inline bool starts_with_acquire(std::span<const CommandList* const> lists, const HostMemoryAcquire& acquire) {
+    const auto first = std::find_if(lists.begin(), lists.end(), [](const CommandList* list) {
+        return !list->commands().empty();
+    });
+    return first != lists.end() && std::get_if<HostMemoryAcquire>(&(*first)->commands().front()) == &acquire;
+}
 
 // The caller holds the device-wide submission tracker through vkQueueSubmit. Compare against
 // the arena itself so direct CPU edits, including A -> B -> A, need no second full-heap shadow.

@@ -995,7 +995,7 @@ struct ReplayFunctions {
     // A fresh one-slot timestamp pool for this execution only; its owner retains it through GPU retirement.
     std::function<VkQueryPool()> timestamp_query;
     // Freshly checks a live coherent imported uint64. False refuses the batch; it never waits or writes a value.
-    std::function<bool(std::uint64_t address, std::uint64_t reference)> host_memory_acquire;
+    std::function<bool(const HostMemoryAcquire&)> host_memory_acquire;
     // Set only where a copy of timestamp results is not ordered after the timestamps written before it (MoltenVK on
     // Apple GPUs, docs/d3d12_vulkan.md section 4.6): records what orders them, before each timestamp resolve.
     std::function<void(VkCommandBuffer)> order_timestamp_copy;
@@ -3458,7 +3458,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* acquire = std::get_if<HostMemoryAcquire>(&command)) {
             if (!vk.pipeline_barrier || !vk.host_memory_acquire ||
-                !vk.host_memory_acquire(acquire->address, acquire->reference)) return ReplayResult::unsupported;
+                !vk.host_memory_acquire(*acquire)) return ReplayResult::unsupported;
         } else if (const auto* timestamp = std::get_if<WriteTimestamp>(&command)) {
             if (!vk.buffer_at || !vk.reset_query_pool || !vk.write_timestamp || !vk.copy_query_pool_results ||
                 !vk.timestamp_query) return ReplayResult::unsupported;
@@ -4568,8 +4568,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                               any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             }
         } else if (std::holds_alternative<HostMemoryAcquire>(command)) {
-            // The narrowly admitted predicate was satisfied by a CPU publication before submission. Its known
-            // later values cannot invalidate the startup reference; make those prior host writes visible here.
+            // The CPU publication satisfied the stable startup floor or was observed at the queue boundary.
+            // Make preceding host writes visible at the acquire.
             // HOST and ALL_COMMANDS are valid for every queue. Preserve them directly rather than clipping
             // HOST through the queue's device-command stage mask while retaining HOST_WRITE access.
             VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

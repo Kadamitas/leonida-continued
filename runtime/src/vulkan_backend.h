@@ -2593,9 +2593,10 @@ private:
         HostImageReads image_reads;
         if (!context_.host_images_.empty()) replay.image_reads = &image_reads;
         // prepare() holds resource_mutex_ shared. Validate the exact live coherent import and read the CPU's real
-        // word on every execution, never a recording-time snapshot. The caller admits only a generation whose
-        // satisfied floor cannot fall before the GPU reaches its HOST_WRITE acquire barrier; this does not wait.
-        replay.host_memory_acquire = [this](std::uint64_t address, std::uint64_t reference) {
+        // word on every execution. The startup floor is stable. Later generations may regress:
+        // observe them only at their logical execution boundary, after all queue predecessors retire.
+        replay.host_memory_acquire = [this, &lists](const HostMemoryAcquire& acquire) {
+            const auto [address, reference] = acquire;
             if constexpr (!std::atomic_ref<std::uint64_t>::is_always_lock_free) {
                 return false;
             } else {
@@ -2613,10 +2614,34 @@ private:
                 if (offset > binding->size || sizeof(std::uint64_t) > binding->size - offset) return false;
                 const auto* host = binding->host + offset;
                 if (reinterpret_cast<std::uintptr_t>(host) != address) return false;
+                if (reference != 1) {
+                    if (reference != 2) return false;
+                    if (!starts_with_acquire(lists, acquire)) {
+                        std::fprintf(stderr, "[rt] VulkanQueue: generation wait has unsubmitted batch predecessors\n");
+                        return false;
+                    }
+                    // state_mutex_ serializes guest queue operations. All explicit wait dependencies plus the
+                    // last submitted ticket must have executed. Never block while holding resource_mutex_.
+                    const auto retired = [&](VkSemaphore semaphore, std::uint64_t value) {
+                        std::uint64_t done = 0;
+                        return context_.vk.vkGetSemaphoreCounterValue(context_.device(), semaphore, &done) == VK_SUCCESS &&
+                               done >= value;
+                    };
+                    if (submitted_ && !retired(progress_, submitted_)) {
+                        std::fprintf(stderr, "[rt] VulkanQueue: generation wait has an unretired queue predecessor\n");
+                        return false;
+                    }
+                    for (std::size_t i = 0; i < waits_.size(); ++i)
+                        if (!retired(waits_[i], wait_values_[i])) {
+                            std::fprintf(stderr, "[rt] VulkanQueue: generation wait has an unretired fence dependency\n");
+                            return false;
+                        }
+                }
                 auto* word = reinterpret_cast<std::uint64_t*>(const_cast<std::uint8_t*>(host));
                 const auto observed = std::atomic_ref<std::uint64_t>(*word).load(std::memory_order_acquire);
-                static std::atomic<unsigned> observations{0};
-                if (observations.fetch_add(1, std::memory_order_relaxed) < 16)
+                static std::atomic<unsigned> observations[2]{};
+                if ((reference != 1 && observed < reference) ||
+                    observations[reference != 1].fetch_add(1, std::memory_order_relaxed) < 16)
                     std::fprintf(stderr, "[rt] VulkanQueue: startup host acquire address=0x%llx reference=%llu "
                                          "observed=%llu satisfied=%u\n",
                         static_cast<unsigned long long>(address), static_cast<unsigned long long>(reference),
