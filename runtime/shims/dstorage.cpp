@@ -632,10 +632,7 @@ public:
         // Queues hold the shared owner until Close has retired every job.
         for (auto& job : jobs_) if (job.work) CloseThreadpoolWork(job.work);
         if (pool_) CloseThreadpool(pool_);
-        if (profile_ && claimed_)
-            std::fprintf(stderr, "[rt] dstorage: parallel zlib jobs=%llu peak_active=%u peak_reserved=%zu "
-                         "pool_capacity_waits=%llu\n", static_cast<unsigned long long>(claimed_), peak_active_,
-                         peak_reserved_, static_cast<unsigned long long>(waits_));
+        if (profile_ && claimed_) report();
     }
 
     // Includes the compressed input, exact-size result and a fixed allowance for the dynamic Huffman
@@ -702,7 +699,14 @@ private:
         if (pool.profile_) {
             std::lock_guard lock(pool.mutex_);
             --pool.active_;
+            if (++pool.completed_ == 1 || pool.completed_ % 256 == 0) pool.report();
         }
+    }
+
+    void report() const {
+        std::fprintf(stderr, "[rt] dstorage: parallel zlib jobs=%llu completed=%llu peak_active=%u "
+            "peak_reserved=%zu pool_capacity_waits=%llu\n", static_cast<unsigned long long>(claimed_),
+            static_cast<unsigned long long>(completed_), peak_active_, peak_reserved_, static_cast<unsigned long long>(waits_));
     }
 
     bool initialize() {
@@ -733,7 +737,7 @@ private:
     std::condition_variable available_;
     size_t used_ = 0;
     bool profile_ = false;
-    uint64_t claimed_ = 0, waits_ = 0;
+    uint64_t claimed_ = 0, completed_ = 0, waits_ = 0;
     unsigned active_ = 0, peak_active_ = 0;
     size_t peak_reserved_ = 0;
 };
