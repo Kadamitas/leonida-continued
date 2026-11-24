@@ -1366,6 +1366,25 @@ void test_zlib(Env& env) {
         check(head && tail, c.result ? "the inflated bytes are the synthetic text, and nothing past them"
                                      : "a failed zlib request leaves the destination untouched");
     }
+    // Several adjacent file inflates may finish in different orders. Only the FIFO writer
+    // may publish overlapping data, and the first failing request supplies the status.
+    std::vector<uint8_t> overlap(dynamic_plain.size(), 0xee);
+    auto append = [&](uint64_t offset, uint32_t bytes, size_t start, size_t length) {
+        auto r = file_request(f, offset, overlap.data() + start, static_cast<uint32_t>(length));
+        r.Options.AsUINT64 = options::kZlib;
+        r.SourceSize = bytes;
+        q->EnqueueRequest(&r);
+    };
+    append(at_dynamic, z, 0, dynamic_plain.size());
+    append(at_fixed, static_cast<uint32_t>(fixed.size()), 17, fixed_plain.size());
+    append(at_check, z, 0, dynamic_plain.size());
+    append(at_method, z, 0, dynamic_plain.size());
+    q->EnqueueStatus(s, 0);
+    q->Close(); // implicitly submits and waits for every result and its notification
+    auto expected_overlap = dynamic_plain;
+    std::copy(fixed_plain.begin(), fixed_plain.end(), expected_overlap.begin() + 17);
+    check(overlap == expected_overlap, "overlapping file inflates commit in order through Close");
+    check_hr(s->GetHResult(0), E_DSTORAGE_ZLIB_PARITY_FAIL, "the first failing file inflate supplies the status");
     s->Release();
     q->Release();
     f->Release();
@@ -1415,14 +1434,14 @@ void test_zlib(Env& env) {
     ms->Release();
     mq->Release();
 
-    // Counted when the inflate starts: the 11 file requests (4 good, 7 bad streams) and 4 memory requests (all but the
-    // unreadable source) whose checks passed and whose source was read. Failed: the 7 bad file streams and the memory
+    // Counted when the inflate starts: the 15 file requests (6 good, 9 bad streams) and 4 memory requests (all but the
+    // unreadable source) whose checks passed and whose source was read. Failed: the 9 bad file streams and the memory
     // one with an Adler-32 mismatch; a destination the process cannot write is not a decompression error.
     DSTORAGE_STATS after{};
     env.factory->GetStats(&after);
-    check(after.TotalDecompressionRequestCount - before.TotalDecompressionRequestCount == 15,
+    check(after.TotalDecompressionRequestCount - before.TotalDecompressionRequestCount == 19,
           "TotalDecompressionRequestCount counts the zlib requests that reached the inflate");
-    check(after.DecompressionErrors - before.DecompressionErrors == 8, "DecompressionErrors counts the bad streams");
+    check(after.DecompressionErrors - before.DecompressionErrors == 10, "DecompressionErrors counts the bad streams");
     check(after.PendingDecompressionRequestCount == 0, "no decompression is pending afterwards");
 }
 
