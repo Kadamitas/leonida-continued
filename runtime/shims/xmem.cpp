@@ -32,6 +32,7 @@
 #include "shims.h"
 #include "startup_trace.h"
 #include "xmem_physical.h"
+#include "xmem_heap_profile.h"
 #include "xmem_control_pages.h"
 
 namespace {
@@ -99,7 +100,9 @@ void* allocate_block(size_t size, uint64_t attributes) {
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
-    return allocate_block(size, attributes);
+    void* block = allocate_block(size, attributes);
+    rt::xmem::heap_profile::sample_allocation("XMemAlloc", block, size, attributes, _ReturnAddress());
+    return block;
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
@@ -112,7 +115,9 @@ void __stdcall XMemFree(void* p, uint64_t attributes) {
 // and each public entry point records its own caller and API name.
 void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
     note_attributes("XMemAllocDefault", attributes, size, _ReturnAddress());
-    return allocate_block(size, attributes);
+    void* block = allocate_block(size, attributes);
+    rt::xmem::heap_profile::sample_allocation("XMemAllocDefault", block, size, attributes, _ReturnAddress());
+    return block;
 }
 
 void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {

@@ -20,6 +20,7 @@
 #include "missing_shader_capture.h"
 #include "shims.h"
 #include "xmem_control_pages.h"
+#include "xmem_heap_profile.h"
 #include "xmem_pages.h"
 #include "xbox_linear_texture.h"
 #include "../src/arena_size.h"
@@ -3125,6 +3126,7 @@ public:
         static std::atomic<unsigned> reports{};
         if (!DeviceState::trace_texture_ranges() || reports.fetch_add(1, std::memory_order_relaxed) >= 4) return;
         device_.report_arena();
+        rt::xmem::heap_profile::report();
         MEMORY_BASIC_INFORMATION region{};
         VirtualQuery(address, &region, sizeof(region));
         const auto pages = rt::xmem::find_physical_cpu_view(address, bytes);
@@ -10426,6 +10428,7 @@ public:
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t initial_layout,
                                    const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
+        rt::xmem::heap_profile::check_placement();
         if (out) *out = nullptr;
         if (!title_linear_texture_enabled() && !clear && initial_layout != UINT32_MAX &&
             desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
