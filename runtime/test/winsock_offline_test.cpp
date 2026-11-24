@@ -142,6 +142,10 @@ int main() {
     check(legacy && rt::shims::owns_dll("wsock32.dll") &&
               get_proc(legacy, MAKEINTRESOURCEA(23)) == reinterpret_cast<FARPROC>(sock),
           "legacy Winsock has the same guest socket implementation");
+    check(get_proc(legacy, MAKEINTRESOURCEA(10)) == reinterpret_cast<FARPROC>(&::inet_addr) &&
+              get_proc(legacy, MAKEINTRESOURCEA(11)) == reinterpret_cast<FARPROC>(&::inet_ntoa) &&
+              get_proc(legacy, MAKEINTRESOURCEA(12)) == get_proc(guest, "ioctlsocket"),
+          "legacy Winsock preserves its own address and ioctl ordinals");
     WSASetLastError(1234);
     bool thread_ok = false;
     std::thread thread([&] {

@@ -83,11 +83,12 @@ int WSAAPI address_info(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA* result) {
 
 // The original Winsock ordinals used by this image were checked against the host DLL's export table. Cover both
 // static ordinal imports and named GetProcAddress. Unknown dynamic exports on the owned pseudo-module fail closed.
+#define WS_EXPORT(dll, name, ordinal, function) \
+    {dll, name, reinterpret_cast<void*>(function)}, \
+    {dll, "#" #ordinal, reinterpret_cast<void*>(function)}
 #define WS(name, ordinal, function) \
-    {"ws2_32.dll", name, reinterpret_cast<void*>(function)}, \
-    {"ws2_32.dll", "#" #ordinal, reinterpret_cast<void*>(function)}, \
-    {"wsock32.dll", name, reinterpret_cast<void*>(function)}, \
-    {"wsock32.dll", "#" #ordinal, reinterpret_cast<void*>(function)}
+    WS_EXPORT("ws2_32.dll", name, ordinal, function), \
+    WS_EXPORT("wsock32.dll", name, ordinal, function)
 
 }  // namespace
 }  // namespace rt::winsock
@@ -100,8 +101,11 @@ SHIM_OWNED_TABLE(winsock_offline,
     WS("getsockname", 6, &rt::winsock::name_offline),
     WS("getsockopt", 7, &rt::winsock::get_option),
     WS("htons", 9, &::htons),
-    WS("ioctlsocket", 10, &rt::winsock::ioctl_offline),
-    WS("inet_addr", 11, &::inet_addr),
+    WS_EXPORT("ws2_32.dll", "ioctlsocket", 10, &rt::winsock::ioctl_offline),
+    WS_EXPORT("ws2_32.dll", "inet_addr", 11, &::inet_addr),
+    WS_EXPORT("wsock32.dll", "ioctlsocket", 12, &rt::winsock::ioctl_offline),
+    WS_EXPORT("wsock32.dll", "inet_addr", 10, &::inet_addr),
+    WS_EXPORT("wsock32.dll", "inet_ntoa", 11, &::inet_ntoa),
     WS("listen", 13, &rt::winsock::listen_offline),
     WS("recv", 16, &rt::winsock::recv_offline),
     WS("recvfrom", 17, &rt::winsock::recv_from),
@@ -128,3 +132,4 @@ SHIM_OWNED_TABLE(winsock_offline,
 );
 
 #undef WS
+#undef WS_EXPORT
