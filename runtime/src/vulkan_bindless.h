@@ -1,5 +1,7 @@
 #pragma once
 
+#include "frame_profile.h"
+
 // The bindless descriptor set of translated shaders: set 0 of the contract in docs/design.md and
 // docs/d3d12_vulkan.md section 5, as tools/rdna2spirv.py declares it.
 //
@@ -535,6 +537,7 @@ public:
     // compares with what has completed. False when the new generation cannot be made: the set then still has the
     // table as of the last flush.
     bool flush(VkCommandBuffer command_buffer, std::uint64_t retire_ticket = 0) {
+        const auto profile_start = FrameProfile::now();
         bool replaced = false;
         bool written = true;
         const bool must_replace = flush_replaces_table();
@@ -543,11 +546,13 @@ public:
         // The new generation could not be made: the current set is the one running work reads, so its descriptors are
         // not written in place either. The pending writes and the table's changes stay for the next flush.
         if (!written && must_replace) return false;
+        const auto profile_after_table = FrameProfile::now();
         for (const Pending& pending : pending_) {
             if (pending.binding >= shadow_.size() || pending.index >= shadow_[pending.binding].size()) continue;
             shadow_[pending.binding][pending.index] = pending.info;
             shadow_written_[pending.binding][pending.index] = 1;
         }
+        const auto profile_after_shadow = FrameProfile::now();
         if (replaced) {
             write_shadow();  // includes the pending writes just folded in
         } else if (!pending_.empty()) {
@@ -564,8 +569,11 @@ public:
             }
             vk_.vkUpdateDescriptorSets(device_, std::uint32_t(writes.size()), writes.data(), 0, nullptr);
         }
+        const auto profile_after_descriptors = FrameProfile::now();
         for (const Pending& pending : pending_) pending_at_[pending.binding][pending.index] = 0;
         pending_.clear();
+        flush_profile_.record("descriptor-table,shadow,updates,cleanup", profile_start, profile_after_table,
+                              profile_after_shadow, profile_after_descriptors);
         return written;
     }
 
@@ -1080,6 +1088,7 @@ private:
     };
     std::vector<Generation> retired_;
     std::uint64_t generations_made_ = 0;
+    FrameProfile flush_profile_;
     bool last_flush_replaced_ = false;
     std::array<VkDescriptorPoolSize, bindless::bindings.size()> pool_sizes_{};
     std::uint32_t pool_size_count_ = 0;
