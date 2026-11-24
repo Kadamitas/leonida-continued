@@ -10258,10 +10258,11 @@ public:
             }
             // Serialize the observed repeat placement through publication of its first native image. Address
             // SRV creation already takes this lock before title_placement_mutex in the same order.
-            const bool repeat_bc5 = desc.Format == DXGI_FORMAT_BC5_UNORM && desc.DepthOrArraySize == 1 &&
-                title_display_bc_texture_shape(desc);
+            const bool repeat_typed_placement = desc.DepthOrArraySize == 1 && title_display_bc_texture_shape(desc) &&
+                (desc.Format == DXGI_FORMAT_BC5_UNORM || desc.Format == DXGI_FORMAT_BC7_UNORM ||
+                 desc.Format == DXGI_FORMAT_BC7_UNORM_SRGB);
             std::unique_lock cache_lock(state_.host_static_texture_mutex);
-            if (repeat_bc5) {
+            if (repeat_typed_placement) {
                 Resource* pinned = nullptr;
                 {
                     std::lock_guard placement_lock(state_.title_placement_mutex);
@@ -10343,7 +10344,7 @@ public:
                     return d3d12_trace::result(method, image.QueryInterface(riid, out));
                 }
             }
-            if (!repeat_bc5) cache_lock.unlock();
+            if (!repeat_typed_placement) cache_lock.unlock();
             const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
             try {
                 const auto release = [](Resource* resource) { resource->Release(); };
