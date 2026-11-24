@@ -3161,7 +3161,7 @@ public:
             !desc_.Alignment && desc_.Height == 1 && desc_.DepthOrArraySize == 1 && desc_.MipLevels == 1 &&
             desc_.Format == DXGI_FORMAT_UNKNOWN && desc_.SampleDesc.Count == 1 && !desc_.SampleDesc.Quality &&
             desc_.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && alignment == 4096 && bytes == 8192 &&
-            start % rt::xmem::kPhysicalPageBytes == rt::xmem::kPhysicalPageBytes - bytes &&
+            start % rt::xmem::kPhysicalPageBytes <= rt::xmem::kPhysicalPageBytes - bytes &&
             diagnostic_region.Type == MEM_MAPPED && diagnostic_region.Protect == PAGE_NOACCESS) {
             const auto* ops = rt::xmem::physical_import_ops();
             if (void* backing = ops ? ops->pin(imported_address, bytes) : nullptr) {
