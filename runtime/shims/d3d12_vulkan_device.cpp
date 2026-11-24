@@ -1169,11 +1169,18 @@ struct DeviceState {
 
     // Called with the sampled-image cache locked after image, caller reference and cache node are ready.
     // Change placement protection only on successful publication, under the native placement/host range lock.
-    bool reserve_sampled_alias(std::uint64_t start, std::uint64_t bytes, TitleImageCollision& conflict) {
+    bool reserve_sampled_alias(std::uint64_t start, std::uint64_t bytes, TitleImageCollision& conflict,
+                               bool revalidate_shared_span = false) {
         std::lock_guard lock(title_placement_mutex);
         auto source = title_address_views.find(start);
         if (source == title_address_views.end()) {
             conflict = {start, 0, "no previous source registration"};
+            return false;
+        }
+        const auto shared_span = std::max(source->second.bytes, bytes);
+        if (revalidate_shared_span && rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(start), shared_span) !=
+            rt::xmem::SparseTextureSnapshot::ready) {
+            conflict = {start, shared_span, "cubemap source outside physical store"};
             return false;
         }
         if (title_image_overlap_locked(start, bytes, DXGI_FORMAT_UNKNOWN, 0, &conflict) ||
@@ -4555,14 +4562,17 @@ private:
 using CachedTextures = decltype(DeviceState::host_static_textures);
 
 bool distinct_sampled_sources(CachedTextures::const_iterator first, CachedTextures::const_iterator last,
-                              const D3D12_RESOURCE_DESC& requested) {
+                              const D3D12_RESOURCE_DESC& requested, bool cube_alias = false) {
     return std::all_of(first, last, [&](const auto& item) {
         const auto& other = *static_cast<Resource*>(item.second.owner.get());
         const auto& shape = other.desc();
         // These fixed fields are encoded in every T#, independently of the selected view range and tile mode.
         const bool single_surface = shape.DepthOrArraySize == 1 ||
             (other.sampled_tile_bytes() == 4096 && title_sampled_volume_4ks_query(shape));
-        return (other.linear_host_image() || other.sampled_tile_bytes()) && single_surface &&
+        const bool compatible_cube = other.sampled_tile_bytes() == 4096 && shape.DepthOrArraySize == 6 &&
+            shape.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && shape.Width == shape.Height &&
+            shape.Format == requested.Format;
+        return (other.linear_host_image() || other.sampled_tile_bytes()) && (cube_alias ? compatible_cube : single_surface) &&
             (shape.Dimension != requested.Dimension || shape.Width != requested.Width ||
              shape.Height != requested.Height || shape.MipLevels != requested.MipLevels);
     });
@@ -13967,6 +13977,8 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
             return same_texture_shape(image.desc(), resource) && bool(linear_layout) == image.linear_host_image() &&
                 (!tiled_layout || image.sampled_tile_bytes() == tiled_layout->tile_bytes);
         });
+        const bool cube_alias = tiled_layout && tiled_layout->tile_bytes == 4096 && cube_faces && faces == 6 &&
+            resource.Format == DXGI_FORMAT_BC7_UNORM && view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE;
         bool physical_alias = false;
         if (found == last && first != last) {
             // Preserve the established standard-4KB single-layer alias profile.
@@ -13978,11 +13990,11 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                         sibling.desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && sibling.desc().DepthOrArraySize == 1;
                 });
             if (!small_tiles) {
-                const bool distinct = distinct_sampled_sources(first, last, resource);
+                const bool distinct = distinct_sampled_sources(first, last, resource, cube_alias);
                 // A 3D descriptor represents one volume, including its padded depth, in a single XMem span.
                 const bool one_surface = (!is_volume && faces == 1 && (linear_layout || tiled_layout)) ||
                     (volume && title_sampled_volume_4ks_query(resource));
-                physical_alias = one_surface && distinct && physical_snapshot;
+                physical_alias = (one_surface || cube_alias) && distinct && physical_snapshot;
                 if (!physical_alias) {
                     report_sampled_siblings(address, first, last, int(backing), distinct);
                     return sampled_view_failure("incompatible cached shape at same address", E_NOTIMPL, address,
@@ -14043,7 +14055,7 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                 CachedTextures staged;
                 const auto row = staged.emplace(address, DeviceState::CachedTexture{std::move(owner), placement_bytes});
                 DeviceState::TitleImageCollision conflict{};
-                if (!state.reserve_sampled_alias(address, source_bytes, conflict)) {
+                if (!state.reserve_sampled_alias(address, source_bytes, conflict, cube_alias)) {
                     report_sampled_siblings(address, first, last, int(backing), true);
                     return sampled_view_failure("physical sampled alias overlaps an incompatible owner", E_NOTIMPL,
                                                 address, resource, view, source_bytes, conflict, int(backing));
