@@ -3,8 +3,8 @@
 The console title reads its streamed data through Xbox DirectStorage: `DStorageGetFactory` hands out a factory, the
 factory opens files and creates queues, and a queue reads file or memory ranges into memory and reports completion
 through status arrays, `ID3D12Fence` signals and events. `runtime/shims/dstorage.cpp` serves that API on the PC:
-files open through the runtime's `GAME:` mapping and write overlay, and a worker thread per queue does the reads
-and inflates zlib requests.
+files open through the runtime's `GAME:` mapping and write overlay. Each queue worker reads source ranges and
+publishes completed requests in order.
 This page records which DLL and ABI the console title is expected to use, how sure that is, and what the shim does.
 
 ## Which DLL and which ABI: the evidence
@@ -59,7 +59,8 @@ The first boot with the executable settles most of this: the dry-run report show
 - **Factory**: one object for the process, never freed (its reference count does not drop below one).
   `SetDebugFlags` and `SetCpuAffinity` are stored only (a console core mask means nothing on the host).
   `SetStagingBufferSize` accepts 0, 16, 20, 24, 28 and 32 MiB, fails with `E_DSTORAGE_INVALID_STAGING_BUFFER_SIZE`
-  otherwise and with `E_DSTORAGE_STAGING_BUFFER_LOCKED` while a queue or file exists; there is no staging buffer.
+  otherwise and with `E_DSTORAGE_STAGING_BUFFER_LOCKED` while a queue or file exists. The optional parallel
+  inflater uses this size as its shared staging budget.
   `GetStats` reports the counts the shim keeps (queues per priority, requests, bytes, files, errors, zlib
   inflates: `TotalDecompressionRequestCount` grows when a zlib request's inflate starts, which is after its checks
   passed and its source was read, `PendingDecompressionRequestCount` is the inflates running, and
@@ -168,9 +169,18 @@ The first boot with the executable settles most of this: the dry-run report show
 - **Parallel reads**: the worker reads one request at a time. Overlapped reads with in-order retirement of
   notifications would keep the order guarantee.
 
+## Parallel file decompression
+
+Set `LEONIDA_DSTORAGE_PARALLEL_ZLIB=1` to allow four workers shared by file queues to inflate adjacent zlib
+requests. The default runs each inflate on its queue worker. File reads and destination writes stay in queue
+order, including overlapping writes. A queue retires earlier work before publishing statuses, signals or events.
+The compressed input, expected output and a scratch allowance count against the staging budget until the result
+retires. Requests larger than that budget run serially. Set `LEONIDA_PROFILE_STORAGE=1` to report the job count,
+peak concurrent decodes, peak charged staging bytes and waits for pool capacity.
+
 ## Tests
 
-`runtime/test/dstorage_test.cpp` (ctest `dstorage`) runs on synthetic files in `%TEMP%` through the registry entries
+`runtime/test/dstorage_test.cpp` (ctest `dstorage` and `dstorage_parallel_zlib`) runs on synthetic files in `%TEMP%` through the registry entries
 under all three module names: `GAME:` reads with an overlay copy winning, offsets, zero size, a range past the end,
 cancellation, auto-submit, a full queue, status arrays, fences (a CPU fence object that checks the data is in place
 when it is signalled), events, error records, file and queue close with requests in flight, a destination the

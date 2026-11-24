@@ -7,17 +7,16 @@
 //     runtime's console path mapping and write overlay (file_system.cpp) exactly as the title's own CreateFileW.
 //   - Each queue has one worker thread that runs its submitted entries in order: a request reads a file range or
 //     copies a memory range into the destination, a status entry, fence signal or event runs when every entry before
-//     it has. Completion is therefore in queue order, as the API guarantees.
-//   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
-//     the runtime's RFC 1950 inflater (leonida::zlib_inflate, src/shader_library.h) and copies the result to the
-//     destination only when it is exactly DestinationSize bytes; a stream that fails leaves the destination as it was.
-//   - BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages between
-//     the read and the destination write, BCPack after the inflate).
+//     it has. LEONIDA_DSTORAGE_PARALLEL_ZLIB=1 lets a shared four-worker pool inflate eligible file requests.
+//     The queue worker still commits every destination and reports each completion in order.
+//   - Zlib uses the RFC 1950 inflater in src/shader_library.h and publishes only exact-size results.
+//   - BCPack, swizzle and physical-page requests fail with E_NOTIMPL.
 // Nothing here goes online or touches the GPU.
 #include <windows.h>
 #include <d3d12.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -27,6 +26,8 @@
 #include <mutex>
 #include <new>
 #include <set>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -190,6 +191,7 @@ HRESULT bad_call(const char* method, HRESULT hr, const char* what) {
 struct Stats {
     std::mutex mutex;
     DSTORAGE_STATS s{};
+    uint32_t staging_size = 32u << 20;
     uint32_t live_queues = 0;  // all priorities; SetStagingBufferSize is refused while queues or files exist
 };
 
@@ -479,6 +481,181 @@ struct Entry {
     HANDLE event = nullptr;  // a duplicate the entry owns
 };
 
+class DecompressionScope {
+public:
+    DecompressionScope() {
+        std::lock_guard lock(stats().mutex);
+        ++stats().s.PendingDecompressionRequestCount;
+        ++stats().s.TotalDecompressionRequestCount;
+    }
+    ~DecompressionScope() {
+        std::lock_guard lock(stats().mutex);
+        --stats().s.PendingDecompressionRequestCount;
+        if (!succeeded_) ++stats().s.DecompressionErrors;
+    }
+    void succeeded() { succeeded_ = true; }
+private:
+    bool succeeded_ = false;
+};
+
+HRESULT inflate_request(std::span<const uint8_t> source, std::vector<uint8_t>& inflated, uint32_t expected) {
+    inflated.reserve(expected);
+    static std::once_flag logged;
+    std::call_once(logged, [] {
+        log_once("zlib", "zlib requests are inflated on the CPU (RFC 1950, leonida::zlib_inflate)");
+    });
+    DecompressionScope pending;
+    leonida::ZlibError why = leonida::ZlibError::none;
+    if (!leonida::zlib_inflate(source, inflated, expected, &why)) {
+        switch (why) {
+            case leonida::ZlibError::header: return E_DSTORAGE_ZLIB_BAD_HEADER;
+            case leonida::ZlibError::checksum: return E_DSTORAGE_ZLIB_PARITY_FAIL;
+            case leonida::ZlibError::limit: return E_DSTORAGE_DECOMPRESSION_ERROR;
+            default: return E_DSTORAGE_ZLIB_BAD_DATA;
+        }
+    }
+    if (inflated.size() != expected) return E_DSTORAGE_DECOMPRESSION_ERROR;
+    pending.succeeded();
+    return S_OK;
+}
+
+// The four process-wide slots bound both decoding and completed outputs waiting behind an earlier request.
+class InflatePool {
+public:
+    static constexpr size_t slots = 4;
+    struct Job {
+        PTP_WORK work = nullptr;
+        std::unique_ptr<uint8_t[]> source;
+        size_t source_size = 0;
+        std::vector<uint8_t> output;
+        uint32_t expected = 0;
+        size_t charge = 0;
+        InflatePool* owner = nullptr;
+        HRESULT result = S_OK;
+    };
+
+    static std::shared_ptr<InflatePool> acquire() {
+        char enabled[2]{};
+        if (GetEnvironmentVariableA("LEONIDA_DSTORAGE_PARALLEL_ZLIB", enabled, sizeof(enabled)) != 1 ||
+            enabled[0] != '1') return {};
+        static std::mutex mutex;
+        static std::weak_ptr<InflatePool> current;
+        std::lock_guard lock(mutex);
+        if (auto pool = current.lock()) return pool;
+        auto pool = std::make_shared<InflatePool>();
+        if (!pool->initialize()) return {};
+        current = pool;
+        return pool;
+    }
+
+    ~InflatePool() {
+        // Queues hold the shared owner until Close has retired every job.
+        for (auto& job : jobs_) if (job.work) CloseThreadpoolWork(job.work);
+        if (pool_) CloseThreadpool(pool_);
+        if (profile_ && claimed_)
+            std::fprintf(stderr, "[rt] dstorage: parallel zlib jobs=%llu peak_active=%u peak_reserved=%zu "
+                         "pool_capacity_waits=%llu\n", static_cast<unsigned long long>(claimed_), peak_active_,
+                         peak_reserved_, static_cast<unsigned long long>(waits_));
+    }
+
+    // Includes the compressed input, exact-size result and a fixed allowance for the dynamic Huffman
+    // tables and worker bookkeeping. The decoder never expands its output past the reserved length.
+    static uint64_t charge(const DSTORAGE_REQUEST& r) {
+        return uint64_t(r.SourceSize) + r.DestinationSize + 16 * 1024;
+    }
+
+    Job* try_claim(size_t charge, size_t budget) {
+        std::lock_guard lock(mutex_);
+        if (!free_count_ || used_ + charge > budget) return nullptr;
+        Job* job = free_[--free_count_];
+        job->charge = charge;
+        used_ += charge;
+        if (profile_) {
+            ++claimed_;
+            peak_reserved_ = (std::max)(peak_reserved_, used_);
+        }
+        return job;
+    }
+
+    void notify_cancellation() {
+        // Synchronize with predicate evaluation so a cancellation between checking and waiting is observed.
+        std::lock_guard lock(mutex_);
+        available_.notify_all();
+    }
+
+    void wait_for_space(size_t charge, size_t budget, const std::atomic_uint64_t& changed, uint64_t generation) {
+        std::unique_lock lock(mutex_);
+        if (profile_) ++waits_;
+        available_.wait(lock, [&] {
+            return changed.load(std::memory_order_relaxed) != generation ||
+                (free_count_ && used_ + charge <= budget);
+        });
+    }
+
+    void release(Job& job) {
+        job.source.reset();
+        std::vector<uint8_t>().swap(job.output);
+        std::lock_guard lock(mutex_);
+        used_ -= job.charge;
+        job.charge = 0;
+        free_[free_count_++] = &job;
+        available_.notify_all();
+    }
+
+private:
+    static void CALLBACK decode(PTP_CALLBACK_INSTANCE, void* context, PTP_WORK) noexcept {
+        Job& job = *static_cast<Job*>(context);
+        auto& pool = *job.owner;
+        if (pool.profile_) {
+            std::lock_guard lock(pool.mutex_);
+            pool.peak_active_ = (std::max)(++pool.active_, pool.peak_active_);
+        }
+        try {
+            job.result = inflate_request({job.source.get(), job.source_size}, job.output, job.expected);
+        } catch (const std::bad_alloc&) {
+            job.result = E_OUTOFMEMORY;
+        } catch (const std::length_error&) {
+            job.result = E_OUTOFMEMORY;
+        }
+        if (pool.profile_) {
+            std::lock_guard lock(pool.mutex_);
+            --pool.active_;
+        }
+    }
+
+    bool initialize() {
+        char profile[2]{};
+        profile_ = GetEnvironmentVariableA("LEONIDA_PROFILE_STORAGE", profile, sizeof(profile)) == 1 && profile[0] == '1';
+        pool_ = CreateThreadpool(nullptr);
+        if (!pool_) return false;
+        SetThreadpoolThreadMaximum(pool_, static_cast<DWORD>(slots));
+        if (!SetThreadpoolThreadMinimum(pool_, static_cast<DWORD>(slots))) return false;
+        TP_CALLBACK_ENVIRON env{};
+        InitializeThreadpoolEnvironment(&env);
+        SetThreadpoolCallbackPool(&env, pool_);
+        for (auto& job : jobs_) {
+            job.owner = this;
+            job.work = CreateThreadpoolWork(decode, &job, &env);
+            if (!job.work) break;
+            free_[free_count_++] = &job;
+        }
+        DestroyThreadpoolEnvironment(&env);
+        return jobs_.back().work != nullptr;
+    }
+
+    PTP_POOL pool_ = nullptr;
+    std::array<Job, slots> jobs_{};
+    std::array<Job*, slots> free_{};
+    size_t free_count_ = 0;
+    std::mutex mutex_;
+    std::condition_variable available_;
+    size_t used_ = 0;
+    bool profile_ = false;
+    uint64_t claimed_ = 0, waits_ = 0;
+    unsigned active_ = 0, peak_active_ = 0;
+    size_t peak_reserved_ = 0;
+};
+
 class Queue final : public IDStorageQueueX2 {
 public:
     explicit Queue(const DSTORAGE_QUEUE_DESC1& desc) : desc_(desc) {
@@ -490,10 +667,15 @@ public:
         ++p.CumulativeQueueCount;
         p.MaxQueueCount = std::max(p.MaxQueueCount, p.CurrentQueueCount);
         ++stats().live_queues;
+        budget_ = stats().staging_size;
     }
     // Separate from the constructor so a failure to start the thread can be reported.
     bool start() {
         if (!error_event_) return false;
+        if (budget_ && desc_.SourceType == DSTORAGE_REQUEST_SOURCE_FILE) {
+            try { pool_ = InflatePool::acquire(); }
+            catch (const std::bad_alloc&) { /* Serial execution needs no pool. */ }
+        }
         try {
             worker_ = std::thread([this] { run(); });
         } catch (...) {
@@ -605,8 +787,16 @@ public:
     // without being read (the overview: the title may no longer use its result).
     void STDMETHODCALLTYPE CancelRequestsWithTag(UINT64 mask, UINT64 value) override {
         std::lock_guard lock(mutex_);
-        for (Entry& e : entries_)
-            if (e.type == Entry::Type::Request && (e.request.CancellationTag & mask) == value) e.cancelled = true;
+        bool changed = false;
+        for (Entry& e : entries_) {
+            if (e.type != Entry::Type::Request || e.cancelled || (e.request.CancellationTag & mask) != value) continue;
+            e.cancelled = true;
+            changed = true;
+        }
+        if (changed && pool_) {
+            cancel_generation_.fetch_add(1, std::memory_order_relaxed);
+            pool_->notify_cancellation();
+        }
     }
 
     // Submits what is enqueued, waits until the worker has run all of it and stops the worker. Later enqueues are
@@ -679,7 +869,7 @@ private:
     size_t usable() const { return desc_.Capacity - 1u; }
     size_t half() const { return desc_.Capacity / 2u; }
     bool auto_submit() const { return !desc_.Options.AutoSubmitDisabled; }
-    size_t used_locked() const { return entries_.size() + (in_flight_ ? 1 : 0); }
+    size_t used_locked() const { return entries_.size() + in_flight_; }
 
     void enqueue(Entry&& e) {
         {
@@ -726,37 +916,108 @@ private:
         }
     }
 
+    Entry start_locked() {
+        Entry e = std::move(entries_.front());
+        entries_.pop_front();
+        --submitted_;
+        ++in_flight_;
+        return e;
+    }
+
+    void finish(Entry& e) {
+        release_references(e);
+        std::lock_guard lock(mutex_);
+        --in_flight_;
+        space_.notify_all();
+        if (entries_.empty() && !in_flight_) idle_.notify_all();
+    }
+
+    bool parallel_eligible(const Entry& e) const {
+        const auto o = e.request.Options.AsUINT64;
+        return e.type == Entry::Type::Request && !e.cancelled && SUCCEEDED(e.enqueue_error) &&
+            options::source_type(o) == DSTORAGE_REQUEST_SOURCE_FILE && options::zlib(o) &&
+            !(o & (options::kDestinationPages | options::kSourcePages)) &&
+            !options::swizzle(o) && !options::bcpack(o) && InflatePool::charge(e.request) <= budget_;
+    }
+
+    struct Flight {
+        Entry entry;
+        InflatePool::Job* job = nullptr;
+        HRESULT prepared = S_OK;
+    };
+
+    void retire(Flight& f) {
+        auto& job = *f.job;
+        HRESULT hr = f.prepared;
+        if (SUCCEEDED(hr)) {
+            WaitForThreadpoolWorkCallbacks(job.work, FALSE);
+            hr = job.result;
+            if (SUCCEEDED(hr) && !guarded_move(f.entry.request.Destination, job.output.data(), job.output.size()))
+                hr = E_DSTORAGE_ACCESS_VIOLATION;
+        }
+        pool_->release(job);
+        process(f.entry, &hr);
+        finish(f.entry);
+    }
+
     void run() {
+        std::array<Flight, InflatePool::slots> flights{};
+        size_t head = 0, count = 0;
         for (;;) {
-            Entry e;
-            {
-                std::unique_lock lock(mutex_);
-                work_.wait(lock, [&] { return submitted_ > 0 || closed_; });
-                if (submitted_ == 0) return;  // closed and drained
-                e = std::move(entries_.front());
-                entries_.pop_front();
-                --submitted_;
-                in_flight_ = true;
+            std::unique_lock lock(mutex_);
+            if (!count) work_.wait(lock, [&] { return submitted_ || closed_; });
+            if (pool_ && submitted_ && parallel_eligible(entries_.front())) {
+                const auto charge = static_cast<size_t>(InflatePool::charge(entries_.front().request));
+                if (auto* job = pool_->try_claim(charge, budget_)) {
+                    Flight& f = flights[(head + count) % flights.size()];
+                    f.entry = start_locked();  // this is the cancellation boundary, after reserving space
+                    lock.unlock();
+                    f.job = job;
+                    set_pending(+1);
+                    try {
+                        f.prepared = execute_request(f.entry, job);
+                    } catch (const std::bad_alloc&) {
+                        f.prepared = E_OUTOFMEMORY;
+                    } catch (const std::length_error&) {
+                        f.prepared = E_OUTOFMEMORY;
+                    }
+                    if (SUCCEEDED(f.prepared)) SubmitThreadpoolWork(job->work);
+                    ++count;
+                    continue;
+                }
+                if (!count) {
+                    const auto generation = cancel_generation_.load(std::memory_order_relaxed);
+                    lock.unlock();
+                    pool_->wait_for_space(charge, budget_, cancel_generation_, generation);
+                    continue; // may have been cancelled while capacity was held by another queue
+                }
             }
+            if (count) {
+                lock.unlock();
+                retire(flights[head]);
+                head = (head + 1) % flights.size();
+                --count;
+                continue;
+            }
+            if (!submitted_) return;
+            Entry e = start_locked();
+            lock.unlock();
             process(e);
-            release_references(e);
-            {
-                std::lock_guard lock(mutex_);
-                in_flight_ = false;
-                space_.notify_all();
-                if (entries_.empty()) idle_.notify_all();
-            }
+            finish(e);
         }
     }
 
     // Runs on the worker. since_notify_ is the first failure since the last status entry or fence signal: the
     // HRESULT a status entry reports.
-    void process(Entry& e) {
+    void process(Entry& e, const HRESULT* prepared = nullptr) {
         HRESULT hr = e.enqueue_error;
         switch (e.type) {
             case Entry::Type::Request:
                 // A cancelled request is a success whatever else is wrong with it (the GDK: not counted as a failure).
-                if (e.cancelled) {
+                if (prepared) {
+                    hr = *prepared;
+                    set_pending(-1);
+                } else if (e.cancelled) {
                     hr = S_OK;
                 } else if (SUCCEEDED(hr)) {
                     // Pending: processing has started and not completed (DSTORAGE_PRIORITY_STATS).
@@ -789,7 +1050,7 @@ private:
         }
     }
 
-    HRESULT execute_request(const Entry& e) {
+    HRESULT execute_request(const Entry& e, InflatePool::Job* job = nullptr) {
         const DSTORAGE_REQUEST& r = e.request;
         const uint64_t o = r.Options.AsUINT64;
         if (o & options::kReservedMask) return E_DSTORAGE_RESERVED_FIELDS;
@@ -828,74 +1089,39 @@ private:
             if (!r.File) return E_INVALIDARG;
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
-        if (zlib) return inflate_request(e, memory);
-        if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
-        if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
-        return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
-    }
-
-    // A zlib request whose checks have passed: the source (SourceSize bytes of the file or of memory) goes into a
-    // staging buffer, inflates there, and only a result of exactly DestinationSize bytes is copied to the destination.
-    // So a failed stream leaves the destination as it was, and a memory source that overlaps its destination is safe.
-    // Both buffers are at most 32 MiB (execute_request). The stream is RFC 1950: the two header bytes, the deflate
-    // data, the Adler-32 of the result; bytes after the Adler-32 are not read. A failure is the matching
-    // dstorageerr.h code: a bad header (not deflate, a window over 32 KiB, a bad check value or a preset dictionary)
-    // E_DSTORAGE_ZLIB_BAD_HEADER, bad or truncated deflate data E_DSTORAGE_ZLIB_BAD_DATA, an Adler-32 mismatch
-    // E_DSTORAGE_ZLIB_PARITY_FAIL, and a stream that inflates to more or fewer bytes than DestinationSize
-    // E_DSTORAGE_DECOMPRESSION_ERROR (no code names a size mismatch; this is the header's generic one).
-    HRESULT inflate_request(const Entry& e, bool memory) {
-        const DSTORAGE_REQUEST& r = e.request;
-        std::vector<uint8_t> source, result;
+        if (job) {
+            if (r.SourceSize) job->source = std::make_unique_for_overwrite<uint8_t[]>(r.SourceSize);
+            job->source_size = r.SourceSize;
+            job->expected = r.DestinationSize;
+            return r.SourceSize ? read_file_range(e.file->handle(), r.FileOffset, job->source.get(), r.SourceSize) : S_OK;
+        }
+        if (!zlib) {
+            if (r.SourceSize == 0) return S_OK;
+            if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+            return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+        }
         try {
-            source.resize(r.SourceSize);
-            result.reserve(r.DestinationSize);
+            std::vector<uint8_t> source(r.SourceSize), output;
+            if (r.SourceSize) {
+                if (memory) {
+                    if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
+                } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
+                           FAILED(hr)) {
+                    return hr;
+                }
+            }
+            if (const HRESULT hr = inflate_request(source, output, r.DestinationSize); FAILED(hr)) return hr;
+            return guarded_move(r.Destination, output.data(), output.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
+        } catch (const std::length_error&) {
+            return E_OUTOFMEMORY;
         }
-        if (r.SourceSize != 0) {
-            if (memory) {
-                if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
-            } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
-                       FAILED(hr)) {
-                return hr;
-            }
-        }
-        log_once("zlib", "zlib requests are inflated on the CPU (RFC 1950, leonida::zlib_inflate)");
-        set_decompression_pending(+1);
-        leonida::ZlibError why = leonida::ZlibError::none;
-        const bool inflated = leonida::zlib_inflate(source, result, r.DestinationSize, &why);
-        set_decompression_pending(-1);
-        HRESULT hr = S_OK;
-        if (!inflated) {
-            switch (why) {
-                case leonida::ZlibError::header: hr = E_DSTORAGE_ZLIB_BAD_HEADER; break;
-                case leonida::ZlibError::checksum: hr = E_DSTORAGE_ZLIB_PARITY_FAIL; break;
-                case leonida::ZlibError::limit: hr = E_DSTORAGE_DECOMPRESSION_ERROR; break;  // longer than the destination
-                default: hr = E_DSTORAGE_ZLIB_BAD_DATA; break;
-            }
-        } else if (result.size() != r.DestinationSize) {
-            hr = E_DSTORAGE_DECOMPRESSION_ERROR;  // shorter than the destination
-        }
-        if (FAILED(hr)) {
-            std::lock_guard lock(stats().mutex);
-            ++stats().s.DecompressionErrors;
-            return hr;
-        }
-        return guarded_move(r.Destination, result.data(), result.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
     }
 
     void set_pending(int delta) {
         std::lock_guard lock(stats().mutex);
         priority_stats(stats().s, desc_.Priority).PendingRequestCount += static_cast<uint32_t>(delta);
-    }
-
-    // PendingDecompressionRequestCount is the zlib requests being inflated; TotalDecompressionRequestCount counts each
-    // one that reached its inflate (its source was read), DecompressionErrors those whose stream then failed.
-    static void set_decompression_pending(int delta) {
-        std::lock_guard lock(stats().mutex);
-        auto& s = stats().s;
-        s.PendingDecompressionRequestCount += static_cast<uint32_t>(delta);
-        if (delta > 0) ++s.TotalDecompressionRequestCount;
     }
 
     void describe(const Entry& e, DSTORAGE_ERROR_FIRST_FAILURE& f) const {
@@ -971,7 +1197,10 @@ private:
     std::condition_variable work_, space_, idle_;
     std::deque<Entry> entries_;
     size_t submitted_ = 0;  // the first submitted_ entries are submitted
-    bool in_flight_ = false;
+    size_t in_flight_ = 0;
+    size_t budget_ = 0;
+    std::atomic_uint64_t cancel_generation_{0};
+    std::shared_ptr<InflatePool> pool_;
     bool closing_ = false;
     bool closed_ = false;
     std::thread worker_;
@@ -1089,7 +1318,7 @@ public:
                             "not one of 0, 16, 20, 24, 28 or 32 MiB");
         std::lock_guard lock(stats().mutex);
         if (stats().live_queues || stats().s.CurrentOpenFileCount) return E_DSTORAGE_STAGING_BUFFER_LOCKED;
-        staging_size_ = size;  // there is no staging buffer here; the size is only kept
+        stats().staging_size = size;
         return S_OK;
     }
 
@@ -1119,7 +1348,6 @@ private:
     std::atomic<ULONG> refs_{1};
     std::atomic<uint64_t> cpu_affinity_{~0ull};
     std::atomic<uint32_t> debug_flags_{0};
-    uint32_t staging_size_ = 32u << 20;  // under stats().mutex
 };
 
 Factory& factory() {
