@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace leonida {
@@ -63,7 +65,9 @@ struct DescriptorEntry {
     std::uint32_t index = 0;
     std::uint32_t pad = 0; // 0 when empty, kSlotOccupiedMarker when occupied
 };
-static_assert(sizeof(DescriptorEntry) == 40);
+static_assert(std::is_trivially_copyable_v<DescriptorEntry> && sizeof(DescriptorEntry) == 40 &&
+              offsetof(DescriptorEntry, key) == 0 && offsetof(DescriptorEntry, index) == 32 &&
+              offsetof(DescriptorEntry, pad) == 36);
 
 class DescriptorTable {
 public:
@@ -182,13 +186,7 @@ public:
     std::vector<std::uint32_t> build_gpu_buffer(bool clear_pad = false) const {
         std::lock_guard lock(mutex_);
         std::vector<std::uint32_t> out(1 + entries_.size() * 10, 0);
-        out[0] = mask_;
-        for (std::size_t s = 0; s < entries_.size(); ++s) {
-            const std::size_t base = 1 + s * 10;
-            std::memcpy(&out[base], entries_[s].key, sizeof(entries_[s].key));
-            out[base + 8] = entries_[s].index;
-            out[base + 9] = clear_pad ? 0 : entries_[s].pad;
-        }
+        write_locked(out.data(), clear_pad);
         return out;
     }
 
@@ -229,20 +227,20 @@ public:
     void write_to_buffer(void* dest, bool clear_pad = false) const {
         if (!dest) return;
         std::lock_guard lock(mutex_);
-        auto* out = static_cast<std::uint8_t*>(dest);
-        std::memcpy(out, &mask_, sizeof(mask_));
-        out += sizeof(mask_);
-        for (const auto& entry : entries_) {
-            std::uint32_t slot[10];
-            std::memcpy(slot, entry.key, sizeof(entry.key));
-            slot[8] = entry.index;
-            slot[9] = clear_pad ? 0 : entry.pad;
-            std::memcpy(out, slot, sizeof(slot));
-            out += sizeof(slot);
-        }
+        write_locked(dest, clear_pad);
     }
 
 private:
+    void write_locked(void* dest, bool clear_pad) const {
+        auto* out = static_cast<std::uint8_t*>(dest);
+        std::memcpy(out, &mask_, sizeof(mask_));
+        out += sizeof(mask_);
+        std::memcpy(out, entries_.data(), entries_.size() * sizeof(DescriptorEntry));
+        if (clear_pad)
+            for (std::size_t i = 0; i < entries_.size(); ++i)
+                std::memset(out + i * sizeof(DescriptorEntry) + offsetof(DescriptorEntry, pad), 0, sizeof(std::uint32_t));
+    }
+
     void mark(std::uint32_t slot) { changed_slots_.push_back(slot); }
 
     // All eight slots for the incoming key are occupied. Try moving one resident
