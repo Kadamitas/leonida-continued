@@ -367,8 +367,8 @@ private:
 class BindlessSet {
 public:
     BindlessSet(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
-                BindlessFeatures features = {})
-        : device_(device), memory_(memory), features_(features) {
+                BindlessFeatures features = {}, DescriptorHashKind hash_kind = DescriptorHashKind::fnv1a)
+        : device_(device), memory_(memory), features_(features), table_(64, hash_kind) {
         ok_ = vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffers() && fill();
     }
 
@@ -1171,7 +1171,7 @@ private:
     std::vector<Pending> pending_;
     std::array<std::vector<std::uint32_t>, bindless::bindings.size()> pending_at_;  // one-based position, zero if absent
     std::vector<VkWriteDescriptorSet> pending_writes_;
-    DescriptorTable table_{64};
+    DescriptorTable table_;
     TableBuffers table_buffers_;
     bool table_uploaded_ = false;  // the table's current contents are in table_buffers_.table
     bool table_device_local_ = false;

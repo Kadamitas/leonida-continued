@@ -1512,7 +1512,13 @@ struct DeviceState {
     // The translator's output, loaded on first use.
     std::mutex library_mutex;
     bool library_tried = false;
-    leonida::ShaderLibrary shader_library;
+    const leonida::DescriptorHashKind descriptor_hash = [] {
+        char mode[32]{};
+        return GetEnvironmentVariableA("LEONIDA_DESCRIPTOR_HASH", mode, sizeof(mode)) == 12 &&
+               std::strcmp(mode, "fnv1a_fmix32") == 0
+            ? leonida::DescriptorHashKind::fnv1a_fmix32 : leonida::DescriptorHashKind::fnv1a;
+    }();
+    leonida::ShaderLibrary shader_library{descriptor_hash};
 
     const leonida::ShaderLibrary* library() {
         std::lock_guard lock(library_mutex);
@@ -8209,7 +8215,8 @@ public:
                                  "sampler heap (%u of %u besides the fallback): its limits or "
                                  "vkGetDescriptorSetLayoutSupport allow no more\n",
                          features.counts[b::sampler_binding] - 1, unsigned(D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE));
-        state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features);
+        state_.bindless = std::make_unique<leonida::BindlessSet>(
+            get_device, state_.info.device, state_.memory, features, state_.descriptor_hash);
         if (!state_.bindless->ok() || !state_.context->vk.vkCreateSampler) {
             state_.bindless.reset();
             return false;

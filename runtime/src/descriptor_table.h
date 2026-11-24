@@ -4,6 +4,8 @@
 // Shaders look up bindless resource/sampler indices by FNV-1a hashing the 8-dword descriptor key (T# or padded S#)
 // and probing up to 8 slots in this table. Miss or fallback yields index 0.
 
+#include "descriptor_hash.h"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -28,12 +30,13 @@ inline constexpr std::uint32_t kSlotOccupiedMarker = 0xA11CA7EDu;
 // S# key is 4 dwords followed by 4x 0xFFFFFFFF.
 using DescriptorKey = std::array<std::uint32_t, 8>;
 
-inline std::uint32_t hash_descriptor_key(const std::uint32_t key[8]) {
+inline std::uint32_t hash_descriptor_key(const std::uint32_t key[8],
+                                         DescriptorHashKind kind = DescriptorHashKind::fnv1a) {
     std::uint32_t h = kFnvOffsetBasis;
     for (int i = 0; i < 8; ++i) {
         h = (h ^ key[i]) * kFnvPrime;
     }
-    return h;
+    return kind == DescriptorHashKind::fnv1a_fmix32 ? finalize_descriptor_hash(h) : h;
 }
 
 inline std::uint32_t hash_descriptor_key(const DescriptorKey& key) {
@@ -73,7 +76,8 @@ class DescriptorTable {
 public:
     enum class InsertResult { added, unchanged, replaced, added_with_relocation };
 
-    explicit DescriptorTable(std::uint32_t initial_capacity = 16) {
+    explicit DescriptorTable(std::uint32_t initial_capacity = 16, DescriptorHashKind hash_kind = DescriptorHashKind::fnv1a)
+        : hash_kind_(hash_kind) {
         // Slots use nonnegative int indices internally. Larger powers also wrap the capacity counter.
         if (initial_capacity > max_capacity) throw std::length_error("Descriptor table capacity exceeds slot range");
         std::uint32_t cap = 16;
@@ -103,7 +107,7 @@ public:
     // Queries the index associated with key. Returns 0 if not found.
     std::uint32_t lookup(const std::uint32_t key[8]) const {
         std::lock_guard lock(mutex_);
-        const std::uint32_t h = hash_descriptor_key(key);
+        const std::uint32_t h = hash_descriptor_key(key, hash_kind_);
         for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
             const std::uint32_t slot = (h + k) & mask_;
             const auto& entry = entries_[slot];
@@ -120,7 +124,7 @@ public:
 
     bool contains(const std::uint32_t key[8]) const {
         std::lock_guard lock(mutex_);
-        const std::uint32_t h = hash_descriptor_key(key);
+        const std::uint32_t h = hash_descriptor_key(key, hash_kind_);
         for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
             const std::uint32_t slot = (h + k) & mask_;
             const auto& entry = entries_[slot];
@@ -242,15 +246,15 @@ private:
     // to the first empty slot beyond that window, within its own eight probes.
     // A later hole is farther from every resident, so failure here is final for a single move.
     // `moved_to` receives the hole the resident moved into, so the caller can mark that slot changed too.
-    static int make_probe_slot(std::vector<DescriptorEntry>& entries, std::uint32_t hash,
-                               std::uint32_t* moved_to = nullptr) {
+    int make_probe_slot(std::vector<DescriptorEntry>& entries, std::uint32_t hash,
+                               std::uint32_t* moved_to = nullptr) const {
         const auto mask = static_cast<std::uint32_t>(entries.size() - 1);
         for (auto offset = kDescriptorProbes; offset < 2 * kDescriptorProbes - 1; ++offset) {
             const auto hole = (hash + offset) & mask;
             if (entries[hole].pad == kSlotOccupiedMarker) continue;
             for (auto k = kDescriptorProbes; k > 0; --k) {
                 const auto slot = (hash + k - 1) & mask;
-                const auto home = hash_descriptor_key(entries[slot].key);
+                const auto home = hash_descriptor_key(entries[slot].key, hash_kind_);
                 if (((hole - home) & mask) < kDescriptorProbes) {
                     entries[hole] = entries[slot];
                     if (moved_to) *moved_to = hole;
@@ -264,7 +268,7 @@ private:
 
     InsertResult insert_locked(const std::uint32_t key[8], std::uint32_t index) {
         while (true) {
-            const std::uint32_t h = hash_descriptor_key(key);
+            const std::uint32_t h = hash_descriptor_key(key, hash_kind_);
             int empty_slot = -1;
 
             for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
@@ -293,7 +297,7 @@ private:
                 std::uint32_t same_hash = 0;
                 for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
                     const auto& entry = entries_[(h + k) & mask_];
-                    if (hash_descriptor_key(entry.key) == h) ++same_hash;
+                    if (hash_descriptor_key(entry.key, hash_kind_) == h) ++same_hash;
                 }
                 if (same_hash == kDescriptorProbes)
                     throw std::length_error("Descriptor hash collision exceeds shader probe limit");
@@ -317,7 +321,7 @@ private:
     }
 
     bool erase_locked(const std::uint32_t key[8]) {
-        const std::uint32_t h = hash_descriptor_key(key);
+        const std::uint32_t h = hash_descriptor_key(key, hash_kind_);
         std::uint32_t found_slot = 0;
         bool found = false;
         for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
@@ -348,7 +352,7 @@ private:
 
             for (const auto& old : entries_) {
                 if (old.pad != kSlotOccupiedMarker) continue;
-                const std::uint32_t h = hash_descriptor_key(old.key);
+                const std::uint32_t h = hash_descriptor_key(old.key, hash_kind_);
                 int slot = -1;
                 for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
                     const std::uint32_t s = (h + k) & new_mask;
@@ -378,6 +382,7 @@ private:
     }
 
     static constexpr std::uint32_t max_capacity = std::uint32_t{1} << 31;
+    const DescriptorHashKind hash_kind_;
     mutable std::mutex mutex_;
     std::uint32_t mask_ = 15;
     std::vector<DescriptorEntry> entries_;

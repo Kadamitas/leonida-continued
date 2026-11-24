@@ -1696,7 +1696,9 @@ FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallbac
 
 def fallback_flags(a) -> tuple[str, ...]:
     """The fallback flags the parsed arguments ask for, in a stable order (the order they are recorded in)."""
-    return tuple(flag for flag, attr in FALLBACK_FLAGS if getattr(a, attr, False))
+    flags = tuple(flag for flag, attr in FALLBACK_FLAGS if getattr(a, attr, False))
+    mode = getattr(a, "descriptor_hash", "fnv1a")
+    return flags if mode == "fnv1a" else (*flags, f"--descriptor-hash={mode}")
 
 
 def recorded_fallback_flags(work: str) -> tuple[str, ...]:
@@ -2903,6 +2905,8 @@ def main() -> int:
                     help="a Windows build of runtime/ (gta6rt.exe and its runtime DLLs) for the runtime stage "
                          "instead of building it (off Windows: instead of the clang-cl + xwin cross-build); "
                          "on Windows, also use vk_pipeline_check.exe from DIR if present")
+    ap.add_argument("--descriptor-hash", choices=("fnv1a", "fnv1a_fmix32"), default="fnv1a",
+                    help="use this descriptor lookup ABI when translating shaders (default: %(default)s)")
     ap.add_argument("--wave64-emulate", choices=WAVE64_MODES, default="auto",
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
                          "32-wide GPUs: NVIDIA, Intel). auto (default) checks GPU subgroup support and prefers "

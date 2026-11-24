@@ -51,6 +51,7 @@ STRUCTURED = True     # False (--dispatch-loop): every shader with branches as o
 # the corpus, as a guard for depths where validation really grows. Both forms are equivalent; only the routing
 # differs. docs/design.md "Control flow" has the numbers.
 MAX_STRUCTURED_DEPTH = 64
+DESCRIPTOR_HASH = "fnv1a"  # Lookup ABI for set 0 binding 2; old caches use bare FNV-1a.
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
 # --max-shared-memory: a cap on a compute shader's Workgroup variables, LDS plus %x_buf (SHADER-309, #1721). The
 # default is the hard cap: 64 KiB, RDNA2's LDS per workgroup and the largest maxComputeSharedMemorySize drivers
@@ -257,6 +258,7 @@ class Unsupported(Exception):
 
 class Gen:
     def __init__(self, stage, hoist_reg_ptrs=False, cache_active=False):
+        self.descriptor_hash = DESCRIPTOR_HASH
         self.stage = stage
         self.hoist_reg_ptrs = hoist_reg_ptrs
         self.reg_ptrs = {}
@@ -12691,6 +12693,18 @@ class Gen:
             self.emit(f"{x} = OpBitwiseXor %uint {h} {w}")
             self.emit(f"{m} = OpIMul %uint {x} {self.cu(16777619)}")
             h = m
+        if self.descriptor_hash == "fnv1a_fmix32":
+            # MurmurHash3 fmix32, shared with the runtime descriptor table.
+            for shift, multiplier in ((16, 0x85ebca6b), (13, 0xc2b2ae35)):
+                upper, folded, product = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{upper} = OpShiftRightLogical %uint {h} {self.cu(shift)}")
+                self.emit(f"{folded} = OpBitwiseXor %uint {h} {upper}")
+                self.emit(f"{product} = OpIMul %uint {folded} {self.cu(multiplier)}")
+                h = product
+            upper, folded = self.tmp(), self.tmp()
+            self.emit(f"{upper} = OpShiftRightLogical %uint {h} {self.cu(16)}")
+            self.emit(f"{folded} = OpBitwiseXor %uint {h} {upper}")
+            h = folded
         mp, mask = self.tmp(), self.tmp()
         self.emit(f"{mp} = OpAccessChain %_ptr_SB_uint %desc_map %c0 %c0")
         self.emit(f"{mask} = OpLoad %uint {mp}")
@@ -16324,6 +16338,8 @@ def assemble(gen):
         gen.body =["         " + l if not (l.startswith("%") and " = OpLabel" in l) else l for l in flow + body]
     if pops:
         fn.append("OpBeginInvocationInterlockEXT")   # end of the entry block: uniform, executed once
+    if gen.uses_tex and gen.descriptor_hash == "fnv1a_fmix32":
+        hdr.append('OpModuleProcessed "leonida.descriptor_hash=fnv1a_fmix32"')
     out = hdr + dec + types + gvars + helpers + fn
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
     if msc:
@@ -18718,6 +18734,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
                 m["mesh_compute"] = dict(m["mesh_compute"], f16_halves=m["f16_halves"])
     if g.build_meta:
         m.update(g.build_meta)
+    if getattr(g, "descriptor_hash", "fnv1a") == "fnv1a_fmix32" and g.uses_tex:
+        m["descriptor_hash"] = g.descriptor_hash
     return m
 
 
@@ -18983,6 +19001,8 @@ def _out_inside_input(src, out):
 def main():
     global MAX_SHARED_BYTES, MAX_STRUCTURED_DEPTH
     ap = argparse.ArgumentParser()
+    ap.add_argument("--descriptor-hash", choices=("fnv1a", "fnv1a_fmix32"), default="fnv1a",
+                    help="descriptor-table lookup ABI (default: %(default)s)")
     ap.add_argument("src")
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=_limit_arg)
@@ -19082,6 +19102,8 @@ def main():
     STRUCTURED = not a.dispatch_loop
     global FLOAT_CONTROLS
     FLOAT_CONTROLS = not a.no_float_controls
+    global DESCRIPTOR_HASH
+    DESCRIPTOR_HASH = a.descriptor_hash
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback

@@ -750,11 +750,14 @@ struct ShaderEntry {
     bool rectangle_inputs_affine = false;  // verified input-space corner construction is valid for this VS
     std::optional<std::uint32_t> rectangle_position_xy; // input location passed to clip XY with constant positive W
     bool declares_no_bindings = false;  // only an explicit, unambiguous empty bindings array proves this
+    std::optional<DescriptorHashKind> descriptor_hash; // When present, it must agree with the actual module.
     bool bounded_image_keys() const { return declares_no_bindings || (root_table && root_table->image_offsets); }
 };
 
 class ShaderLibrary {
 public:
+    explicit ShaderLibrary(DescriptorHashKind hash_kind = DescriptorHashKind::fnv1a) : hash_kind_(hash_kind) {}
+
     // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs, each
     // when it is there:
     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
@@ -864,7 +867,9 @@ public:
         auto path = dir_;
         path += "/" + entry.name + ".spv";
         std::ifstream file(path, std::ios::binary | std::ios::ate);
-        return read_spirv_words(file, file.tellg());
+        auto words = read_spirv_words(file, file.tellg());
+        if (!descriptor_hash_matches(words, hash_kind_, entry.descriptor_hash)) return {};
+        return words;
     }
 
 private:
@@ -1017,6 +1022,14 @@ private:
                 if (parsed.single_graphics_binding && (e.stage == "cs" || !parsed.image_offsets)) continue;
                 e.root_table = std::move(parsed);
             }
+            const Json* hash_mode = nullptr;
+            if (!unique_field(meta, "descriptor_hash", hash_mode)) continue;
+            if (hash_mode) {
+                if (hash_mode->kind != Json::Kind::string) continue;
+                if (hash_mode->string == "fnv1a_fmix32") e.descriptor_hash = DescriptorHashKind::fnv1a_fmix32;
+                else if (hash_mode->string == "fnv1a") e.descriptor_hash = DescriptorHashKind::fnv1a;
+                else continue;
+            }
             if (by_fssm) e.fssm_sha256 = hash->string;
             if (by_fspx) e.fspx_code_sha256 = code_hash->string;
             if (const Json* s = meta.find("fspx_state_sha256"); s && s->kind == Json::Kind::string)
@@ -1092,6 +1105,7 @@ private:
         return true;
     }
 
+    DescriptorHashKind hash_kind_;
     std::filesystem::path dir_;
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
