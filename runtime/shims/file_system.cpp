@@ -285,9 +285,9 @@ partial_package::FileRef partial_target(const Roots& r, const std::vector<std::w
         !partial_package::enabled() || deleted(r.overlay, parts)) return {};
     std::error_code ec;
     if (!r.overlay.empty()) {
-        if (std::filesystem::exists(join(r.overlay, parts), ec) || ec) return {};
+        if (std::filesystem::exists(disk_path(r.overlay, parts), ec) || ec) return {};
     }
-    if (std::filesystem::exists(join(r.game, parts), ec) || ec) return {};
+    if (std::filesystem::exists(disk_path(r.game, parts), ec) || ec) return {};
     return partial_package::find(join({}, parts).generic_wstring());
 }
 
@@ -495,7 +495,7 @@ Target read_target(const std::wstring& path) {
     if (deleted(r.overlay, parts)) return fail(ERROR_FILE_NOT_FOUND);
 
     Target t;
-    t.path = join(r.game, parts);
+    t.path = disk_path(r.game, parts);
     t.partial = partial_target(r, parts);
     return t;
 }
@@ -707,7 +707,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         return deleted(r.overlay, entry_parts);
     };
     // Names already listed, ordered by _wcsicmp itself, so two names are one entry exactly when same_name says so, in
-    // whatever locale the title set (a lower-cased key is not: under .UTF-8 _wcslwr_s folds Ã‰ and Ã©, _wcsicmp not).
+    // whatever locale the title set (a lower-cased key is not: under .UTF-8 _wcslwr_s folds Ãƒâ€° and ÃƒÂ©, _wcsicmp not).
     struct NoCase {
         bool operator()(const std::wstring& a, const std::wstring& b) const { return _wcsicmp(a.c_str(), b.c_str()) < 0; }
     };
