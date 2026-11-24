@@ -10,7 +10,7 @@
 // runtime/src/bcpack_tables.inc, which tools/gen_bcpack_tables.py generates from the Python tables;
 // tests/test_bcpack_cpp.py compares the two decoders on synthetic chunks. docs/textures.md has the format.
 // An optional LEONIDA_BCPACK_TABLES file supplies the recognized VIctory format dictionaries and control words
-// for exact BC5 and BC7 reconstruction. It is opened on the first request for either format.
+// for exact BC5, BC6H and BC7 reconstruction. It is opened on the first request for one of those formats.
 
 #include <cstddef>
 #include <cstdint>

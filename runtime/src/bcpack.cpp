@@ -672,9 +672,9 @@ struct RootCounts {
     }
 };
 
-void bc6h_blocks(const Lanes& lanes, std::size_t nblocks, Labels* provisional, std::uint8_t* out) {
+void bc6h_blocks(const Lanes& lanes, std::size_t nblocks, Labels* provisional, std::uint8_t* out,
+                 const Bc6hHistory& hist) {
     if (lanes[0].size() != 2 * nblocks) fail("BC6H lane length does not match the block count");
-    const Bc6hHistory& hist = builtin_bc6h_history();
     using Endpoints = std::array<std::array<int, 4>, 3>;
     const Endpoints none_e = {{{0x8000, 0x200, 0x20, 0x20}, {0x8000, 0x200, 0x20, 0x20}, {0x8000, 0x200, 0x20, 0x20}}};
     std::array<int, 16> none_i;
@@ -906,6 +906,7 @@ struct Bc7History {
 struct ExactTables {
     std::array<std::uint8_t, 64> rank5{};
     std::array<std::uint8_t, 255 * 36> bc5{};
+    Bc6hHistory bc6;
     std::array<std::uint16_t, 512> ctrl7{};
     Bc7History bc7;
 };
@@ -922,7 +923,8 @@ const ExactTables* exact_tables() {
         constexpr std::size_t rank5_offset = model_bytes + 256 + 64 + 256 + 64;
         constexpr std::size_t controls = rank5_offset + 64;
         constexpr std::size_t dict5 = controls + 512 * 2 + 255 * (22 + 40 + 18);
-        constexpr std::size_t dict7 = dict5 + 255 * (36 + 58);
+        constexpr std::size_t dict6 = dict5 + 255 * 36;
+        constexpr std::size_t dict7 = dict6 + 255 * 58;
         constexpr std::size_t table_size = dict7 + 255 * 116;
         std::vector<std::uint8_t> raw(table_size);
         std::ifstream file(path, std::ios::binary);
@@ -937,6 +939,28 @@ const ExactTables* exact_tables() {
         for (std::size_t i = 0; i < t->ctrl7.size(); ++i) t->ctrl7[i] = word(controls + 2 * i);
         for (int distance = 1; distance <= 255; ++distance) {
             const auto entry = 256 - distance;
+            const auto bc6_offset = dict6 + (distance - 1) * 58;
+            // The dictionary stores signed, left-aligned 16-bit endpoints in endpoint-major order.
+            // The decoder keeps biased channel-major fields at 16, 10 and 6 bits respectively.
+            constexpr int precision[] = {16, 10, 6, 6};
+            for (int field = 0; field < 4; ++field) {
+                for (int channel = 0; channel < 3; ++channel) {
+                    const auto value = word(bc6_offset + 1 + 2 * (3 * field + channel));
+                    t->bc6.endpoints[entry][channel][field] = (value ^ 0x8000u) >> (16 - precision[field]);
+                    t->bc6.endpoint_confirmed_bits[entry][channel][field] = precision[field];
+                }
+            }
+            const int mode = raw[bc6_offset + 25];
+            const int bits = mode >= 1 && mode <= 10 ? 3 : mode >= 11 && mode <= 14 ? 4 : 0;
+            for (int pixel = 0; pixel < 16; ++pixel) {
+                // Signed source indices use their reference mode's precision. Normalize to the
+                // four-bit biased representation that the receiving block truncates to its own precision.
+                const auto value = word(bc6_offset + 26 + 2 * pixel);
+                const auto expanded = bits ? std::uint16_t(std::uint32_t(value) << (16 - bits)) : std::uint16_t(0);
+                t->bc6.indices[entry][pixel] = (expanded ^ 0x8000u) >> 12;
+                t->bc6.index_confirmed_bits[entry][pixel] = 4;
+            }
+            t->bc6.endpoint_class[entry] = t->bc6.index_class[entry] = 3;
             const auto pos = dict7 + (distance - 1) * 116;
             const int rows = (word(pos) >> 6) & 3;
             for (int row = 0; row < 3; ++row) {
@@ -1426,7 +1450,11 @@ Result decode(std::span<const std::uint8_t> raw, int codec, std::span<std::uint8
             if (const auto* tables = exact_tables()) exact_bc5_blocks(lanes, nblocks, *tables, out.data());
             else bc5_blocks(lanes, nblocks, provisional, out.data());
             break;
-        case 6: bc6h_blocks(lanes, nblocks, provisional, out.data()); break;
+        case 6: {
+            const auto* tables = exact_tables();
+            bc6h_blocks(lanes, nblocks, provisional, out.data(), tables ? tables->bc6 : builtin_bc6h_history());
+            break;
+        }
         case 7:
             if (const auto* tables = exact_tables()) {
                 const auto status = bc7_rebuild(lanes, nblocks, tables->bc7, out.data(), tables);
