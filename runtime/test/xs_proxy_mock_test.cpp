@@ -1221,7 +1221,8 @@ int run_env_slots(bool valid) {
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_RESUME_X_SLOT", resume_x) != FALSE);
 
     Mock* mock = nullptr;
-    void* device = make_device(mock, 11, true);
+    // Exercise the PC backend's finite vtable, including refusal of unmapped console extensions.
+    void* device = make_device(mock, 11, true, true, false, false);
     EXPECT(device);
     xs::reset_device_proxy_stats();
     std::uint64_t token = 0;
