@@ -9920,7 +9920,7 @@ public:
             }
         }
         if (title_linear_texture_enabled() && (title_default_bc_texture_shape(desc) || title_display_bc_texture_shape(desc) ||
-            title_display_rgba8_array_shape(desc))) {
+            title_display_rgba8_texture_shape(desc))) {
             const auto native = title_linear_native_desc(desc);
             const auto format = state_.texture_format(native);
             const auto layout = title_tiled_texture_layout(desc, format);
@@ -11393,7 +11393,7 @@ private:
         }
         if (title_linear_texture_enabled() &&
             (implicit_sampled || title_sampled_4ks_texture_shape(desc) || title_default_bc_texture_shape(desc) ||
-             title_display_bc_texture_shape(desc) || (xbox_query && title_display_rgba8_array_shape(desc)))) {
+             title_display_bc_texture_shape(desc) || (xbox_query && title_display_rgba8_texture_shape(desc)))) {
             const auto native = title_linear_native_desc(desc);
             const auto format = state_.texture_format(native);
             const auto layout = title_tiled_texture_layout(desc, format);
@@ -13691,7 +13691,7 @@ HRESULT create_live_title_texture_view(ID3D12Device* device, const D3D12_RESOURC
         (resource.Alignment == cached.Alignment || reported_alignment);
     const bool raw_linear = linear_image && (title_linear_texture_shape(resource) ||
         (texture->sampled_tile_bytes() == 65536 &&
-         (title_display_bc_texture_shape(resource) || title_display_rgba8_array_shape(resource))) ||
+         (title_display_bc_texture_shape(resource) || title_display_rgba8_texture_shape(resource))) ||
         (texture->sampled_tile_bytes() == 4096 && title_default_bc_texture_shape(resource)));
     const bool line_default_alignment = line && use == TitleTextureUse::storage &&
         cached.Alignment == 4096 && resource.Alignment == 0;
@@ -13714,7 +13714,10 @@ HRESULT create_live_title_texture_view(ID3D12Device* device, const D3D12_RESOURC
         (!linear_image && use == TitleTextureUse::storage && title_storage_layout_matches(resource));
     const auto expected_view = volume ? D3D12_SRV_DIMENSION_TEXTURE3D :
         line ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE2D;
-    const bool depth_array = (d16 || d32s8 || linear_image || texture->title_storage_array()) && cached.DepthOrArraySize > 1;
+    const bool single_display_array = cached.DepthOrArraySize == 1 && texture->sampled_tile_bytes() == 65536 &&
+        title_display_rgba8_texture_shape(resource) && view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    const bool depth_array = single_display_array ||
+        ((d16 || d32s8 || linear_image || texture->title_storage_array()) && cached.DepthOrArraySize > 1);
     const bool depth_cube = depth_array && cached.Width == cached.Height && cached.DepthOrArraySize >= 6;
     const bool view_dimension_matches = depth_array ?
         view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY ||
@@ -13892,8 +13895,8 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
     const bool single_array = single_color && resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         faces > 1 && faces <= 96 && block.block == 1;
     const bool default_bc = title_default_bc_texture_shape(resource);
-    const bool display_tiled = title_display_bc_texture_shape(resource) || title_display_rgba8_array_shape(resource);
-    const bool legacy_single_mip = resource.MipLevels == 1 && block.block == 1 &&
+    const bool display_tiled = title_display_bc_texture_shape(resource) || title_display_rgba8_texture_shape(resource);
+    const bool legacy_single_mip = !display_tiled && resource.MipLevels == 1 && block.block == 1 &&
         (single_array || (faces == 1 && (r8_atlas || single_color)));
     const auto tiled_layout = (linear_layout || legacy_single_mip) ? std::nullopt : title_tiled_texture_layout(resource, format);
     // A tiled 2D image can expose its sole layer through an explicit TEXTURE2DARRAY view.
