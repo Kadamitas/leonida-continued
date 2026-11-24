@@ -62,6 +62,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -988,8 +989,19 @@ struct DeviceState {
     // Address-only views have no resource lifetime to follow. Remember their ranges conservatively until the
     // device goes away rather than later accepting an unrelated optimal-image alias over those CPU bytes.
     std::map<std::uint64_t, AddressView> title_address_views;
+    std::uint64_t longest_title_address_view = 0;
     // A display-BC placement sharing a physical sampled source owns no writable native range.
     std::map<std::uint64_t, std::uint64_t> sampled_alias_spans;
+
+    // Views stay in the map and only grow. No view starting more than longest - 1 bytes below the
+    // query can reach it, and a view starting at its exclusive end cannot overlap it.
+    auto title_address_candidates_locked(std::uint64_t address, std::uint64_t bytes) const {
+        const auto before = longest_title_address_view ? longest_title_address_view - 1 : 0;
+        const auto first = title_address_views.lower_bound(address - std::min(address, before));
+        const auto last = bytes > UINT64_MAX - address ? title_address_views.end()
+                                                        : title_address_views.lower_bound(address + bytes);
+        return std::ranges::subrange(first, last);
+    }
 
     static bool ranges_overlap(std::uint64_t a, std::uint64_t bytes_a, std::uint64_t b, std::uint64_t bytes_b) {
         return a <= b ? b - a < bytes_a : a - b < bytes_b;
@@ -1104,6 +1116,7 @@ struct DeviceState {
             it->second.buffer_srv |= buffer_srv;
             it->second.texture_srv |= !buffer_srv;
         }
+        longest_title_address_view = std::max(longest_title_address_view, bytes);
         return true;
     }
     static const char* view_kind(const AddressView& view) {
@@ -1139,7 +1152,7 @@ struct DeviceState {
                         id, range.physical_snapshot};
             return false;
         }
-        for (const auto& [base, view] : title_address_views) {
+        for (const auto& [base, view] : title_address_candidates_locked(start, bytes)) {
             if (!ranges_overlap(start, bytes, base, view.bytes) || view.physical_snapshot) continue;
             if (!physical_readonly_view(base, view)) {
                 conflict = {base, view.bytes, view_kind(view)};
@@ -1149,6 +1162,7 @@ struct DeviceState {
         auto& protected_bytes = sampled_alias_spans[start];
         protected_bytes = std::max(protected_bytes, bytes);
         source->second.bytes = std::max(source->second.bytes, bytes);
+        longest_title_address_view = std::max(longest_title_address_view, bytes);
         return true;
     }
 
@@ -1162,7 +1176,7 @@ struct DeviceState {
                                           id, range.physical_snapshot};
                 return true;
             }
-        for (const auto& [start, view] : title_address_views)
+        for (const auto& [start, view] : title_address_candidates_locked(address, bytes))
             if (conflicting_host_range(address, bytes, physical_snapshot, start, view.bytes, view.physical_snapshot)) {
                 // The addresses and native image identities stay distinct. Only a read-only display-BC placement
                 // with verified physical backing can admit a neighboring, separately revalidated read-only SRV.
@@ -3716,7 +3730,7 @@ public:
                     static_cast<unsigned long long>(range.bytes));
                 return failed("live host resource overlap", E_NOTIMPL);
             }
-        for (const auto& [base, view] : device_.title_address_views)
+        for (const auto& [base, view] : device_.title_address_candidates_locked(start, guest_bytes))
             if (DeviceState::ranges_overlap(start, guest_bytes, base, view.bytes)) {
                 static std::atomic<unsigned> collisions{0};
                 if (collisions.fetch_add(1, std::memory_order_relaxed) < 16)
@@ -12232,8 +12246,7 @@ HRESULT record_console_address_copy(ID3D12Device* device, ID3D12GraphicsCommandL
     bool raw_texture = false;
     if (!src_buffer) {
         std::lock_guard lock(state.title_placement_mutex);
-        for (auto it = state.title_address_views.upper_bound(src); it != state.title_address_views.begin();) {
-            const auto& [base, view] = *--it;
+        for (const auto& [base, view] : std::views::reverse(state.title_address_candidates_locked(src, 1))) {
             if (view.physical_snapshot && src - base < view.bytes && bytes <= view.bytes - (src - base)) {
                 raw_texture = true;
                 break;
