@@ -3729,9 +3729,6 @@ public:
             bool initialized = false;
         };
         auto capture = std::make_shared<Capture>();
-        capture->tiled.resize(source_bytes);
-        capture->uploaded.resize(source_bytes);
-        capture->packed.resize(upload_bytes);
         auto shadow = std::make_shared<leonida::MutableHostShadow>();
         shadow->regions.resize(std::size_t(layers) * layout.mip_count);
         for (UINT layer = 0; layer < layers; ++layer)
@@ -3742,7 +3739,16 @@ public:
                 region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
                 region.imageExtent = {item.width, item.height, item.depth};
             }
-        shadow->capture = [source, capture, layout, layers, source_bytes, volume, physical](bool& dirty) {
+        shadow->capture = [source, capture, layout, layers, source_bytes, upload_bytes, volume, physical](bool& dirty) {
+            // A descriptor can exist for the entire session without any submission selecting it.
+            // Allocate pending bytes before the queue wait. Failed capture leaves uploaded untouched.
+            const auto resize = [](std::vector<std::byte>& buffer, std::size_t bytes) {
+                if (bytes > buffer.max_size()) return false;
+                try { buffer.resize(bytes); }
+                catch (const std::bad_alloc&) { return false; }
+                return true;
+            };
+            if (!resize(capture->tiled, source_bytes)) return false;
             const auto previous = capture->initialized ? std::span<const std::byte>(capture->uploaded) :
                                                          std::span<const std::byte>{};
             const auto sparse = rt::xmem::snapshot_sparse_texture(source, capture->tiled, previous);
@@ -3775,6 +3781,7 @@ public:
             dirty = !capture->initialized || sparse == rt::xmem::SparseTextureSnapshot::ready ||
                 capture->tiled != capture->uploaded;
             if (!dirty) return true;
+            if (!resize(capture->packed, upload_bytes)) return false;
             const std::span<const std::byte> tiled = capture->tiled;
             const std::span<std::byte> packed = capture->packed;
             if (volume) return leonida::detile_volume_mips_4ks(tiled, packed,
@@ -3795,6 +3802,9 @@ public:
         };
         shadow->commit = [capture] {
             capture->uploaded.swap(capture->tiled);
+            // One-shot uploads need no permanent packed copy. Retain it after a later actual change so
+            // animated textures allocate at most once more and reuse the buffers for every subsequent refresh.
+            if (!capture->initialized) std::vector<std::byte>{}.swap(capture->packed);
             capture->initialized = true;
         };
         const auto previous_image_address = image_address_;
