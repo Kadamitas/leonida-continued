@@ -3961,10 +3961,19 @@ public:
         need.size = budget;
         std::uint32_t memory_type = 0;
         VkMemoryPropertyFlags flags = 0;
+        const bool attachment_only = desc_.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET ||
+            desc_.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         const bool deferred = defer_placed_images(true) && region.Protect == PAGE_NOACCESS && !linear_color &&
-            !depth_projection && !dedicated.prefersDedicatedAllocation &&
-            (desc_.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET ||
-             desc_.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+            !depth_projection && !dedicated.prefersDedicatedAllocation && attachment_only;
+        if (defer_placed_images(true) && attachment_only && DeviceState::trace_texture_ranges()) {
+            static std::atomic<unsigned> reports{};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 12 ||
+                (desc_.Width == 3840 && desc_.Height == 2160 && desc_.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB))
+                std::fprintf(stderr, "[rt] d3d12: placed attachment backing va=%p bytes=%llu protect=0x%lx "
+                    "linear=%u depth_projection=%u prefers_dedicated=%u deferred=%u\n", address,
+                    static_cast<unsigned long long>(budget), region.Protect, unsigned(linear_color),
+                    unsigned(depth_projection), unsigned(dedicated.prefersDedicatedAllocation), unsigned(deferred));
+        }
         VkDeviceMemory memory = VK_NULL_HANDLE;
         if (deferred) {
             if (!defer_image_memory(need, true)) return failed("deferred memory owner", E_OUTOFMEMORY);
