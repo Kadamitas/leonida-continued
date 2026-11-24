@@ -3097,6 +3097,7 @@ private:
             ResourceId id;
             const ResourceBinding* image;
             std::shared_ptr<MutableHostShadow> owner;
+            VkBuffer staging;
         };
         std::vector<MutableUpload> mutable_uploads;
         std::vector<VkBufferMemoryBarrier> upload_sources;
@@ -3135,7 +3136,7 @@ private:
             const auto& [id, image] = *node.entry;
             if (image.mutable_host_shadow) {
                 const auto& shadow = image.mutable_host_shadow;
-                if (!image.host_readonly_image || !image.image || !image.host_shadow_buffer ||
+                if (!image.host_readonly_image || !image.image || (!image.host_shadow_buffer && !shadow->prepare_staging) ||
                     !image.host_shadow_layer_bytes || image.aspects != VK_IMAGE_ASPECT_COLOR_BIT ||
                     (image.line && (image.volume || image.height != 1 || image.depth != 1 || image.array_layers != 1)) ||
                     image.samples != 1 || !image.array_layers ||
@@ -3195,13 +3196,16 @@ private:
                         (!dirty && piece.layout == VK_IMAGE_LAYOUT_UNDEFINED))
                         return shadow_refused("mutable-tracked-layout", &image);
                 if (!dirty) continue;
+                VkBuffer staging = image.host_shadow_buffer;
+                if (!staging) staging = shadow->prepare_staging();
+                if (!staging) return shadow_refused("mutable-native-staging", &image);
                 try {
-                    mutable_uploads.push_back({id, &image, shadow});
+                    mutable_uploads.push_back({id, &image, shadow, staging});
                     VkBufferMemoryBarrier source{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
                     source.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
                     source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
                     source.srcQueueFamilyIndex = source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    source.buffer = image.host_shadow_buffer;
+                    source.buffer = staging;
                     source.size = VK_WHOLE_SIZE;
                     upload_sources.push_back(source);
                     for (const auto& piece : pieces) {
@@ -3307,7 +3311,7 @@ private:
                 std::uint32_t(upload_before.size()), upload_before.data());
             for (const auto& upload : mutable_uploads) {
                 const auto& image = *upload.image;
-                context_.vk.vkCmdCopyBufferToImage(command_buffer, image.host_shadow_buffer, image.image,
+                context_.vk.vkCmdCopyBufferToImage(command_buffer, upload.staging, image.image,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, std::uint32_t(upload.owner->regions.size()), upload.owner->regions.data());
                 const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, image.mip_levels, 0, image.array_layers};
                 next_tracker.set(upload.id, range, VK_IMAGE_LAYOUT_GENERAL);

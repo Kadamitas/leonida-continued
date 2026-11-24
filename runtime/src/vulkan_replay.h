@@ -70,6 +70,8 @@ namespace leonida {
 struct MutableHostShadow {
     std::vector<VkBufferImageCopy> regions;
     std::function<bool(bool& dirty)> capture;
+    // Called by serialized queue preparation after a dirty capture, before staging bytes or recording a copy.
+    std::function<VkBuffer()> prepare_staging;
     std::function<void()> stage;
     std::function<void()> commit;
 };

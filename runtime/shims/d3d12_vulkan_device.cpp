@@ -3490,8 +3490,8 @@ public:
     }
 
     HRESULT allocate_texture_shadow(const void* source, std::size_t source_span, std::size_t upload_bytes,
-                                    bool physical_snapshot = false, DeviceState::DisplayBcShape typed_display = {}) {
-        auto& vk = device_.context->vk;
+                                    bool physical_snapshot = false, DeviceState::DisplayBcShape typed_display = {},
+                                    bool defer_staging = false) {
         DeviceState::TitleImageCollision conflict{};
         const auto source_address = reinterpret_cast<std::uintptr_t>(source);
         if (!device_.register_title_host_range(id(), source_address, source_span, "static_texture_source", source_span,
@@ -3500,17 +3500,29 @@ public:
                                                          physical_snapshot, conflict);
         title_host_range_ = true;
         shadow_source_ = source;
+        if (!defer_staging) {
+            if (const HRESULT hr = prepare_texture_staging(upload_bytes); FAILED(hr)) return hr;
+        }
+        binding_.host_readonly_image = true;
+        binding_.host_shadow_buffer = shadow_buffer_;
+        return S_OK;
+    }
+
+    HRESULT prepare_texture_staging(std::size_t upload_bytes) {
+        if (shadow_buffer_) return S_OK;
+        auto& vk = device_.context->vk;
         VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         buffer.size = upload_bytes;
         buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         device_.share(buffer);
-        if (vk.vkCreateBuffer(device_.info.device, &buffer, nullptr, &shadow_buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
+        VkBuffer staging = VK_NULL_HANDLE;
+        if (vk.vkCreateBuffer(device_.info.device, &buffer, nullptr, &staging) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         constexpr auto visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
         if (device_.get_buffer_memory_requirements2) {
             VkBufferMemoryRequirementsInfo2 query{VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2};
-            query.buffer = shadow_buffer_;
+            query.buffer = staging;
             VkMemoryRequirements2 result{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated};
             device_.get_buffer_memory_requirements2(device_.info.device, &query, &result);
             requirements = result.memoryRequirements;
@@ -3520,7 +3532,7 @@ public:
             }();
             if (pool_staging && !dedicated.requiresDedicatedAllocation && !dedicated.prefersDedicatedAllocation) {
                 try {
-                    pooled_shadow_ = device_.title_staging_pool.bind(device_.info.device, shadow_buffer_, requirements,
+                    pooled_shadow_ = device_.title_staging_pool.bind(device_.info.device, staging, requirements,
                         vk.vkBindBufferMemory, vk.vkDestroyBuffer, vk.vkFreeMemory,
                         [&](VkDeviceSize size, std::uint32_t& type) {
                             auto page = requirements;
@@ -3530,20 +3542,25 @@ public:
                 } catch (const std::bad_alloc&) { /* Retry below with one buffer. */ }
             }
         } else {
-            vk.vkGetBufferMemoryRequirements(device_.info.device, shadow_buffer_, &requirements);
+            vk.vkGetBufferMemoryRequirements(device_.info.device, staging, &requirements);
         }
         if (pooled_shadow_) {
             shadow_mapped_ = static_cast<std::byte*>(pooled_shadow_->page->mapped) + pooled_shadow_->offset;
         } else {
             const auto single = dedicated.requiresDedicatedAllocation || dedicated.prefersDedicatedAllocation;
-            shadow_memory_ = device_.allocate(requirements, visible, VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-                                               nullptr, false, nullptr, VK_NULL_HANDLE, single ? shadow_buffer_ : VK_NULL_HANDLE);
-            if (!shadow_memory_ || vk.vkBindBufferMemory(device_.info.device, shadow_buffer_, shadow_memory_, 0) != VK_SUCCESS ||
-                vk.vkMapMemory(device_.info.device, shadow_memory_, 0, VK_WHOLE_SIZE, 0, &shadow_mapped_) != VK_SUCCESS)
+            const auto memory = device_.allocate(requirements, visible, VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                                 nullptr, false, nullptr, VK_NULL_HANDLE, single ? staging : VK_NULL_HANDLE);
+            void* mapped = nullptr;
+            if (!memory || vk.vkBindBufferMemory(device_.info.device, staging, memory, 0) != VK_SUCCESS ||
+                vk.vkMapMemory(device_.info.device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+                vk.vkDestroyBuffer(device_.info.device, staging, nullptr);
+                if (memory) vk.vkFreeMemory(device_.info.device, memory, nullptr);
                 return E_OUTOFMEMORY;
+            }
+            shadow_memory_ = memory;
+            shadow_mapped_ = mapped;
         }
-        binding_.host_readonly_image = true;
-        binding_.host_shadow_buffer = shadow_buffer_;
+        shadow_buffer_ = staging;
         return S_OK;
     }
 
@@ -3738,7 +3755,12 @@ public:
         const bool display_sampled = layout.tile_bytes == 65536 && layout.block_dim == 4 && !volume && layers == 1;
         const DeviceState::DisplayBcShape typed_display = physical && placed_bytes && display_sampled ?
             DeviceState::DisplayBcShape{desc_.Format, UINT(desc_.Width), desc_.Height, desc_.MipLevels} : DeviceState::DisplayBcShape{};
-        if (const HRESULT hr = allocate_texture_shadow(source, source_span, upload_bytes, physical, typed_display); FAILED(hr))
+        static const bool defer_staging = [] {
+            const char* setting = std::getenv("LEONIDA_TILED_STAGING_DEFER");
+            return setting && std::strcmp(setting, "1") == 0;
+        }();
+        if (const HRESULT hr = allocate_texture_shadow(source, source_span, upload_bytes, physical, typed_display,
+                                                        defer_staging); FAILED(hr))
             return hr;
         struct Capture {
             std::vector<std::byte> tiled, uploaded, packed;
@@ -3813,8 +3835,13 @@ public:
             }
             return true;
         };
-        shadow->stage = [mapped = shadow_mapped_, capture] {
-            std::memcpy(mapped, capture->packed.data(), capture->packed.size());
+        if (defer_staging) {
+            shadow->prepare_staging = [this, upload_bytes] {
+                return SUCCEEDED(prepare_texture_staging(upload_bytes)) ? shadow_buffer_ : VK_NULL_HANDLE;
+            };
+        }
+        shadow->stage = [this, capture] {
+            std::memcpy(shadow_mapped_, capture->packed.data(), capture->packed.size());
         };
         shadow->commit = [capture] {
             capture->uploaded.swap(capture->tiled);
