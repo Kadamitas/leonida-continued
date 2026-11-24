@@ -444,6 +444,9 @@ inline bool compute_module_excludes_sampled_images(std::span<const std::uint32_t
     static constexpr std::pair<std::size_t, std::string_view> modules[] = {
         {86840, "c83ee055babd395f0701586fd962a7b94672657f523eb38d2872803c97528320"},
         {123252, "db1c7be6f1d31a2af849ddfbd653d3a270e004acd8a2529e402086a9b60256eb"},
+        // The same two modules with only their descriptor-table hash finalized.
+        {87076, "d1278aacfe37b453a4122fcbc4ca1b915692e6d7cf687ebb660f62d8d82cbfe1"},
+        {123488, "94bd051233651eeb84c995ab93bfcc4e04d076907f97fd31dfa017348ae79a75"},
     };
     try {
         std::string digest;
