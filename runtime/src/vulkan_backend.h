@@ -3069,6 +3069,15 @@ private:
             std::shared_ptr<MutableHostShadow> owner;
         };
         std::vector<MutableUpload> mutable_uploads;
+        std::vector<VkBufferMemoryBarrier> upload_sources;
+        std::vector<VkImageMemoryBarrier> upload_before, upload_after;
+        VkPipelineStageFlags upload_src_stages = VK_PIPELINE_STAGE_HOST_BIT;
+        VkPipelineStageFlags upload_copy_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkPipelineStageFlags upload_dst_stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkAccessFlags upload_write = VK_ACCESS_TRANSFER_WRITE_BIT;
+        VkAccessFlags upload_read = VK_ACCESS_MEMORY_READ_BIT;
+        detail::restrict_to_queue(replay, upload_copy_stage, upload_write);
+        detail::restrict_to_queue(replay, upload_dst_stages, upload_read);
         const auto shadow_refused = [](const char* reason, const ResourceBinding* image = nullptr,
                                         std::uint32_t layer = 0, std::uint32_t mip = 0,
                                         const VkBufferImageCopy* region = nullptr) {
@@ -3150,13 +3159,34 @@ private:
                                                image.host_shadow_layer_bytes * image.array_layers, dirty);
                 }
                 const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, image.mip_levels, 0, image.array_layers};
-                for (const auto& piece : detail::current(&context_.tracker_, id, range, VK_IMAGE_LAYOUT_UNDEFINED))
+                const auto pieces = detail::current(&context_.tracker_, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
+                for (const auto& piece : pieces)
                     if ((piece.layout != VK_IMAGE_LAYOUT_UNDEFINED && piece.layout != VK_IMAGE_LAYOUT_GENERAL) ||
                         (!dirty && piece.layout == VK_IMAGE_LAYOUT_UNDEFINED))
                         return shadow_refused("mutable-tracked-layout", &image);
                 if (!dirty) continue;
-                try { mutable_uploads.push_back({id, &image, shadow}); }
-                catch (const std::bad_alloc&) { return shadow_refused("mutable-upload-allocation", &image); }
+                try {
+                    mutable_uploads.push_back({id, &image, shadow});
+                    VkBufferMemoryBarrier source{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                    source.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+                    source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    source.srcQueueFamilyIndex = source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    source.buffer = image.host_shadow_buffer;
+                    source.size = VK_WHOLE_SIZE;
+                    upload_sources.push_back(source);
+                    for (const auto& piece : pieces) {
+                        const bool first = piece.layout == VK_IMAGE_LAYOUT_UNDEFINED;
+                        VkAccessFlags access = first ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                        VkPipelineStageFlags stages = first ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT :
+                                                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                        detail::restrict_to_queue(replay, stages, access);
+                        upload_src_stages |= stages;
+                        upload_before.push_back(detail::image_barrier_info(image, piece.range, piece.layout,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, access, upload_write));
+                    }
+                    upload_after.push_back(detail::image_barrier_info(image, range,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, upload_write, upload_read));
+                } catch (const std::bad_alloc&) { return shadow_refused("mutable-upload-allocation", &image); }
                 continue;
             }
             if (!image.host_readonly_image || !image.host_shadow_prepare) continue;
@@ -3173,6 +3203,8 @@ private:
                 if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED && piece.layout != VK_IMAGE_LAYOUT_GENERAL)
                     return shadow_refused("immutable-tracked-layout", &image);
         }
+        if (upload_sources.size() > UINT32_MAX || upload_before.size() > UINT32_MAX)
+            return shadow_refused("mutable-upload-count");
         const auto wait_begin = profile_host ? HostShadowProfile::now() : HostShadowProfile::Time{};
         bool host_writes_safe = false;
         const auto retire_before_host_write = [&] {
@@ -3234,33 +3266,22 @@ private:
         replay.bindless_set = guest_queue_ && context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
         const bool bindless_uploaded = guest_queue_ && std::exchange(context_.bindless_upload_pending_, false);
         auto next_tracker = context_.tracker_.pending_changes();
-        bool initialized_host_images = false;
-        for (const auto& upload : mutable_uploads) {
-            const auto& image = *upload.image;
-            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, image.mip_levels, 0, image.array_layers};
-            const auto pieces = detail::current(&next_tracker, upload.id, range, VK_IMAGE_LAYOUT_UNDEFINED);
-            VkBufferMemoryBarrier source{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-            source.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-            source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            source.srcQueueFamilyIndex = source.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            source.buffer = image.host_shadow_buffer;
-            source.size = VK_WHOLE_SIZE;
-            context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &source, 0, nullptr);
-            for (const auto& piece : pieces) {
-                const bool first = piece.layout == VK_IMAGE_LAYOUT_UNDEFINED;
-                detail::image_barrier(replay, command_buffer, image, piece.range, piece.layout,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, first ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-                    first ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        bool initialized_host_images = !mutable_uploads.empty();
+        if (initialized_host_images) {
+            // Sampled shadows own separate native images and non-overlapping staging ranges, even when they
+            // snapshot the same guest pages. Group their transitions around the copies in this submission.
+            context_.vk.vkCmdPipelineBarrier(command_buffer, upload_src_stages, upload_copy_stage,
+                0, 0, nullptr, std::uint32_t(upload_sources.size()), upload_sources.data(),
+                std::uint32_t(upload_before.size()), upload_before.data());
+            for (const auto& upload : mutable_uploads) {
+                const auto& image = *upload.image;
+                context_.vk.vkCmdCopyBufferToImage(command_buffer, image.host_shadow_buffer, image.image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, std::uint32_t(upload.owner->regions.size()), upload.owner->regions.data());
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, image.mip_levels, 0, image.array_layers};
+                next_tracker.set(upload.id, range, VK_IMAGE_LAYOUT_GENERAL);
             }
-            context_.vk.vkCmdCopyBufferToImage(command_buffer, image.host_shadow_buffer, image.image,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, std::uint32_t(upload.owner->regions.size()), upload.owner->regions.data());
-            detail::image_barrier(replay, command_buffer, image, range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-            next_tracker.set(upload.id, range, VK_IMAGE_LAYOUT_GENERAL);
-            initialized_host_images = true;
+            context_.vk.vkCmdPipelineBarrier(command_buffer, upload_copy_stage, upload_dst_stages,
+                0, 0, nullptr, 0, nullptr, std::uint32_t(upload_after.size()), upload_after.data());
         }
         // These images are the caller's coherent CPU bytes, including before their first use. A shader can
         // reach them without naming a resource in its command, so unknown reads include every live import.

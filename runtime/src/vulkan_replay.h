@@ -1520,12 +1520,10 @@ inline VkImageSubresourceRange layout_range(const ResourceBinding& resource, VkI
     return range;
 }
 
-inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
-                          const VkImageSubresourceRange& range, VkImageLayout old_layout, VkImageLayout new_layout,
-                          VkAccessFlags src_access, VkPipelineStageFlags src_stages, VkAccessFlags dst_access,
-                          VkPipelineStageFlags dst_stages) {
-    restrict_to_queue(vk, src_stages, src_access);
-    restrict_to_queue(vk, dst_stages, dst_access);
+inline VkImageMemoryBarrier image_barrier_info(const ResourceBinding& resource,
+                                               const VkImageSubresourceRange& range,
+                                               VkImageLayout old_layout, VkImageLayout new_layout,
+                                               VkAccessFlags src_access, VkAccessFlags dst_access) {
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.srcAccessMask = src_access;
@@ -1536,6 +1534,16 @@ inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buf
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = resource.image;
     barrier.subresourceRange = layout_range(resource, range);
+    return barrier;
+}
+
+inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
+                          const VkImageSubresourceRange& range, VkImageLayout old_layout, VkImageLayout new_layout,
+                          VkAccessFlags src_access, VkPipelineStageFlags src_stages, VkAccessFlags dst_access,
+                          VkPipelineStageFlags dst_stages) {
+    restrict_to_queue(vk, src_stages, src_access);
+    restrict_to_queue(vk, dst_stages, dst_access);
+    const auto barrier = image_barrier_info(resource, range, old_layout, new_layout, src_access, dst_access);
     vk.pipeline_barrier(command_buffer, src_stages, dst_stages, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
