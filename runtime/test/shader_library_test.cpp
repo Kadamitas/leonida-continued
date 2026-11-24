@@ -11,6 +11,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #define CHECK(condition) do {                                    \
@@ -587,6 +588,8 @@ int main() {
     broken.resize(100);
     CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::data);
 
+    // Growing manifest arrays and objects must transfer the subtrees they already contain.
+    static_assert(std::is_nothrow_move_constructible_v<Json> && std::is_nothrow_move_constructible_v<JsonObjectEntry>);
     Json json;
     // "s" holds an escaped quote and a \u escape for U+00E9, which the reader must turn into UTF-8.
     const std::string text = "{\"a\": {\"stage\": \"cs\", \"n\": [1, 2.5, -3e2], \"ok\": true, "

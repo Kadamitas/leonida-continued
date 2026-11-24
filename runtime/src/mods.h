@@ -22,9 +22,10 @@
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
-#include "shader_library.h"  // leonida::Json / JsonReader
+#include "json_reader.h"
 
 namespace leonida::mods {
 

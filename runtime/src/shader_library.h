@@ -8,12 +8,12 @@
 // writes into `spirv/index.json`, next to `<name>.spv`. This header needs no Windows, Vulkan or third-party code:
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
+#include "json_reader.h"
 #include "spirv_words.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -434,183 +434,6 @@ inline std::string sha256_hex(std::span<const std::uint8_t> data) {
         for (int shift = 28; shift >= 0; shift -= 4) out.push_back(hex[(word >> shift) & 0xf]);
     return out;
 }
-
-// ---------------------------------------------------------------------------------------------------------------
-// JSON (the subset the translator's index uses, which is all of JSON except number precision beyond double)
-
-struct JsonObjectEntry;
-
-struct Json {
-    enum class Kind { null, boolean, number, string, array, object } kind = Kind::null;
-    bool boolean = false;
-    double number = 0;
-    std::string string;
-    std::vector<Json> array;
-    // Declared through the incomplete JsonObjectEntry and destroyed out of line: a vector element type that holds a
-    // Json by value cannot be instantiated while Json is still being defined. GCC tolerates it, Clang with libstdc++
-    // does not (the pair<string, Json> form used to fail to build there). Structured bindings still work.
-    std::vector<JsonObjectEntry> object;
-
-    ~Json();
-    const Json* find(std::string_view key) const;
-};
-
-struct JsonObjectEntry {
-    std::string key;
-    Json value;
-};
-
-inline Json::~Json() = default;
-
-inline const Json* Json::find(std::string_view key) const {
-    for (const auto& [k, v] : object)
-        if (k == key) return &v;
-    return nullptr;
-}
-
-class JsonReader {
-public:
-    explicit JsonReader(std::string_view text) : text_(text) {}
-
-    bool parse(Json& out) {
-        if (!value(out, 0)) return false;
-        space();
-        return pos_ == text_.size();
-    }
-
-private:
-    void space() {
-        while (pos_ < text_.size() && (text_[pos_] == ' ' || text_[pos_] == '\n' || text_[pos_] == '\r' ||
-                                       text_[pos_] == '\t'))
-            ++pos_;
-    }
-
-    bool literal(std::string_view word) {
-        if (text_.substr(pos_, word.size()) != word) return false;
-        pos_ += word.size();
-        return true;
-    }
-
-    bool value(Json& out, int depth) {
-        if (depth > 64) return false;
-        space();
-        if (pos_ >= text_.size()) return false;
-        const char c = text_[pos_];
-        if (c == '{') {
-            out.kind = Json::Kind::object;
-            ++pos_;
-            space();
-            if (pos_ < text_.size() && text_[pos_] == '}') return ++pos_, true;
-            for (;;) {
-                space();
-                std::string key;
-                if (!string(key)) return false;
-                space();
-                if (pos_ >= text_.size() || text_[pos_++] != ':') return false;
-                Json item;
-                if (!value(item, depth + 1)) return false;
-                out.object.emplace_back(std::move(key), std::move(item));
-                space();
-                if (pos_ >= text_.size()) return false;
-                if (text_[pos_] == ',') {
-                    ++pos_;
-                    continue;
-                }
-                return text_[pos_++] == '}';
-            }
-        }
-        if (c == '[') {
-            out.kind = Json::Kind::array;
-            ++pos_;
-            space();
-            if (pos_ < text_.size() && text_[pos_] == ']') return ++pos_, true;
-            for (;;) {
-                Json item;
-                if (!value(item, depth + 1)) return false;
-                out.array.push_back(std::move(item));
-                space();
-                if (pos_ >= text_.size()) return false;
-                if (text_[pos_] == ',') {
-                    ++pos_;
-                    continue;
-                }
-                return text_[pos_++] == ']';
-            }
-        }
-        if (c == '"') {
-            out.kind = Json::Kind::string;
-            return string(out.string);
-        }
-        if (literal("true")) return out.kind = Json::Kind::boolean, out.boolean = true, true;
-        if (literal("false")) return out.kind = Json::Kind::boolean, out.boolean = false, true;
-        if (literal("null")) return out.kind = Json::Kind::null, true;
-        // Numbers through strtod: Apple's libc++ does not provide the floating-point from_chars overload. The
-        // token is already limited to JSON number characters, and the end check requires all of it to be consumed.
-        const std::size_t start = pos_;
-        while (pos_ < text_.size() && std::strchr("+-0123456789.eE", text_[pos_])) ++pos_;
-        if (pos_ == start) return false;
-        out.kind = Json::Kind::number;
-        const std::string token(text_.substr(start, pos_ - start));
-        char* end = nullptr;
-        errno = 0;
-        out.number = std::strtod(token.c_str(), &end);
-        return errno != ERANGE && end == token.c_str() + token.size();
-    }
-
-    static int hex_digit(char c) {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    }
-
-    bool string(std::string& out) {
-        if (pos_ >= text_.size() || text_[pos_++] != '"') return false;
-        while (pos_ < text_.size()) {
-            const char c = text_[pos_++];
-            if (c == '"') return true;
-            if (c != '\\') {
-                out.push_back(c);
-                continue;
-            }
-            if (pos_ >= text_.size()) return false;
-            const char e = text_[pos_++];
-            switch (e) {
-            case '"': case '\\': case '/': out.push_back(e); break;
-            case 'b': out.push_back('\b'); break;
-            case 'f': out.push_back('\f'); break;
-            case 'n': out.push_back('\n'); break;
-            case 'r': out.push_back('\r'); break;
-            case 't': out.push_back('\t'); break;
-            case 'u': {
-                if (pos_ + 4 > text_.size()) return false;
-                unsigned code = 0;
-                for (int i = 0; i < 4; ++i) {  // exactly four hex digits
-                    const int digit = hex_digit(text_[pos_++]);
-                    if (digit < 0) return false;
-                    code = code << 4 | unsigned(digit);
-                }
-                if (code < 0x80) {
-                    out.push_back(char(code));
-                } else if (code < 0x800) {
-                    out.push_back(char(0xc0 | (code >> 6)));
-                    out.push_back(char(0x80 | (code & 0x3f)));
-                } else {  // surrogate pairs are kept as two 3-byte sequences; index names are ASCII
-                    out.push_back(char(0xe0 | (code >> 12)));
-                    out.push_back(char(0x80 | ((code >> 6) & 0x3f)));
-                    out.push_back(char(0x80 | (code & 0x3f)));
-                }
-                break;
-            }
-            default: return false;
-            }
-        }
-        return false;
-    }
-
-    std::string_view text_;
-    std::size_t pos_ = 0;
-};
 
 // ---------------------------------------------------------------------------------------------------------------
 // DXBC containers and the FSSM program
