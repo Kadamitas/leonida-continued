@@ -10488,9 +10488,19 @@ public:
                             image->sampled_tile_bytes() != layout->tile_bytes || image->GetDesc().Alignment != alignment ||
                             !same_texture_shape(image->desc(), native)) continue;
                         const auto pages = rt::xmem::find_physical_cpu_view(address, guest_bytes);
-                        if (!pages.total_pages || pages.mapped_pages != pages.total_pages ||
-                            rt::xmem::validate_sparse_texture(address, guest_bytes) != rt::xmem::SparseTextureSnapshot::ready ||
-                            !image->pin_title_image()) return d3d12_trace::result(method, E_NOTIMPL);
+                        const bool complete = pages.total_pages && pages.mapped_pages == pages.total_pages;
+                        const auto backing = complete ? rt::xmem::validate_sparse_texture(address, guest_bytes) :
+                                                       rt::xmem::SparseTextureSnapshot::untracked;
+                        if (!complete || backing != rt::xmem::SparseTextureSnapshot::ready || !image->pin_title_image()) {
+                            static std::atomic<unsigned> reports{};
+                            if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+                                std::fprintf(stderr, "[rt] d3d12: repeated display texture refused va=%p size=%llux%u "
+                                    "mips=%u format=%u bytes=%llu mapped_pages=%zu/%zu validation_attempted=%u backing=%u\n",
+                                    address, static_cast<unsigned long long>(desc.Width), desc.Height, desc.MipLevels,
+                                    unsigned(desc.Format), static_cast<unsigned long long>(guest_bytes), pages.mapped_pages,
+                                    pages.total_pages, unsigned(complete), unsigned(backing));
+                            return d3d12_trace::result(method, E_NOTIMPL);
+                        }
                         pinned = image;
                         break;
                     }

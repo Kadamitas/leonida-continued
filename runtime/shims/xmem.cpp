@@ -38,6 +38,25 @@ namespace {
 
 constexpr size_t kAlign = 64;
 constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
+constexpr SIZE_T kTitleCommitTraceMinimum = 4 * 1024 * 1024;
+
+void trace_large_title_allocation(const char* api, const void* requested, SIZE_T bytes, DWORD flags,
+                                  DWORD protect, const void* result, DWORD error, const void* caller) {
+    if (bytes < kTitleCommitTraceMinimum) return;
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("LEONIDA_TRACE_TITLE_COMMIT", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    if (!enabled) return;
+    static std::atomic<unsigned> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) >= 4096) return;
+    MEMORY_BASIC_INFORMATION info{};
+    if (result) VirtualQuery(result, &info, sizeof(info));
+    std::fprintf(stderr, "[rt] xmem: %s request=%p result=%p allocation=%p bytes=%zu flags=0x%lx "
+                         "protect=0x%lx host_state=0x%lx host_type=0x%lx error=%lu caller=%p\n",
+                 api, requested, result, info.AllocationBase, static_cast<size_t>(bytes), flags, protect,
+                 info.State, info.Type, result ? ERROR_SUCCESS : error, caller);
+}
 
 // gta6rt --trace FILE: the first allocation/free wrapper or XMemVirtualAlloc call for each distinct raw attribute word goes to the
 // startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
@@ -365,6 +384,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     const DWORD effective_protect = cached_host_allocation ? protect & ~PAGE_WRITECOMBINE : protect;
     void* result = xmem_virtual_alloc(address, size, allocation_type, attributes, effective_protect);
     const DWORD error = GetLastError();
+    trace_large_title_allocation("XMemVirtualAlloc", address, size, allocation_type, protect, result, error, caller);
     if (coherent_control && result)
         rt::shims::control_pages::note_allocation(reinterpret_cast<std::uintptr_t>(result), size);
     // Shared CPU/GPU write-back arenas used by CopyMemoryToMemoryX. Record successful new allocations
@@ -466,7 +486,13 @@ constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    void* const result = VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    if (size >= kTitleCommitTraceMinimum) {
+        const DWORD error = GetLastError();
+        trace_large_title_allocation("VirtualAlloc", address, size, allocation_type, protect, result, error, _ReturnAddress());
+        SetLastError(error);
+    }
+    return result;
 }
 
 }  // namespace
