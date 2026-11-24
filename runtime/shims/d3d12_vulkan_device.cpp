@@ -982,12 +982,14 @@ struct DeviceState {
     };
     std::map<std::uint64_t, TitleImageResource> title_image_resources;
     std::multimap<std::uint64_t, TitleImageResource> title_depth_image_resources;
-    struct HostRange { std::uint64_t address, bytes; bool physical_snapshot; };
+    struct HostRange { std::uint64_t address, bytes; bool physical_snapshot, sampled_shadow; };
     struct AddressView { std::uint64_t bytes; bool physical_snapshot; };
     std::map<leonida::ResourceId, HostRange> title_host_ranges;
     // Address-only views have no resource lifetime to follow. Remember their ranges conservatively until the
     // device goes away rather than later accepting an unrelated optimal-image alias over those CPU bytes.
     std::map<std::uint64_t, AddressView> title_address_views;
+    // A display-BC placement sharing a physical sampled source owns no writable native range.
+    std::map<std::uint64_t, std::uint64_t> sampled_alias_spans;
 
     static bool ranges_overlap(std::uint64_t a, std::uint64_t bytes_a, std::uint64_t b, std::uint64_t bytes_b) {
         return a <= b ? b - a < bytes_a : a - b < bytes_b;
@@ -998,6 +1000,17 @@ struct DeviceState {
         std::uint64_t allocation = 0;
         bool physical = false;
     };
+    static HRESULT sampled_placement_failure(const char* stage, HRESULT hr, std::uint64_t address,
+                                             std::uint64_t bytes, bool physical, const TitleImageCollision& conflict) {
+        static std::atomic<unsigned> reports{};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 24)
+            std::fprintf(stderr, "[rt] d3d12: sampled placement refused stage=%s hr=0x%08x va=0x%llx bytes=%llu "
+                "physical=%u collider=%s/va0x%llx/bytes%llu/owner0x%llx/physical%u\n", stage, unsigned(hr),
+                static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), unsigned(physical),
+                conflict.kind, static_cast<unsigned long long>(conflict.address), static_cast<unsigned long long>(conflict.bytes),
+                static_cast<unsigned long long>(conflict.allocation), unsigned(conflict.physical));
+        return hr;
+    }
     bool title_image_overlap_locked(std::uint64_t address, std::uint64_t bytes,
                                     DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN, UINT depth_metadata = 0,
                                     TitleImageCollision* collision = nullptr) {
@@ -1043,15 +1056,23 @@ struct DeviceState {
     }
     bool register_title_host_range(leonida::ResourceId id, std::uint64_t address, std::uint64_t bytes,
                                   const char* kind, std::uint64_t addressable_bytes,
-                                  std::uint64_t buffer_address = 0, bool physical_snapshot = false) {
+                                  std::uint64_t buffer_address = 0, bool physical_snapshot = false,
+                                  bool sampled_shadow = false, TitleImageCollision* conflict = nullptr) {
         if (!address || !bytes || bytes > UINT64_MAX - address) return false;
         // Imported buffer memory is page-aligned. Replay exposes only the resource's logical byte range.
         const auto first = buffer_address ? buffer_address : address;
         const auto extent = buffer_address ? addressable_bytes : bytes;
         if (first < address || first - address >= bytes || !extent || extent > bytes - (first - address)) return false;
         std::lock_guard lock(title_placement_mutex);
-        if (title_image_overlap_locked(first, extent) || linear_image_overlap_locked(first, extent, physical_snapshot)) return false;
-        title_host_ranges[id] = {first, extent, physical_snapshot};
+        if (title_image_overlap_locked(first, extent, DXGI_FORMAT_UNKNOWN, 0, conflict) ||
+            linear_image_overlap_locked(first, extent, physical_snapshot, conflict)) return false;
+        if (!sampled_shadow || !physical_snapshot)
+            for (const auto& [start, protected_bytes] : sampled_alias_spans)
+                if (ranges_overlap(first, extent, start, protected_bytes)) {
+                    if (conflict) *conflict = {start, protected_bytes, "protected physical sampled alias", 0, true};
+                    return false;
+                }
+        title_host_ranges[id] = {first, extent, physical_snapshot, sampled_shadow};
         static std::atomic<unsigned> registrations{0};
         if (registrations.fetch_add(1, std::memory_order_relaxed) < 512)
             std::fprintf(stderr, "[rt] d3d12: title host range kind=%s id=0x%llx va=0x%llx bytes=%llu addressable=%llu\n",
@@ -1065,6 +1086,9 @@ struct DeviceState {
         std::lock_guard lock(title_placement_mutex);
         if (title_image_overlap_locked(address, bytes, DXGI_FORMAT_UNKNOWN, 0, collision) ||
             linear_image_overlap_locked(address, bytes, physical_snapshot, collision)) return false;
+        if (!physical_snapshot)
+            for (const auto& [start, protected_bytes] : sampled_alias_spans)
+                if (ranges_overlap(address, bytes, start, protected_bytes)) return false;
         auto [it, inserted] = title_address_views.try_emplace(address, AddressView{bytes, physical_snapshot});
         if (!inserted) {
             it->second.bytes = std::max(it->second.bytes, bytes);
@@ -1072,13 +1096,39 @@ struct DeviceState {
         }
         return true;
     }
+    // Called with the sampled-image cache locked after image, caller reference and cache node are ready.
+    // Change placement protection only on successful publication, under the native placement/host range lock.
+    bool reserve_sampled_alias(std::uint64_t start, std::uint64_t bytes) {
+        std::lock_guard lock(title_placement_mutex);
+        auto source = title_address_views.find(start);
+        if (source == title_address_views.end() || !source->second.physical_snapshot ||
+            title_image_overlap_locked(start, bytes) || linear_image_overlap_locked(start, bytes, true)) return false;
+        for (const auto& [id, range] : title_host_ranges)
+            if (ranges_overlap(start, bytes, range.address, range.bytes) &&
+                (!range.physical_snapshot || !range.sampled_shadow)) return false;
+        for (const auto& [base, view] : title_address_views)
+            if (ranges_overlap(start, bytes, base, view.bytes) && !view.physical_snapshot) return false;
+        auto& protected_bytes = sampled_alias_spans[start];
+        protected_bytes = std::max(protected_bytes, bytes);
+        source->second.bytes = std::max(source->second.bytes, bytes);
+        return true;
+    }
+
     bool conflicting_host_placement_locked(leonida::ResourceId owner, std::uint64_t address,
-                                            std::uint64_t bytes, bool physical_snapshot) const {
+                                            std::uint64_t bytes, bool physical_snapshot,
+                                            TitleImageCollision* conflict = nullptr) const {
         for (const auto& [id, range] : title_host_ranges)
             if (id != owner && conflicting_host_range(address, bytes, physical_snapshot,
-                range.address, range.bytes, range.physical_snapshot)) return true;
+                range.address, range.bytes, range.physical_snapshot)) {
+                if (conflict) *conflict = {range.address, range.bytes, range.sampled_shadow ? "sampled source" : "host resource",
+                                          id, range.physical_snapshot};
+                return true;
+            }
         for (const auto& [start, view] : title_address_views)
-            if (conflicting_host_range(address, bytes, physical_snapshot, start, view.bytes, view.physical_snapshot)) return true;
+            if (conflicting_host_range(address, bytes, physical_snapshot, start, view.bytes, view.physical_snapshot)) {
+                if (conflict) *conflict = {start, view.bytes, "address-only source", 0, view.physical_snapshot};
+                return true;
+            }
         return false;
     }
 
@@ -3188,8 +3238,12 @@ public:
     HRESULT allocate_texture_shadow(const void* source, std::size_t source_span, std::size_t upload_bytes,
                                     bool physical_snapshot = false) {
         auto& vk = device_.context->vk;
-        if (!device_.register_title_host_range(id(), reinterpret_cast<std::uintptr_t>(source), source_span,
-                                              "static_texture_source", source_span, 0, physical_snapshot)) return E_NOTIMPL;
+        DeviceState::TitleImageCollision conflict{};
+        const auto source_address = reinterpret_cast<std::uintptr_t>(source);
+        if (!device_.register_title_host_range(id(), source_address, source_span, "static_texture_source", source_span,
+                                              0, physical_snapshot, true, &conflict))
+            return DeviceState::sampled_placement_failure("upload source range", E_NOTIMPL, source_address, source_span,
+                                                         physical_snapshot, conflict);
         title_host_range_ = true;
         shadow_source_ = source;
         VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -3502,9 +3556,18 @@ public:
             };
             try {
                 std::lock_guard lock(device_.title_placement_mutex);
-                if (device_.conflicting_host_placement_locked(id(), address, placed_bytes, physical)) return refused(E_NOTIMPL);
-                if (!device_.title_image_resources.emplace(address, DeviceState::TitleImageResource{this, placed_bytes, physical}).second)
-                    return refused(E_NOTIMPL);
+                DeviceState::TitleImageCollision conflict{};
+                if (device_.conflicting_host_placement_locked(id(), address, placed_bytes, physical, &conflict))
+                    return refused(DeviceState::sampled_placement_failure("placed source intersects earlier owner",
+                        E_NOTIMPL, address, placed_bytes, physical, conflict));
+                const auto [existing, inserted] = device_.title_image_resources.emplace(address,
+                    DeviceState::TitleImageResource{this, placed_bytes, physical});
+                if (!inserted) {
+                    conflict = {address, existing->second.linear_bytes, "exact placed source",
+                                existing->second.resource->id(), existing->second.physical_snapshot};
+                    return refused(DeviceState::sampled_placement_failure("placed address already occupied",
+                        E_NOTIMPL, address, placed_bytes, physical, conflict));
+                }
                 title_image_va_ = address;
                 linear_shadow_bytes_ = placed_bytes;  // console Map exposes the original tiled allocation
                 title_guest_alignment_ = guest_alignment;
@@ -4379,6 +4442,37 @@ private:
     std::size_t bytes_;
     UINT64 alignment_;
 };
+
+using CachedTextures = decltype(DeviceState::host_static_textures);
+
+bool distinct_sampled_sources(CachedTextures::const_iterator first, CachedTextures::const_iterator last,
+                              const D3D12_RESOURCE_DESC& requested) {
+    return std::all_of(first, last, [&](const auto& item) {
+        const auto& other = *static_cast<Resource*>(item.second.owner.get());
+        const auto& shape = other.desc();
+        // These fixed fields are encoded in every T#, independently of the selected view range and tile mode.
+        return (other.linear_host_image() || other.sampled_tile_bytes()) && shape.DepthOrArraySize == 1 &&
+            (shape.Dimension != requested.Dimension || shape.Width != requested.Width ||
+             shape.Height != requested.Height || shape.MipLevels != requested.MipLevels);
+    });
+}
+
+void report_sampled_siblings(std::uint64_t address, CachedTextures::const_iterator first,
+                            CachedTextures::const_iterator last, int backing, bool distinct) {
+    static std::atomic<unsigned> reports{};
+    if (reports.fetch_add(1, std::memory_order_relaxed) >= 12) return;
+    for (unsigned i = 0; first != last && i < 4; ++first, ++i) {
+        auto& image = *static_cast<Resource*>(first->second.owner.get());
+        const auto shape = image.GetDesc();
+        std::fprintf(stderr, "[rt] d3d12: cached sampled sibling %u va=0x%llx source_snapshot=%d distinct=%u "
+            "dim=%u size=%llux%ux%u mips=%u format=%u flags=0x%x tile=%u linear=%u alignment=%llu owner=0x%llx\n",
+            i, static_cast<unsigned long long>(address), backing, unsigned(distinct), unsigned(shape.Dimension),
+            static_cast<unsigned long long>(shape.Width), shape.Height, unsigned(shape.DepthOrArraySize),
+            unsigned(shape.MipLevels), unsigned(shape.Format), unsigned(shape.Flags), image.sampled_tile_bytes(),
+            unsigned(image.linear_host_image()), static_cast<unsigned long long>(shape.Alignment),
+            static_cast<unsigned long long>(image.id()));
+    }
+}
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
 bool vertex_format(DXGI_FORMAT format, VkFormat& out, UINT& bytes) {
@@ -9714,7 +9808,9 @@ public:
             const auto format = state_.texture_format(native);
             const auto layout = title_tiled_texture_layout(desc, format);
             const auto start = reinterpret_cast<std::uintptr_t>(address);
-            if (!layout || !state_.sampled_usable(format.format)) return d3d12_trace::result(method, E_NOTIMPL);
+            if (!layout || !state_.sampled_usable(format.format))
+                return d3d12_trace::result(method, DeviceState::sampled_placement_failure(
+                    !layout ? "unsupported tile layout" : "unsupported sampled format", E_NOTIMPL, start, 0, false, {}));
             const UINT64 alignment = std::max<UINT64>(layout->tile_bytes, desc.Alignment);
             const UINT64 source_bytes = layout->tiled_bytes * desc.DepthOrArraySize;
             if (source_bytes > UINT64_MAX - (alignment - 1)) return d3d12_trace::result(method, E_INVALIDARG);
@@ -9737,12 +9833,39 @@ public:
                             image.GetDesc().Alignment == alignment && same_texture_shape(image.desc(), native);
                     });
                     if (cached == last) {
-                        static std::atomic<unsigned> mismatches{};
-                        if (mismatches.fetch_add(1, std::memory_order_relaxed) < 12)
-                            std::fprintf(stderr, "[rt] d3d12: no matching cached BC placement va=%p format=%u "
-                                "size=%llux%u bytes=%llu alignment=%llu\n", address, unsigned(desc.Format),
-                                static_cast<unsigned long long>(desc.Width), desc.Height,
-                                static_cast<unsigned long long>(guest_bytes), static_cast<unsigned long long>(alignment));
+                        const bool distinct = distinct_sampled_sources(first, last, native);
+                        const auto backing = rt::xmem::validate_sparse_texture(address, guest_bytes);
+                        const bool physical = backing == rt::xmem::SparseTextureSnapshot::ready;
+                        try {
+                            if (layout->tile_bytes == 65536 && desc.DepthOrArraySize == 1 && distinct && physical) {
+                                // Use the same cache-owned COM object and raw descriptor address as slot 70. A later
+                                // identical placement or address view must find this exact native image again.
+                                const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+                                auto* image = new CachedBcImage(state_, native, heap, holder(), guest_bytes, alignment);
+                                std::shared_ptr<void> owner(image, [](void* p) { static_cast<Resource*>(p)->Resource::Release(); });
+                                HRESULT hr = image->create_texture(format, {}, 0, true);
+                                if (SUCCEEDED(hr)) hr = image->enable_tiled_texture_shadow(address, *layout);
+                                if (FAILED(hr)) return d3d12_trace::result(method,
+                                    DeviceState::sampled_placement_failure("cached alias image or tiled upload",
+                                        hr, start, guest_bytes, physical, {}));
+                                IUnknown* result = nullptr;
+                                hr = image->QueryInterface(riid, reinterpret_cast<void**>(&result));
+                                if (FAILED(hr)) return d3d12_trace::result(method, hr);
+                                const auto release = [](IUnknown* object) { object->Release(); };
+                                std::unique_ptr<IUnknown, decltype(release)> reference(result, release);
+                                // Prepare both the cache node and caller reference before expanding the protected
+                                // span. Transferring this uint64-key node between identical allocators cannot allocate.
+                                decltype(state_.host_static_textures) staged;
+                                const auto row = staged.emplace(start,
+                                    DeviceState::CachedTexture{std::move(owner), std::size_t(guest_bytes)});
+                                if (state_.reserve_sampled_alias(start, guest_bytes)) {
+                                    state_.host_static_textures.insert(last, staged.extract(row));
+                                    *out = reference.release();
+                                    return d3d12_trace::result(method, hr);
+                                }
+                            }
+                        } catch (const std::bad_alloc&) { return d3d12_trace::result(method, E_OUTOFMEMORY); }
+                        report_sampled_siblings(start, first, last, int(backing), distinct);
                         return d3d12_trace::result(method, E_NOTIMPL);
                     }
                     auto& image = *static_cast<Resource*>(cached->second.owner.get());
@@ -9762,8 +9885,14 @@ public:
                 resource->attach_device(identity());
                 const bool cube = desc.Width == desc.Height && desc.DepthOrArraySize >= 6 && desc.DepthOrArraySize % 6 == 0;
                 HRESULT hr = resource->create_texture(format, {}, cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0, true);
-                if (SUCCEEDED(hr)) hr = resource->enable_tiled_texture_shadow(address, *layout, guest_bytes, alignment);
-                if (FAILED(hr)) return d3d12_trace::result(method, hr);
+                const char* stage = "standalone native texture";
+                if (SUCCEEDED(hr)) {
+                    stage = "standalone tiled shadow";
+                    hr = resource->enable_tiled_texture_shadow(address, *layout, guest_bytes, alignment);
+                }
+                if (FAILED(hr)) return d3d12_trace::result(method, DeviceState::sampled_placement_failure(
+                    stage, hr, start, guest_bytes, rt::xmem::validate_sparse_texture(address, guest_bytes) ==
+                        rt::xmem::SparseTextureSnapshot::ready, {}));
                 static std::atomic<unsigned> created{0};
                 if (created.fetch_add(1, std::memory_order_relaxed) < 16)
                     std::fprintf(stderr, "[rt] d3d12: default BC4KS placed shadow va=%p format=%u bytes=%llu "
@@ -13696,10 +13825,6 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
             rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(address), source_bytes) :
             rt::xmem::SparseTextureSnapshot::untracked;
         const bool physical_snapshot = backing == rt::xmem::SparseTextureSnapshot::ready;
-        DeviceState::TitleImageCollision collision{};
-        if (!state.register_title_address_view(address, source_bytes, physical_snapshot, &collision))
-            return sampled_view_failure("source range registration", E_NOTIMPL, address, resource, view, source_bytes,
-                                        collision, int(backing));
         std::lock_guard cache_lock(state.host_static_texture_mutex);
         const auto [first, last] = state.host_static_textures.equal_range(address);
         auto found = std::find_if(first, last, [&](const auto& row) {
@@ -13707,19 +13832,33 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
             return same_texture_shape(image.desc(), resource) && bool(linear_layout) == image.linear_host_image() &&
                 (!tiled_layout || image.sampled_tile_bytes() == tiled_layout->tile_bytes);
         });
-        if (found == last) {
-            if (first != last) {
-                // These sampled-only 2D images independently detile the same guest bytes on submission.
-                // Keep other alias types outside this path until their backing and update rules are known.
-                const bool aliasable = tiled_layout && tiled_layout->tile_bytes == 4096 &&
-                    resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && faces == 1 &&
-                    std::all_of(first, last, [](const auto& row) {
-                        const auto& sibling = *static_cast<Resource*>(row.second.owner.get());
-                        return sibling.sampled_tile_bytes() == 4096 &&
-                            sibling.desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && sibling.desc().DepthOrArraySize == 1;
-                    });
-                if (!aliasable) return failure("incompatible cached shape at same address", E_NOTIMPL);
+        bool physical_alias = false;
+        if (found == last && first != last) {
+            // Preserve the established standard-4KB single-layer alias profile.
+            const bool small_tiles = tiled_layout && tiled_layout->tile_bytes == 4096 &&
+                resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && faces == 1 &&
+                std::all_of(first, last, [](const auto& row) {
+                    const auto& sibling = *static_cast<Resource*>(row.second.owner.get());
+                    return sibling.sampled_tile_bytes() == 4096 &&
+                        sibling.desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && sibling.desc().DepthOrArraySize == 1;
+                });
+            if (!small_tiles) {
+                const bool distinct = distinct_sampled_sources(first, last, resource);
+                physical_alias = (linear_layout || tiled_layout) && !is_volume && faces == 1 && distinct && physical_snapshot;
+                if (!physical_alias) {
+                    report_sampled_siblings(address, first, last, int(backing), distinct);
+                    return sampled_view_failure("incompatible cached shape at same address", E_NOTIMPL, address,
+                                                resource, view, source_bytes, {}, int(backing));
+                }
             }
+        }
+        if (!physical_alias) {
+            DeviceState::TitleImageCollision collision{};
+            if (!state.register_title_address_view(address, source_bytes, physical_snapshot, &collision))
+                return sampled_view_failure("source range registration", E_NOTIMPL, address, resource, view, source_bytes,
+                                            collision, int(backing));
+        }
+        if (found == last) {
             auto desc = resource;
             desc.Flags = D3D12_RESOURCE_FLAG_NONE;
             desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -13752,6 +13891,26 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
             if (FAILED(hr)) {
                 return sampled_view_failure("texture upload setup", hr, address, resource, view, source_bytes,
                                             {}, int(backing));
+            }
+            if (physical_alias) {
+                // Stage the descriptor before reserving the range. A failed native view, cache allocation or
+                // overlap check destroys this private image without exposing a new descriptor to the caller.
+                alignas(32) leonida::DescriptorKey staged_key{};
+                d->CreateShaderResourceView(texture, &view, {reinterpret_cast<SIZE_T>(staged_key.data())});
+                leonida::ResourceId actual = 0;
+                if (!state.owns_image_key(texture->id(), staged_key, &actual))
+                    return sampled_view_failure(actual ? "alias descriptor key collision" : "alias descriptor key missing",
+                        E_NOTIMPL, address, resource, view, source_bytes, {}, int(backing), texture->id(), actual);
+                CachedTextures staged;
+                const auto row = staged.emplace(address, DeviceState::CachedTexture{std::move(owner), bc_bytes});
+                if (!state.reserve_sampled_alias(address, source_bytes)) {
+                    report_sampled_siblings(address, first, last, int(backing), true);
+                    return sampled_view_failure("physical sampled alias overlaps an incompatible owner", E_NOTIMPL,
+                                                address, resource, view, source_bytes, {}, int(backing));
+                }
+                state.host_static_textures.insert(last, staged.extract(row));
+                std::memcpy(reinterpret_cast<void*>(destination.ptr), staged_key.data(), sizeof(staged_key));
+                return S_OK;
             }
             found = state.host_static_textures.emplace_hint(last, address, DeviceState::CachedTexture{std::move(owner), bc_bytes});
             if (tiled_layout)
