@@ -4679,6 +4679,17 @@ private:
 
 using CachedTextures = decltype(DeviceState::host_static_textures);
 
+// The two BC7 UNORM cube chains and the independently sampled BC7 sRGB surface share their
+// physical start. Their T#s encode distinct format, dimensions and mip counts, even for subviews.
+bool observed_bc7_unorm_cube(const D3D12_RESOURCE_DESC& shape) {
+    return shape.Format == DXGI_FORMAT_BC7_UNORM && shape.DepthOrArraySize == 6 && shape.Height == shape.Width &&
+        ((shape.Width == 64 && shape.MipLevels == 7) || (shape.Width == 32 && shape.MipLevels == 6));
+}
+bool observed_bc7_srgb_surface(const D3D12_RESOURCE_DESC& shape) {
+    return shape.Format == DXGI_FORMAT_BC7_UNORM_SRGB && shape.DepthOrArraySize == 1 &&
+        shape.Width == 256 && shape.Height == 256 && shape.MipLevels == 7;
+}
+
 bool distinct_sampled_sources(CachedTextures::const_iterator first, CachedTextures::const_iterator last,
                               const D3D12_RESOURCE_DESC& requested, bool bc7_surfaces = false) {
     return std::all_of(first, last, [&](const auto& item) {
@@ -4687,9 +4698,12 @@ bool distinct_sampled_sources(CachedTextures::const_iterator first, CachedTextur
         // These fixed fields are encoded in every T#, independently of the selected view range and tile mode.
         const bool single_surface = shape.DepthOrArraySize == 1 ||
             (other.sampled_tile_bytes() == 4096 && title_sampled_volume_4ks_query(shape));
-        const bool compatible_bc7 = other.sampled_tile_bytes() == 4096 && shape.Format == requested.Format &&
+        const bool compatible_bc7 = bc7_surfaces && other.sampled_tile_bytes() == 4096 &&
             shape.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-            (shape.DepthOrArraySize == 1 || (shape.DepthOrArraySize == 6 && shape.Width == shape.Height));
+            ((shape.Format == DXGI_FORMAT_BC7_UNORM && requested.Format == shape.Format &&
+              (shape.DepthOrArraySize == 1 || (shape.DepthOrArraySize == 6 && shape.Width == shape.Height))) ||
+             (observed_bc7_unorm_cube(shape) && observed_bc7_srgb_surface(requested)) ||
+             (observed_bc7_srgb_surface(shape) && observed_bc7_unorm_cube(requested)));
         return (other.linear_host_image() || other.sampled_tile_bytes()) && (bc7_surfaces ? compatible_bc7 : single_surface) &&
             (shape.Dimension != requested.Dimension || shape.Width != requested.Width ||
              shape.Height != requested.Height || shape.MipLevels != requested.MipLevels);
@@ -14150,7 +14164,8 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                         sibling.desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && sibling.desc().DepthOrArraySize == 1;
                 });
             if (!small_tiles) {
-                const bool bc7_shape = tiled_layout && tiled_layout->tile_bytes == 4096 && resource.Format == DXGI_FORMAT_BC7_UNORM &&
+                const bool bc7_shape = tiled_layout && tiled_layout->tile_bytes == 4096 &&
+                    (resource.Format == DXGI_FORMAT_BC7_UNORM || observed_bc7_srgb_surface(resource)) &&
                     ((cube_faces && faces == 6 && view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE) ||
                      (!is_volume && faces == 1 && view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D));
                 bc7_alias = bc7_shape && distinct_sampled_sources(first, last, resource, true);
