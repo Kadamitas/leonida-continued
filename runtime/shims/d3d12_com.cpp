@@ -1483,6 +1483,8 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
     D3D12_GPU_VIRTUAL_ADDRESS sampler_base_ = 0;
     std::uint32_t resource_shader_offset_ = 0, sampler_shader_offset_ = 0;
+    const leonida::DescriptorHeapMirror* pending_resource_mirror_ = nullptr;
+    const leonida::DescriptorHeapMirror* pending_sampler_mirror_ = nullptr;
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
@@ -1566,8 +1568,15 @@ private:
         }
         // Keep every heap used by this list, including earlier bindings. A closed list
         // may be resubmitted after the application edits its CPU descriptor bytes.
-        if ((cbv != cbv_srv_uav_heap_ && !list_.use_descriptor_heap(descriptor_heap_mirror(cbv))) ||
-            (smp != sampler_heap_ && !list_.use_descriptor_heap(descriptor_heap_mirror(smp))))
+        const auto bind_mirror = [&](ID3D12DescriptorHeap* heap, const leonida::DescriptorHeapMirror*& pending) {
+            const auto* mirror = descriptor_heap_mirror(heap);
+            // The placed heap's arena offset is read only by directly indexed compute roots. Ordinary
+            // heaps also serve explicit tables and retain the existing bind-time mirror registration.
+            pending = mirror && mirror->reservation ? mirror : nullptr;
+            return pending || list_.use_descriptor_heap(mirror);
+        };
+        if ((cbv != cbv_srv_uav_heap_ && !bind_mirror(cbv, pending_resource_mirror_)) ||
+            (smp != sampler_heap_ && !bind_mirror(smp, pending_sampler_mirror_)))
             return check(false);
         cbv_srv_uav_heap_ = cbv;
         cbv_srv_uav_base_ = cbv_base;
@@ -1614,6 +1623,7 @@ private:
         cbv_srv_uav_base_ = 0;
         sampler_base_ = 0;
         resource_shader_offset_ = sampler_shader_offset_ = 0;
+        pending_resource_mirror_ = pending_sampler_mirror_ = nullptr;
         topology_ = 0;
         vertex_buffers_ = {};
         index_ = {};
@@ -1685,7 +1695,7 @@ private:
 
     // PR #1064 observed these inline heap words in a compute shader during story loading.
     // The general placement is inferred. Record only arena offsets the shader can actually dereference.
-    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> compute_user_data() const {
+    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> compute_user_data() {
         auto data = compute_.data;
         const auto flags = compute_.layout->flags;
         if (!(flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
@@ -1696,10 +1706,18 @@ private:
         }();
         if (!enabled) return data;
         auto slot = compute_.layout->compute_arguments_end;
-        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && slot < data.size())
+        const auto consume = [&](const leonida::DescriptorHeapMirror*& pending) {
+            if (pending && !list_.use_descriptor_heap(pending)) check(false);
+            pending = nullptr;
+        };
+        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && slot < data.size()) {
+            consume(pending_resource_mirror_);
             data[slot++] = resource_shader_offset_;
-        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && slot < data.size())
+        }
+        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && slot < data.size()) {
+            consume(pending_sampler_mirror_);
             data[slot] = sampler_shader_offset_;
+        }
         return data;
     }
 

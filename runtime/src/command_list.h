@@ -715,6 +715,12 @@ struct DescriptorHeapMirror {
     const void* title = nullptr;
     void* arena = nullptr;
     std::size_t bytes = 0;
+    // An explicitly placed heap borrows its caller's mapping. Check it before inspection and use a
+    // fault-reporting comparator/copier. Ordinary allocator-owned heaps keep their existing contract.
+    const void* reservation = nullptr;
+    bool (*valid)(const DescriptorHeapMirror&) = nullptr;
+    bool (*compare)(const void*, const void*, std::size_t, bool&) = nullptr;
+    bool (*copy)(void*, const void*, std::size_t) = nullptr;
 };
 
 class CommandList {
@@ -1107,6 +1113,37 @@ bool refresh_descriptor_heaps(std::span<const CommandList* const> lists,
     }
     bool retired = false;
     for (const auto* heap : bound) {
+        if (heap->valid) {
+            if (!heap->valid(*heap)) return false;
+            const auto* title = static_cast<const std::byte*>(heap->title);
+            auto* arena = static_cast<std::byte*>(heap->arena);
+            // Scan in large blocks; visit individual 4 KiB pages only where the source differs. An
+            // unchanged heap never writes its arena, and one modified descriptor copies at most one page.
+            constexpr std::size_t block = 256 * 1024, page = 4096;
+            for (std::size_t first = 0; first < heap->bytes; first += block) {
+                const auto count = (std::min)(block, heap->bytes - first);
+                bool equal = false;
+                if (!heap->compare(title + first, arena + first, count, equal)) return false;
+                if (equal) continue;
+                if (!retired) {
+                    if (!wait()) return false;
+                    retired = true;
+                }
+                const auto end = first + count;
+                auto run = end;
+                for (std::size_t at = first; at < end; at += page) {
+                    const auto size = (std::min)(page, end - at);
+                    if (count > page && !heap->compare(title + at, arena + at, size, equal)) return false;
+                    if (!equal && run == end) run = at;
+                    if (equal && run != end) {
+                        if (!heap->copy(arena + run, title + run, at - run)) return false;
+                        run = end;
+                    }
+                }
+                if (run != end && !heap->copy(arena + run, title + run, end - run)) return false;
+            }
+            continue;
+        }
         if (std::memcmp(heap->title, heap->arena, heap->bytes) == 0) continue;
         if (!retired) {
             if (!wait()) return false;
