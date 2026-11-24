@@ -977,15 +977,17 @@ struct DeviceState {
     std::map<std::uint64_t, std::weak_ptr<const TitleImageAllocation>> title_images;
     std::multimap<std::uint64_t, std::weak_ptr<const TitleImageAllocation>> title_depth_images;
     // Final COM release unpublishes under this same mutex before destruction. A lookup pins only nonzero refs.
+    struct DisplayBcShape { DXGI_FORMAT format; UINT width, height, mips; };
     struct TitleImageResource {
         Resource* resource;
         std::uint64_t linear_bytes = 0;
         bool physical_snapshot = false;
         bool display_bc_snapshot = false;
+        DisplayBcShape typed_display{};
     };
-    std::map<std::uint64_t, TitleImageResource> title_image_resources;
+    std::multimap<std::uint64_t, TitleImageResource> title_image_resources;
     std::multimap<std::uint64_t, TitleImageResource> title_depth_image_resources;
-    struct HostRange { std::uint64_t address, bytes; bool physical_snapshot, sampled_shadow; };
+    struct HostRange { std::uint64_t address, bytes; bool physical_snapshot, sampled_shadow; DisplayBcShape typed_display; };
     struct AddressView { std::uint64_t bytes; bool physical_snapshot, buffer_srv, texture_srv; };
     std::map<leonida::ResourceId, HostRange> title_host_ranges;
     // Address-only views have no resource lifetime to follow. Remember their ranges conservatively until the
@@ -1087,11 +1089,23 @@ struct DeviceState {
             rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(base), image_bytes) ==
                 rt::xmem::SparseTextureSnapshot::ready;
     }
+    // Both are 16-byte BC blocks. The T# format is fixed at 177 (BC5 UNORM) or 182 (BC7 sRGB)
+    // for every permitted typed subview, while each resource owns its own native image and snapshot.
+    static bool shared_display_bc(std::uint64_t address, std::uint64_t bytes, DisplayBcShape a,
+                                  std::uint64_t other, std::uint64_t length, DisplayBcShape b) {
+        const bool typed_pair = (a.format == DXGI_FORMAT_BC5_UNORM && b.format == DXGI_FORMAT_BC7_UNORM_SRGB) ||
+            (b.format == DXGI_FORMAT_BC5_UNORM && a.format == DXGI_FORMAT_BC7_UNORM_SRGB);
+        return typed_pair && address == other && bytes == length && a.width == b.width && a.height == b.height &&
+            a.mips == b.mips && rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(address), bytes) ==
+                rt::xmem::SparseTextureSnapshot::ready;
+    }
     bool linear_image_overlap_locked(std::uint64_t address, std::uint64_t bytes, bool physical_snapshot = false,
-                                     TitleImageCollision* collision = nullptr, bool buffer_srv = false) const {
+                                     TitleImageCollision* collision = nullptr, bool buffer_srv = false,
+                                     DisplayBcShape typed_display = {}) const {
         for (const auto& [start, image] : title_image_resources) {
             if (!image.linear_bytes || !conflicting_host_range(address, bytes, physical_snapshot,
                 start, image.linear_bytes, image.physical_snapshot)) continue;
+            if (shared_display_bc(address, bytes, typed_display, start, image.linear_bytes, image.typed_display)) continue;
             if (buffer_srv && address == start && image.display_bc_snapshot) {
                 const auto prior = title_address_views.find(start);
                 if ((prior == title_address_views.end() || !prior->second.texture_srv) &&
@@ -1106,7 +1120,8 @@ struct DeviceState {
     bool register_title_host_range(leonida::ResourceId id, std::uint64_t address, std::uint64_t bytes,
                                   const char* kind, std::uint64_t addressable_bytes,
                                   std::uint64_t buffer_address = 0, bool physical_snapshot = false,
-                                  bool sampled_shadow = false, TitleImageCollision* conflict = nullptr) {
+                                  bool sampled_shadow = false, TitleImageCollision* conflict = nullptr,
+                                  DisplayBcShape typed_display = {}) {
         if (!address || !bytes || bytes > UINT64_MAX - address) return false;
         // Imported buffer memory is page-aligned. Replay exposes only the resource's logical byte range.
         const auto first = buffer_address ? buffer_address : address;
@@ -1114,14 +1129,14 @@ struct DeviceState {
         if (first < address || first - address >= bytes || !extent || extent > bytes - (first - address)) return false;
         std::lock_guard lock(title_placement_mutex);
         if (title_image_overlap_locked(first, extent, DXGI_FORMAT_UNKNOWN, 0, conflict) ||
-            linear_image_overlap_locked(first, extent, physical_snapshot, conflict)) return false;
+            linear_image_overlap_locked(first, extent, physical_snapshot, conflict, false, typed_display)) return false;
         if (!sampled_shadow || !physical_snapshot)
             for (const auto& [start, protected_bytes] : sampled_alias_spans)
                 if (ranges_overlap(first, extent, start, protected_bytes)) {
                     if (conflict) *conflict = {start, protected_bytes, "protected physical sampled alias", 0, true};
                     return false;
                 }
-        title_host_ranges[id] = {first, extent, physical_snapshot, sampled_shadow};
+        title_host_ranges[id] = {first, extent, physical_snapshot, sampled_shadow, typed_display};
         static std::atomic<unsigned> registrations{0};
         if (registrations.fetch_add(1, std::memory_order_relaxed) < 512)
             std::fprintf(stderr, "[rt] d3d12: title host range kind=%s id=0x%llx va=0x%llx bytes=%llu addressable=%llu\n",
@@ -1212,10 +1227,12 @@ struct DeviceState {
 
     bool conflicting_host_placement_locked(leonida::ResourceId owner, std::uint64_t address,
                                             std::uint64_t bytes, bool physical_snapshot,
-                                            TitleImageCollision* conflict = nullptr, bool display_sampled = false) const {
+                                            TitleImageCollision* conflict = nullptr, bool display_sampled = false,
+                                            DisplayBcShape typed_display = {}) const {
         for (const auto& [id, range] : title_host_ranges)
             if (id != owner && conflicting_host_range(address, bytes, physical_snapshot,
                 range.address, range.bytes, range.physical_snapshot)) {
+                if (shared_display_bc(address, bytes, typed_display, range.address, range.bytes, range.typed_display)) continue;
                 if (conflict) *conflict = {range.address, range.bytes, range.sampled_shadow ? "sampled source" : "host resource",
                                           id, range.physical_snapshot};
                 return true;
@@ -2644,15 +2661,10 @@ public:
     void before_final_release() noexcept {
         if (!title_image_va_) return;
         std::lock_guard lock(device_.title_placement_mutex);
-        if (title_depth_projection_) {
-            const auto [first, last] = device_.title_depth_image_resources.equal_range(title_image_va_);
-            const auto found = std::find_if(first, last, [this](const auto& entry) { return entry.second.resource == this; });
-            if (found != last) device_.title_depth_image_resources.erase(found);
-            return;
-        }
-        const auto found = device_.title_image_resources.find(title_image_va_);
-        if (found != device_.title_image_resources.end() && found->second.resource == this)
-            device_.title_image_resources.erase(found);
+        auto& registry = title_depth_projection_ ? device_.title_depth_image_resources : device_.title_image_resources;
+        const auto [first, last] = registry.equal_range(title_image_va_);
+        const auto found = std::find_if(first, last, [this](const auto& entry) { return entry.second.resource == this; });
+        if (found != last) registry.erase(found);
     }
 
     // Called only while holding title_placement_mutex: final release must unpublish before it can delete this.
@@ -3394,12 +3406,12 @@ public:
     }
 
     HRESULT allocate_texture_shadow(const void* source, std::size_t source_span, std::size_t upload_bytes,
-                                    bool physical_snapshot = false) {
+                                    bool physical_snapshot = false, DeviceState::DisplayBcShape typed_display = {}) {
         auto& vk = device_.context->vk;
         DeviceState::TitleImageCollision conflict{};
         const auto source_address = reinterpret_cast<std::uintptr_t>(source);
         if (!device_.register_title_host_range(id(), source_address, source_span, "static_texture_source", source_span,
-                                              0, physical_snapshot, true, &conflict))
+                                              0, physical_snapshot, true, &conflict, typed_display))
             return DeviceState::sampled_placement_failure("upload source range", E_NOTIMPL, source_address, source_span,
                                                          physical_snapshot, conflict);
         title_host_range_ = true;
@@ -3621,8 +3633,8 @@ public:
         {
             std::lock_guard lock(device_.title_placement_mutex);
             if (device_.conflicting_host_placement_locked(id(), address, bytes, physical)) return E_NOTIMPL;
-            if (!device_.title_image_resources.emplace(address, DeviceState::TitleImageResource{this, bytes, physical}).second)
-                return E_NOTIMPL;
+            if (device_.title_image_resources.contains(address)) return E_NOTIMPL;
+            device_.title_image_resources.emplace(address, DeviceState::TitleImageResource{this, bytes, physical});
             title_image_va_ = address;
         }
         return S_OK;
@@ -3639,7 +3651,10 @@ public:
         const auto source_span = placed_bytes ? std::size_t(placed_bytes) : source_bytes;
         const bool physical = rt::xmem::validate_sparse_texture(source, source_span) == rt::xmem::SparseTextureSnapshot::ready;
         if (require_physical && !physical) return E_INVALIDARG;
-        if (const HRESULT hr = allocate_texture_shadow(source, source_span, upload_bytes, physical); FAILED(hr))
+        const bool display_sampled = layout.tile_bytes == 65536 && layout.block_dim == 4 && !volume && layers == 1;
+        const DeviceState::DisplayBcShape typed_display = physical && placed_bytes && display_sampled ?
+            DeviceState::DisplayBcShape{desc_.Format, UINT(desc_.Width), desc_.Height, desc_.MipLevels} : DeviceState::DisplayBcShape{};
+        if (const HRESULT hr = allocate_texture_shadow(source, source_span, upload_bytes, physical, typed_display); FAILED(hr))
             return hr;
         struct Capture {
             std::vector<std::byte> tiled, uploaded, packed;
@@ -3732,18 +3747,21 @@ public:
             try {
                 std::lock_guard lock(device_.title_placement_mutex);
                 DeviceState::TitleImageCollision conflict{};
-                const bool display_sampled = layout.tile_bytes == 65536 && layout.block_dim == 4 && !volume && layers == 1;
-                if (device_.conflicting_host_placement_locked(id(), address, placed_bytes, physical, &conflict, display_sampled))
+                if (device_.conflicting_host_placement_locked(id(), address, placed_bytes, physical, &conflict,
+                                                             display_sampled, typed_display))
                     return refused(DeviceState::sampled_placement_failure("placed source intersects earlier owner",
                         E_NOTIMPL, address, placed_bytes, physical, conflict));
-                const auto [existing, inserted] = device_.title_image_resources.emplace(address,
-                    DeviceState::TitleImageResource{this, placed_bytes, physical, display_sampled && physical});
-                if (!inserted) {
-                    conflict = {address, existing->second.linear_bytes, "exact placed source",
-                                existing->second.resource->id(), existing->second.physical_snapshot};
+                const auto [first, last] = device_.title_image_resources.equal_range(address);
+                for (auto it = first; it != last; ++it) {
+                    const auto& peer = it->second;
+                    if (DeviceState::shared_display_bc(address, placed_bytes, typed_display, address, peer.linear_bytes,
+                                                       peer.typed_display)) continue;
+                    conflict = {address, peer.linear_bytes, "exact placed source", peer.resource->id(), peer.physical_snapshot};
                     return refused(DeviceState::sampled_placement_failure("placed address already occupied",
                         E_NOTIMPL, address, placed_bytes, physical, conflict));
                 }
+                device_.title_image_resources.emplace_hint(last, address,
+                    DeviceState::TitleImageResource{this, placed_bytes, physical, display_sampled && physical, typed_display});
                 title_image_va_ = address;
                 linear_shadow_bytes_ = placed_bytes;  // console Map exposes the original tiled allocation
                 title_guest_alignment_ = guest_alignment;
@@ -3941,8 +3959,10 @@ public:
         try {
             if (depth_projection)
                 device_.title_depth_image_resources.emplace(start, DeviceState::TitleImageResource{this});
-            else if (!device_.title_image_resources.emplace(start, DeviceState::TitleImageResource{this}).second)
-                return E_NOTIMPL;
+            else {
+                if (device_.title_image_resources.contains(start)) return E_NOTIMPL;
+                device_.title_image_resources.emplace(start, DeviceState::TitleImageResource{this});
+            }
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
         }
@@ -13712,9 +13732,16 @@ HRESULT create_live_title_texture_view(ID3D12Device* device, const D3D12_RESOURC
     Resource* texture = nullptr;
     {
         std::lock_guard lock(state.title_placement_mutex);
-        const auto found = state.title_image_resources.find(address);
-        if (found != state.title_image_resources.end()) {
-            texture = found->second.resource;
+        const auto [placed, placed_end] = state.title_image_resources.equal_range(address);
+        if (placed != placed_end) {
+            if (std::next(placed) == placed_end) texture = placed->second.resource;
+            else {
+                const auto found = std::find_if(placed, placed_end, [&](const auto& row) {
+                    return same_texture_shape(row.second.resource->desc(), resource);
+                });
+                if (found == placed_end) return sampled_view_failure("no matching typed placement", E_NOTIMPL, address, resource, view);
+                texture = found->second.resource;
+            }
         } else {
             const auto [first, last] = state.title_depth_image_resources.equal_range(address);
             for (auto it = first; it != last; ++it) {
