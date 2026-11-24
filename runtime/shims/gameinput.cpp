@@ -1902,8 +1902,12 @@ void update_keyboard_pad() {
     if (g_keyboard.js && g_keyboard.isolated != isolated) detach_keyboard_pad();
     if (!g_keyboard.js && (g_keyboard.failed || !attach_keyboard_pad(isolated))) return;
     if (isolated) {
-        const uint32_t buttons = g_process_pad.buttons();
-        for (const auto& m : kPadButtons) SDL_SetJoystickVirtualButton(g_keyboard.js, m.sdl, (buttons & m.gi) != 0);
+        const auto state = g_process_pad.sample();
+        for (const auto& m : kPadButtons) SDL_SetJoystickVirtualButton(g_keyboard.js, m.sdl, (state.buttons & m.gi) != 0);
+        SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTX, state.axes[0]);
+        SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTY, state.axes[1]);
+        SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTX, state.axes[2]);
+        SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTY, state.axes[3]);
         SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, -32768);
         SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -32768);
         return;
