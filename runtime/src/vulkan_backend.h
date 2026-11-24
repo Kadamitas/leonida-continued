@@ -2524,6 +2524,7 @@ private:
     }
 
     FrameProfile submit_profile_;
+    FrameProfile record_profile_;
     HostShadowProfile shadow_profile_;
     std::vector<const DescriptorHeapMirror*> bound_descriptor_heaps_;
     std::vector<VulkanContext::HostImages::Node> selected_host_images_;
@@ -3246,6 +3247,7 @@ private:
                                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &full, 0, nullptr, 0, nullptr);
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
+        const auto profile_before_bindless = FrameProfile::now();
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();
@@ -3263,6 +3265,7 @@ private:
             tracker_lock.unlock();
             return ReplayResult::unsupported;
         }
+        const auto profile_after_bindless = FrameProfile::now();
         replay.bindless_set = guest_queue_ && context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
         const bool bindless_uploaded = guest_queue_ && std::exchange(context_.bindless_upload_pending_, false);
         auto next_tracker = context_.tracker_.pending_changes();
@@ -3377,6 +3380,7 @@ private:
             auto pieces = detail::current(&next_tracker, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
             detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
         }
+        const auto profile_before_commands = FrameProfile::now();
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
@@ -3428,6 +3432,8 @@ private:
             waits_.push_back(progress_);
             wait_values_.push_back(submitted_);
         }
+        record_profile_.record("begin,bindless,uploads,commands", profile_shadows, profile_before_bindless,
+                               profile_after_bindless, profile_before_commands);
         const auto profile_emit = FrameProfile::now();
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0, replay.frame_draws);
         if (!submitted && (!storage_images.empty() || !zero_buffers.empty())) {
