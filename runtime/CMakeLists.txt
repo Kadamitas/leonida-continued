@@ -37,16 +37,20 @@ add_executable(root_signature_test
 )
 target_link_libraries(root_signature_test PRIVATE gta6rt_root_signature)
 # AVX, OSXSAVE and XCR0 YMM state from synthetic CPUID/XCR0 words, plus one call on the real host.
-add_executable(host_cpu_test test/host_cpu_test.cpp src/host_cpu.cpp)
-target_include_directories(host_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_library(gta6rt_host_cpu STATIC src/host_cpu.cpp)
+target_include_directories(gta6rt_host_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(host_cpu_test test/host_cpu_test.cpp)
+target_link_libraries(host_cpu_test PRIVATE gta6rt_host_cpu)
 if(MSVC)
-  foreach(_portable gta6rt_root_signature root_signature_test host_cpu_test)
+  foreach(_portable gta6rt_root_signature root_signature_test gta6rt_host_cpu host_cpu_test)
     target_compile_definitions(${_portable} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(${_portable} PRIVATE /W4 /permissive- /utf-8)
   endforeach()
   target_link_options(root_signature_test PRIVATE /OPT:NOREF)
 endif()
 
+add_library(gta6rt_json_reader STATIC src/json_reader.cpp)
+target_compile_definitions(gta6rt_json_reader PUBLIC LEONIDA_COMPILED_JSON=1)
 add_library(gta6rt_bcpack ${_leonida_cpu_library_type} src/bcpack.cpp)
 if(_leonida_cpu_library_type STREQUAL "SHARED")
   target_compile_definitions(gta6rt_bcpack INTERFACE GTA6RT_BCPACK_IMPORT)
@@ -168,21 +172,29 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(gta6rt_shim_registry PRIVATE /W4 /permissive- /utf-8)
   set(_shim_registry_objects $<TARGET_OBJECTS:gta6rt_shim_registry>)
 
+  # Each executable registers its own shims. Object libraries compile each provider once and
+  # retain its static registration even when no external symbol names that translation unit.
+  foreach(_shim IN ITEMS acphal bcrypt_rng com_shim winsock_offline ws2_offline xapu_chad xg_xs)
+    add_library(gta6rt_${_shim} OBJECT shims/${_shim}.cpp)
+    target_compile_definitions(gta6rt_${_shim} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_options(gta6rt_${_shim} PRIVATE /W4 /permissive- /utf-8)
+  endforeach()
+  if(TARGET leonida_xma2_decoder)
+    target_link_libraries(gta6rt_acphal PUBLIC leonida_xma2_decoder)
+  endif()
   option(LEONIDA_DISABLE_GUEST_SOCKETS "Disable all guest sockets, including loopback" OFF)
   if(LEONIDA_DISABLE_GUEST_SOCKETS)
-    set(_guest_socket_source shims/winsock_offline.cpp)
+    set(_guest_sockets gta6rt_winsock_offline)
   else()
-    set(_guest_socket_source shims/ws2_offline.cpp)
+    set(_guest_sockets gta6rt_ws2_offline)
   endif()
   add_executable(gta6rt
     src/main.cpp
     src/gta6rt.manifest
-    src/host_cpu.cpp
     src/pe_loader.cpp
     ${_shim_registry_objects}
     shims/file_system.cpp
     shims/winhttp_offline.cpp
-    ${_guest_socket_source}
     shims/xmem.cpp
     shims/xmem_physical.cpp
     shims/d3d12_xs.cpp
@@ -194,8 +206,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
     shims/process.cpp
-    shims/com_shim.cpp
-    shims/bcrypt_rng.cpp
     shims/window_placement.cpp
     shims/dstorage.cpp
   )
@@ -204,7 +214,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # property, so gta6rt and dstorage_test both get it.
   set_source_files_properties(shims/dstorage.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang>:/EHa>")
   add_dependencies(gta6rt gta6rt_tls_host)
-  target_link_libraries(gta6rt PRIVATE gta6rt_bcpack)
+  target_link_libraries(gta6rt PRIVATE gta6rt_bcpack gta6rt_json_reader gta6rt_host_cpu gta6rt_bcrypt_rng gta6rt_com_shim ${_guest_sockets})
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
@@ -234,14 +244,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       IMPORTED_LOCATION "${LEONIDA_AUDIO_CORE_DIR}/target/release/leonida_audio_core.dll"
       IMPORTED_IMPLIB "${LEONIDA_AUDIO_CORE_DIR}/target/release/leonida_audio_core.dll.lib"
       INTERFACE_INCLUDE_DIRECTORIES "${LEONIDA_AUDIO_CORE_DIR}/include")
-    target_sources(gta6rt PRIVATE shims/audio_core_bridge.cpp)
-    target_link_libraries(gta6rt PRIVATE gta6rt_audio_core)
-    add_executable(audio_core_bridge_test test/audio_core_bridge_test.cpp shims/audio_core_bridge.cpp ${_shim_registry_objects})
+    add_library(gta6rt_audio_core_bridge OBJECT shims/audio_core_bridge.cpp)
+    target_compile_definitions(gta6rt_audio_core_bridge PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_options(gta6rt_audio_core_bridge PRIVATE /W4 /permissive- /utf-8)
+    target_link_libraries(gta6rt_audio_core_bridge PUBLIC gta6rt_audio_core)
+    target_link_libraries(gta6rt PRIVATE gta6rt_audio_core_bridge)
+    add_executable(audio_core_bridge_test test/audio_core_bridge_test.cpp ${_shim_registry_objects})
     target_include_directories(audio_core_bridge_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
     target_compile_definitions(audio_core_bridge_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(audio_core_bridge_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(audio_core_bridge_test PRIVATE /OPT:NOREF)
-    target_link_libraries(audio_core_bridge_test PRIVATE gta6rt_audio_core)
+    target_link_libraries(audio_core_bridge_test PRIVATE gta6rt_audio_core_bridge)
     foreach(_audio_target IN ITEMS gta6rt audio_core_bridge_test)
       add_custom_command(TARGET ${_audio_target} POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "$<TARGET_FILE:gta6rt_audio_core>" "$<TARGET_FILE_DIR:${_audio_target}>")
@@ -249,7 +262,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   endif()
 
   if(NOT LEONIDA_AUDIO_CORE_DIR)
-    target_sources(gta6rt PRIVATE shims/acphal.cpp shims/xapu_chad.cpp)
+    target_link_libraries(gta6rt PRIVATE gta6rt_acphal gta6rt_xapu_chad)
   endif()
   set(LEONIDA_TEXTURE_CORE_DIR "" CACHE PATH "Source/build directory of the pinned isolated CPU texture-layout backend")
   if(LEONIDA_TEXTURE_CORE_DIR)
@@ -264,22 +277,25 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       IMPORTED_LOCATION "${LEONIDA_TEXTURE_CORE_DIR}/target/release/leonida_texture_core.dll"
       IMPORTED_IMPLIB "${LEONIDA_TEXTURE_CORE_DIR}/target/release/leonida_texture_core.dll.lib"
       INTERFACE_INCLUDE_DIRECTORIES "${LEONIDA_TEXTURE_CORE_DIR}/include")
-    target_sources(gta6rt PRIVATE shims/texture_core_bridge.cpp)
-    target_link_libraries(gta6rt PRIVATE gta6rt_texture_core)
+    add_library(gta6rt_texture_core_bridge OBJECT shims/texture_core_bridge.cpp)
+    target_compile_definitions(gta6rt_texture_core_bridge PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_options(gta6rt_texture_core_bridge PRIVATE /W4 /permissive- /utf-8)
+    target_link_libraries(gta6rt_texture_core_bridge PUBLIC gta6rt_texture_core)
+    target_link_libraries(gta6rt PRIVATE gta6rt_texture_core_bridge)
     set_source_files_properties(shims/texture_core_bridge.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang>:/EHa>")
-    add_executable(texture_core_bridge_test test/texture_core_bridge_test.cpp shims/texture_core_bridge.cpp ${_shim_registry_objects})
+    add_executable(texture_core_bridge_test test/texture_core_bridge_test.cpp ${_shim_registry_objects})
     target_include_directories(texture_core_bridge_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
     target_compile_definitions(texture_core_bridge_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(texture_core_bridge_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(texture_core_bridge_test PRIVATE /OPT:NOREF)
-    target_link_libraries(texture_core_bridge_test PRIVATE gta6rt_texture_core)
+    target_link_libraries(texture_core_bridge_test PRIVATE gta6rt_texture_core_bridge)
     foreach(_texture_target IN ITEMS gta6rt texture_core_bridge_test)
       add_custom_command(TARGET ${_texture_target} POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "$<TARGET_FILE:gta6rt_texture_core>" "$<TARGET_FILE_DIR:${_texture_target}>")
     endforeach()
   endif()
   if(NOT LEONIDA_TEXTURE_CORE_DIR)
-    target_sources(gta6rt PRIVATE shims/xg_xs.cpp)
+    target_link_libraries(gta6rt PRIVATE gta6rt_xg_xs)
   endif()
 
 
@@ -380,9 +396,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # xg_xs shim: the two exports and the texture computer's slots against the measured call shapes.
   add_executable(xg_xs_test
     test/xg_xs_test.cpp
-    shims/xg_xs.cpp
     ${_shim_registry_objects}
   )
+  target_link_libraries(xg_xs_test PRIVATE gta6rt_xg_xs)
   target_include_directories(xg_xs_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(xg_xs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(xg_xs_test PRIVATE /W4 /permissive- /utf-8)
@@ -391,20 +407,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # acphal shim ABI test: resolves the registered acphal.dll exports through the registry.
   add_executable(acphal_test
     test/acphal_test.cpp
-    shims/acphal.cpp
     ${_shim_registry_objects}
   )
+  target_link_libraries(acphal_test PRIVATE gta6rt_acphal)
   target_include_directories(acphal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(acphal_test PRIVATE /OPT:NOREF)
-
-  if(TARGET leonida_xma2_decoder)
-    if(NOT LEONIDA_AUDIO_CORE_DIR)
-      target_link_libraries(gta6rt PRIVATE leonida_xma2_decoder)
-    endif()
-    target_link_libraries(acphal_test PRIVATE leonida_xma2_decoder)
-  endif()
 
   add_executable(cpu_emulation_test test/cpu_emulation_test.cpp)
   target_include_directories(cpu_emulation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -414,9 +423,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # xapu.dll and chad.dll, the APU and audio DSP command queues, resolved through the registry like xmem_test.
   add_executable(xapu_chad_test
     test/xapu_chad_test.cpp
-    shims/xapu_chad.cpp
-    shims/registry.cpp
+    ${_shim_registry_objects}
   )
+  target_link_libraries(xapu_chad_test PRIVATE gta6rt_xapu_chad)
   target_include_directories(xapu_chad_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(xapu_chad_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(xapu_chad_test PRIVATE /W4 /permissive- /utf-8)
@@ -486,9 +495,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Offline Winsock2 for mapped images (ws2_32.dll restricted to loopback); no external network is touched.
   add_executable(ws2_offline_test
     test/ws2_offline_test.cpp
-    shims/ws2_offline.cpp
     ${_shim_registry_objects}
   )
+  target_link_libraries(ws2_offline_test PRIVATE gta6rt_ws2_offline)
   target_include_directories(ws2_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(ws2_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(ws2_offline_test PRIVATE /W4 /permissive- /utf-8)
@@ -498,9 +507,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # COM lifecycle and helper shims for api-ms-win-core-com-l1-1-*.dll.
   add_executable(com_shim_test
     test/com_shim_test.cpp
-    shims/com_shim.cpp
     ${_shim_registry_objects}
   )
+  target_link_libraries(com_shim_test PRIVATE gta6rt_com_shim)
   target_include_directories(com_shim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(com_shim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(com_shim_test PRIVATE /W4 /permissive- /utf-8)
@@ -509,9 +518,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # BCrypt RNG and algorithm provider shims.
   add_executable(bcrypt_rng_test
     test/bcrypt_rng_test.cpp
-    shims/bcrypt_rng.cpp
     ${_shim_registry_objects}
   )
+  target_link_libraries(bcrypt_rng_test PRIVATE gta6rt_bcrypt_rng)
   target_include_directories(bcrypt_rng_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(bcrypt_rng_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(bcrypt_rng_test PRIVATE /W4 /permissive- /utf-8)
@@ -520,10 +529,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Guest registry and dynamic lookups only; synthetic inputs, no host socket or DNS request.
   add_executable(winsock_offline_test
     test/winsock_offline_test.cpp
-    shims/winsock_offline.cpp
     shims/library_loader.cpp
     ${_shim_registry_objects}
   )
+  target_link_libraries(winsock_offline_test PRIVATE gta6rt_winsock_offline)
   target_include_directories(winsock_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(winsock_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(winsock_offline_test PRIVATE /W4 /permissive- /utf-8)
@@ -1324,11 +1333,13 @@ if(BUILD_TESTING)
   add_executable(descriptor_table_test test/descriptor_table_test.cpp)
   add_test(NAME descriptor_table COMMAND descriptor_table_test)
   add_executable(shader_library_test test/shader_library_test.cpp)
+  target_link_libraries(shader_library_test PRIVATE gta6rt_json_reader)
   add_test(NAME shader_library COMMAND shader_library_test)
   add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
   add_executable(shader_library_corpus_test test/shader_library_corpus_test.cpp)
+  target_link_libraries(shader_library_corpus_test PRIVATE gta6rt_json_reader)
   add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)
   # Reads all 26,503 containers and modules: about 9 minutes from a hard disk.
   set_tests_properties(shader_library_corpus PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
@@ -2031,7 +2042,7 @@ if(TARGET Vulkan::Headers)
     add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp shims/xbox_present.cpp ${_shim_registry_objects}
                 shims/dxgi_com.cpp ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers gta6rt_root_signature)
+    target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers gta6rt_root_signature gta6rt_json_reader)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     # /bigobj: a Debug build of d3d12_vulkan_device.cpp has more sections than a COFF object holds by default
     # (fatal error C1128), because without optimisation every inline function keeps its own COMDAT.
@@ -3771,12 +3782,12 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_descriptor_bench_selftest COMMAND vk_descriptor_bench --self-test)
     # mods.h: mod.json manifests and archetype swaps (docs/modding.md)
     add_executable(mods_test test/mods_test.cpp)
-    target_link_libraries(mods_test PRIVATE Vulkan::Headers)
+    target_link_libraries(mods_test PRIVATE Vulkan::Headers gta6rt_json_reader)
     add_test(NAME mods COMMAND mods_test)
     if(WIN32)
       # code_hooks.h: the remapping thunk and direct-call redirection the archetype hook uses (x64 Windows)
       add_executable(code_hooks_test test/code_hooks_test.cpp)
-      target_link_libraries(code_hooks_test PRIVATE Vulkan::Headers)
+      target_link_libraries(code_hooks_test PRIVATE Vulkan::Headers gta6rt_json_reader)
       target_compile_definitions(code_hooks_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
       add_test(NAME code_hooks COMMAND code_hooks_test)
     endif()
