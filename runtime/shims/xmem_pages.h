@@ -56,6 +56,12 @@ struct PhysicalPageIdentity {
     std::uint16_t physical_store_writes = 0;  // Saturating writes through write_physical_pages to this whole page.
 };
 
+// A successful pin fixes this guest page's frame until release, including through free/unmap requests.
+struct PhysicalImportOps {
+    void* (*pin)(const void*, std::size_t) noexcept;
+    void (*release)(const void*) noexcept;
+};
+
 struct SparseTextureMismatch {
     std::size_t offset = 0;
     std::size_t bytes = 0;
@@ -70,6 +76,7 @@ using SparseTextureSnapshotFn = SparseTextureSnapshot (*)(const void*, std::size
 // The device proxy is also compiled without the physical store. Constant initialization keeps those targets
 // independent of xmem_physical.cpp; the real store publishes its handler during shim registration.
 inline constinit std::atomic<PhysicalPageAliasFn> physical_page_alias_handler{nullptr};
+inline constinit std::atomic<const PhysicalImportOps*> physical_import_ops{nullptr};
 inline constinit std::atomic<PhysicalPageIdentityFn> physical_page_identity_handler{nullptr};
 inline constinit std::atomic<PhysicalCpuViewFn> physical_cpu_view_handler{nullptr};
 inline constinit std::atomic<SparseTextureSnapshotFn> sparse_texture_snapshot_handler{nullptr};
@@ -83,6 +90,12 @@ inline constinit std::atomic<SparseTextureSnapshotFn> sparse_texture_snapshot_ha
 inline bool alias_physical_page_ranges(std::span<const PhysicalPageAliasRange> ranges) noexcept {
     const auto handler = detail::physical_page_alias_handler.load(std::memory_order_acquire);
     return handler && handler(ranges);
+}
+
+// Optional on targets built without the XMem page store. Its permanent write-back mapping owns the
+// actual bytes; this interface never changes guest protections or returns a guest-managed alias.
+inline const PhysicalImportOps* physical_import_ops() noexcept {
+    return detail::physical_import_ops.load(std::memory_order_acquire);
 }
 
 // Debug identity at this instant. It does not pin the page or observe direct writes through a mapped alias.

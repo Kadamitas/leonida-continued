@@ -2735,6 +2735,7 @@ public:
             image_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
         }
+        if (pinned_import_address_) rt::xmem::physical_import_ops()->release(pinned_import_address_);
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (pooled_image_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::pooled_title_image, pooled_image_.release());
@@ -3000,7 +3001,7 @@ public:
     // writes the title names by that VA find this buffer (VulkanContext::buffer_at). A shader that adds heap_base to
     // that VA does not reach it: the title's own V#s into these pages need the single address space of
     // docs/d3d12_vulkan.md section 3.3, which this does not decide. The pages stay the caller's: nothing is zeroed.
-    HRESULT create_host_buffer(void* address) {
+    HRESULT create_host_buffer(void* address, bool title_placement = false) {
         auto& vk = device_.context->vk;
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;
         const auto start = reinterpret_cast<std::uintptr_t>(address);
@@ -3122,21 +3123,47 @@ public:
         // The guest accesses these pages directly, without Map/Unmap cache maintenance. A terminal HOST_READ
         // dependency supplies visibility for coherent imports; it cannot invalidate non-coherent CPU caches.
         constexpr VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        bool compatible_type = false;
-        for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount && !memory_; ++i) {
-            if (!(types & (1u << i)) || (device_.memory.memoryTypes[i].propertyFlags & want) != want) continue;
-            compatible_type = true;
-            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                          need_bda ? static_cast<const void*>(&flags) : &import};
-            allocate.allocationSize = bytes;
-            allocate.memoryTypeIndex = i;
-            native_result = vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_);
-            if (native_result == VK_SUCCESS)
-                memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
-            else
-                memory_ = VK_NULL_HANDLE;
+        const auto allocate_coherent = [&](void* pointer, std::uint32_t mask) {
+            import.pHostPointer = pointer;
+            bool compatible = false;
+            for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount && !memory_; ++i) {
+                if (!(mask & (1u << i)) || (device_.memory.memoryTypes[i].propertyFlags & want) != want) continue;
+                compatible = true;
+                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                              need_bda ? static_cast<const void*>(&flags) : &import};
+                allocate.allocationSize = bytes;
+                allocate.memoryTypeIndex = i;
+                native_result = vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_);
+                if (native_result == VK_SUCCESS) memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
+                else memory_ = VK_NULL_HANDLE;
+            }
+            return compatible;
+        };
+        if (!allocate_coherent(imported_address, types))
+            return failed("no coherent host-visible import memory type", E_NOTIMPL);
+        if (!memory_ && native_result == VK_ERROR_OUT_OF_DEVICE_MEMORY && title_placement && !leading &&
+            desc_.Width == 7856 && desc_.Flags == D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS &&
+            !desc_.Alignment && desc_.Height == 1 && desc_.DepthOrArraySize == 1 && desc_.MipLevels == 1 &&
+            desc_.Format == DXGI_FORMAT_UNKNOWN && desc_.SampleDesc.Count == 1 && !desc_.SampleDesc.Quality &&
+            desc_.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && alignment == 4096 && bytes == 8192 &&
+            start % rt::xmem::kPhysicalPageBytes == rt::xmem::kPhysicalPageBytes - bytes &&
+            diagnostic_region.Type == MEM_MAPPED && diagnostic_region.Protect == PAGE_NOACCESS) {
+            const auto* ops = rt::xmem::physical_import_ops();
+            if (void* backing = ops ? ops->pin(imported_address, bytes) : nullptr) {
+                pinned_import_address_ = imported_address;
+                VkMemoryHostPointerPropertiesEXT alternate{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+                const auto queried = device_.get_host_pointer_properties(device_.info.device,
+                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, backing, &alternate);
+                if (queried == VK_SUCCESS && reinterpret_cast<std::uintptr_t>(backing) % alignment == 0)
+                    allocate_coherent(backing, alternate.memoryTypeBits & requirements.memoryTypeBits);
+                static std::atomic<unsigned> reports{};
+                if (reports.fetch_add(1, std::memory_order_relaxed) < 12)
+                    std::fprintf(stderr, "[rt] d3d12: pinned physical buffer import va=%p bytes=%llu "
+                        "source_vk=%d backing_query=%d backing_types=0x%x imported=%u\n", address,
+                        static_cast<unsigned long long>(bytes), int(VK_ERROR_OUT_OF_DEVICE_MEMORY), int(queried),
+                        alternate.memoryTypeBits, unsigned(memory_ != VK_NULL_HANDLE));
+            }
         }
-        if (!compatible_type) return failed("no coherent host-visible import memory type", E_NOTIMPL);
         if (!memory_) {
             trace_host_import_failure(imported_address, bytes, types);
             return failed("vkAllocateMemory", E_OUTOFMEMORY);
@@ -4616,6 +4643,7 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     std::unique_ptr<TitleDisplayAllocation> title_display_allocation_;
+    const void* pinned_import_address_ = nullptr;  // fixed guest VA/frame until vkFreeMemory after retirement
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
     bool reserved_ = false;
     bool sparse_image_ = false;
@@ -10359,7 +10387,7 @@ public:
         heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
         auto* resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
         resource->attach_device(identity());
-        const HRESULT hr = resource->create_host_buffer(address);
+        const HRESULT hr = resource->create_host_buffer(address, true);
         if (FAILED(hr)) {
             log_once("a title-placed buffer (device slot 133) could not import its pages; HRESULT", int(hr));
             resource->Release();

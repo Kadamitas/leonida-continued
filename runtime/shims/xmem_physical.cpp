@@ -117,6 +117,7 @@ std::mutex g_mutex;
 std::vector<Chunk> g_chunks;
 std::vector<Slot> g_slots;
 std::vector<uint32_t> g_free;            // free slots, the next one at the back
+std::map<uintptr_t, std::size_t> g_import_pins;  // fixed guest page -> live coherent import count
 std::map<uintptr_t, Region> g_regions;  // physical reservations by base
 
 #ifdef LEONIDA_XMEM_TEST_HOOKS
@@ -350,6 +351,17 @@ bool restore_mappings(const std::vector<MappingChange>& changes, size_t undo) {
 // Restore earlier views if any native operation fails. Capture each old view
 // in order so scatter requests with repeated addresses retain their semantics.
 bool apply_mappings(std::vector<MappingChange>& changes) {
+    // Test the entire batch before an alias or its native page protections can change. The expected
+    // slot cannot change inside this batch either, as any operation replacing it is rejected here.
+    if (!g_import_pins.empty()) {
+        for (const auto& change : changes) {
+            if (change.region->page[change.index] != change.slot &&
+                g_import_pins.contains(page_address(change.base, change.index))) {
+                SetLastError(ERROR_BUSY);
+                return false;
+            }
+        }
+    }
     size_t undo = 0;
     DWORD error = ERROR_SUCCESS;
     try {
@@ -859,6 +871,42 @@ bool alias_physical_page_ranges(std::span<const rt::xmem::PhysicalPageAliasRange
     }
 }
 
+void* pin_physical_import(const void* source, std::size_t size) noexcept {
+    const auto start = reinterpret_cast<uintptr_t>(source);
+    const auto page = start & ~(kPage - 1);
+    const auto offset = start - page;
+    if (!start || !size || size > kPage - offset || size > UINTPTR_MAX - start) return nullptr;
+    const std::lock_guard lock(g_mutex);
+    uintptr_t base = 0;
+    size_t index = 0;
+    const auto* region = region_of(page, 1, base, index);
+    if (!region) return nullptr;
+    const auto entry = region->page[index];
+    if (!entry || entry > g_slots.size() || !g_slots[entry - 1].allocated) return nullptr;
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(source, &info, sizeof(info)) || info.AllocationBase != reinterpret_cast<void*>(page) ||
+        info.State != MEM_COMMIT || info.Type != MEM_MAPPED || info.Protect != PAGE_NOACCESS) return nullptr;
+    const auto region_start = reinterpret_cast<uintptr_t>(info.BaseAddress);
+    if (region_start > start || info.RegionSize > UINTPTR_MAX - region_start ||
+        region_start + info.RegionSize < start + size) return nullptr;
+    try {
+        auto& count = g_import_pins[page];
+        if (count == SIZE_MAX) return nullptr;
+        ++count;
+    } catch (const std::bad_alloc&) { return nullptr; }
+    const auto slot = entry - 1;
+    return g_chunks[slot / kChunkPages].view + std::size_t(slot % kChunkPages) * kPage + offset;
+}
+
+void release_physical_import(const void* source) noexcept {
+    const auto page = reinterpret_cast<uintptr_t>(source) & ~(kPage - 1);
+    const std::lock_guard lock(g_mutex);
+    const auto it = g_import_pins.find(page);
+    if (it != g_import_pins.end() && !--it->second) g_import_pins.erase(it);
+}
+
+constexpr rt::xmem::PhysicalImportOps import_ops{pin_physical_import, release_physical_import};
+
 rt::xmem::PhysicalPageIdentity physical_page_identity(const void* source) noexcept {
     using State = rt::xmem::PhysicalPageState;
     const auto page = reinterpret_cast<uintptr_t>(source) & ~(kPage - 1);
@@ -1056,6 +1104,7 @@ const bool g_registered = (rt::xmem::set_physical_reserve(&reserve_physical),
                            rt::xmem::set_placeholder_reserve(&reserve_placeholder),
                            rt::xmem::detail::physical_page_alias_handler.store(&alias_physical_page_ranges,
                                std::memory_order_release),
+                           rt::xmem::detail::physical_import_ops.store(&import_ops, std::memory_order_release),
                            rt::xmem::detail::physical_page_identity_handler.store(&physical_page_identity,
                                std::memory_order_release),
                            rt::xmem::detail::physical_cpu_view_handler.store(&find_physical_cpu_view,
