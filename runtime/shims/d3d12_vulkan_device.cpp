@@ -1089,12 +1089,13 @@ struct DeviceState {
             rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(base), image_bytes) ==
                 rt::xmem::SparseTextureSnapshot::ready;
     }
-    // Both are 16-byte BC blocks. The T# format is fixed at 177 (BC5 UNORM) or 182 (BC7 sRGB)
+    // Both are 16-byte BC blocks. The T# format is fixed at 177 (BC5 UNORM) or 181/182 (BC7 UNORM/sRGB)
     // for every permitted typed subview, while each resource owns its own native image and snapshot.
     static bool shared_display_bc(std::uint64_t address, std::uint64_t bytes, DisplayBcShape a,
                                   std::uint64_t other, std::uint64_t length, DisplayBcShape b) {
-        const bool typed_pair = (a.format == DXGI_FORMAT_BC5_UNORM && b.format == DXGI_FORMAT_BC7_UNORM_SRGB) ||
-            (b.format == DXGI_FORMAT_BC5_UNORM && a.format == DXGI_FORMAT_BC7_UNORM_SRGB);
+        const auto bc7 = [](DXGI_FORMAT f) { return f == DXGI_FORMAT_BC7_UNORM || f == DXGI_FORMAT_BC7_UNORM_SRGB; };
+        const bool typed_pair = (a.format == DXGI_FORMAT_BC5_UNORM && bc7(b.format)) ||
+            (b.format == DXGI_FORMAT_BC5_UNORM && bc7(a.format));
         return typed_pair && address == other && bytes == length && a.width == b.width && a.height == b.height &&
             a.mips == b.mips && rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(address), bytes) ==
                 rt::xmem::SparseTextureSnapshot::ready;
