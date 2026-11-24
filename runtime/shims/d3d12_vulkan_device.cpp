@@ -13841,7 +13841,9 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
     const bool legacy_single_mip = resource.MipLevels == 1 && block.block == 1 &&
         (single_array || (faces == 1 && (r8_atlas || single_color)));
     const auto tiled_layout = (linear_layout || legacy_single_mip) ? std::nullopt : title_tiled_texture_layout(resource, format);
-    const bool array_view = single_array || (tiled_layout && tiled_layers > 1);
+    // A tiled 2D image can expose its sole layer through an explicit TEXTURE2DARRAY view.
+    // The caller's view type selects the array descriptor namespace even when the layer count is one.
+    const bool array_view = single_array || (tiled_layout && !is_volume);
     const bool cube_faces = array_view && faces >= 6 && faces % 6 == 0 && resource.Width == resource.Height;
     const std::size_t source_bytes = linear_layout ? std::size_t(linear_layout->size) :
         tiled_layout ? tiled_layout->tiled_bytes * tiled_layers : volume ? volume->tiled_bytes :
