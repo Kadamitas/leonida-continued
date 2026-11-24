@@ -25,11 +25,12 @@ GREATER_EQUAL, reference 1, flags DWORD 1, and the observed CPU control-page rol
 to 1 before publishing it; reviewed later publications remain positive. An actual coherent 64-bit read during
 every replay must satisfy the predicate. Replay then records a HOST_WRITE-to-ALL_COMMANDS memory barrier at
 the command's position. An unsatisfied value fails preparation rather than being overwritten or signalled.
-Reference 2 can use the same control cell at the head of a batch after the queue's previous submission and all
-explicit fence dependencies have retired. Only at that boundary can a fresh unsigned comparison consume a CPU
-publication that may subsequently regress. A wait after a recorded command reports the preceding command count
-and fails. An unretired predecessor or unsatisfied value also fails. Mid-list waits need an ordered GPU prefix
-and a deferred suffix. The remaining console flag-1 semantics are unverified.
+Reference 2 can follow a prefix of immediate memory writes disjoint from the control cell. The queue submits
+preceding complete lists and the verified write prefix, then waits for their real Vulkan progress ticket without
+holding the device's resource or submission locks. At that boundary a fresh unsigned comparison consumes a CPU
+publication that may subsequently regress. The suffix is prepared and submitted only on success. A failure after
+prefix submission stops the guest device and reports partial execution. Multiple later waits, other mid-list
+prefixes and unsatisfied values remain unsupported. The remaining console flag-1 semantics are unverified.
 
 The separate `LEONIDA_XBOX_QUEUE_SUBMIT=immediate` experiment issues a real PC ExecuteCommandLists after
 validating and retaining the complete console list array. Console token pacing remains unverified. Recording

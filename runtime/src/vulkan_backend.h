@@ -2250,7 +2250,7 @@ public:
             if (!must_hold()) {
                 if (pin) direct_pins.push_back(pin());
                 const auto before = submitted_;
-                result = execute_now(lists, direct_pins);
+                result = execute_guest_batch(lists, direct_pins);
                 retire_pins(direct_pins, submitted_ > before ? submitted_ : 0);
             } else if (context_.is_device_lost()) {
                 result = ReplayResult::unsupported;
@@ -2525,6 +2525,65 @@ private:
     HostShadowProfile shadow_profile_;
     std::vector<const DescriptorHeapMirror*> bound_descriptor_heaps_;
     std::vector<VulkanContext::HostImages::Node> selected_host_images_;
+    ReplayResult execute_guest_batch(std::span<const CommandList* const> lists, std::vector<std::shared_ptr<void>>& pins) {
+        const auto split = std::find_if(lists.begin(), lists.end(), [](const auto* list) {
+            return list->ordered_acquires() != 0;
+        });
+        if (split == lists.end()) return execute_now(lists, pins);
+        for (const auto* list : lists) {
+            if (!list->closed()) return ReplayResult::list_open;
+            if (list->queries_open()) return ReplayResult::invalid_query;
+        }
+        if (std::any_of(split + 1, lists.end(), [](const auto* list) { return list->ordered_acquires() != 0; }))
+            return ReplayResult::unsupported;
+        CommandList before, after;
+        if (!(*split)->split_generation_wait(before, after)) return ReplayResult::unsupported;
+        std::vector<const CommandList*> prefix(lists.begin(), split);
+        if (!before.commands().empty()) prefix.push_back(&before);
+        std::vector<const CommandList*> suffix{&after};
+        suffix.insert(suffix.end(), split + 1, lists.end());
+
+        // Only state_mutex_ is held between executes. Other guest queues and the CPU publisher can make
+        // progress. The prefix consumes the queue's original waits and retains its own real native ticket.
+        const auto before_ticket = submitted_;
+        const auto failure = [&](ReplayResult result) {
+            if (before_ticket == submitted_) return result;
+            std::fprintf(stderr, "[rt] VulkanQueue: generation wait suffix refused (%d) after prefix ticket %llu; "
+                                 "stopping the guest device\n", int(result), static_cast<unsigned long long>(submitted_));
+            context_.mark_device_lost();
+            return ReplayResult::partial_submission;
+        };
+        try {
+            if (!prefix.empty()) {
+                const auto result = execute_now(prefix, pins);
+                if (result != ReplayResult::success) return failure(result);
+            } else if (!waits_.empty() && !submit(VK_NULL_HANDLE, VK_NULL_HANDLE, 0)) {
+                return failure(ReplayResult::unsupported);
+            }
+            if (submitted_) {
+                const VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, nullptr, 0, 1, &progress_, &submitted_};
+                VkResult result;
+                do {
+                    if (context_.is_device_lost()) return failure(ReplayResult::unsupported);
+                    result = context_.vk.vkWaitSemaphores(context_.device(), &wait, 100'000'000);
+                } while (result == VK_TIMEOUT);
+                if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+                if (result != VK_SUCCESS) return failure(ReplayResult::unsupported);
+            }
+            // Suffix preparation performs the actual atomic acquire before reading its descriptor or image data.
+            const auto result = execute_now(suffix, pins);
+            if (result != ReplayResult::success) return failure(result);
+            static std::atomic<unsigned> traces{0};
+            if (traces.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] VulkanQueue: ordered generation wait retired prefix lists=%zu writes=%zu; "
+                    "suffix submitted ticket=%llu\n", prefix.size(), before.commands().size(),
+                    static_cast<unsigned long long>(submitted_));
+            return result;
+        } catch (const std::bad_alloc&) {
+            return failure(ReplayResult::unsupported);
+        }
+    }
+
     ReplayResult execute_now(std::span<const CommandList* const> lists, std::vector<std::shared_ptr<void>>& pins,
                              std::span<const ResourceId> present_sources = {}) {
         const auto profile_start = FrameProfile::now();
@@ -3496,12 +3555,11 @@ private:
             for (const CommandList& list : op.lists) lists.push_back(&list);
             // The pipeline states and root signatures of the lists are in op.pins (see execute()): they live until
             // the batch has been recorded and then, with the fences, until its submission has completed (below).
-            const ReplayResult result = execute_now(lists, op.pins);
+            const ReplayResult result = execute_guest_batch(lists, op.pins);
             if (result != ReplayResult::success) {
                 int none = static_cast<int>(ReplayResult::success);
                 held_failure_.compare_exchange_strong(none, static_cast<int>(result));
-                std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists failed when it was released (result %d); "
-                                     "nothing was submitted for it, and a Signal behind it still signals\n",
+                std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists failed when it was released (result %d)\n",
                              static_cast<int>(result));
             }
             break;

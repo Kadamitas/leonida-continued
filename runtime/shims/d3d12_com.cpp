@@ -93,6 +93,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
     case leonida::ReplayResult::invalid_draw: return "draw kind does not match the pipeline (mesh or vertex)";
     case leonida::ReplayResult::unsupported: return "unsupported";
+    case leonida::ReplayResult::partial_submission: return "generation wait suffix failed after its prefix";
     }
     return "?";
 }
@@ -268,12 +269,13 @@ public:
             !allocator_ || allocator_->recording() != this ||
             (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
              type_ != D3D12_COMMAND_LIST_TYPE_COPY)) return false;
-        if (reference > 1 && !list_.commands().empty()) {
+        if (reference > 1 && (list_.ordered_acquires() ||
+                !leonida::CommandList::is_generation_write_prefix(list_.commands(), address))) {
             const auto prefix = list_.commands();
             std::fprintf(stderr, "[rt] d3d12: generation wait requires mid-list continuation reference=%llu "
                          "preceding=%zu first_ir=%zu last_ir=%zu\n",
                          static_cast<unsigned long long>(reference), prefix.size(),
-                         prefix.front().index(), prefix.back().index());
+                         prefix.empty() ? 0 : prefix.front().index(), prefix.empty() ? 0 : prefix.back().index());
             return false;
         }
         bool added = false;
@@ -1990,7 +1992,9 @@ public:
         const std::span graphics{inline_batch ? inline_graphics.data() : large_graphics.data(), count};
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
-        if (last_result_ != leonida::ReplayResult::success)
+        if (last_result_ == leonida::ReplayResult::partial_submission)
+            std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed after submitting its prefix\n");
+        else if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
                          name(last_result_));
     }

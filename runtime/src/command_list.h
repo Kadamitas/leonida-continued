@@ -875,7 +875,39 @@ public:
 
     bool host_memory_acquire(std::uint64_t address, std::uint64_t reference) {
         if (!address || address % 8 || address > UINT64_MAX - 7) return false;
-        return append(HostMemoryAcquire{address, reference});
+        if (!append(HostMemoryAcquire{address, reference})) return false;
+        if (reference > 1) {
+            if (!ordered_acquires_) ordered_acquire_at_ = commands_.size() - 1;
+            ++ordered_acquires_;
+        }
+        return true;
+    }
+
+    std::size_t ordered_acquires() const { return ordered_acquires_; }
+
+    static bool is_generation_write_prefix(std::span<const Command> commands, std::uint64_t address) {
+        return std::all_of(commands.begin(), commands.end(), [&](const Command& command) {
+            const auto* write = std::get_if<WriteImmediate>(&command);
+            return write && (write->address < address || write->address - address >= 8);
+        });
+    }
+
+    // An immediate write records no persistent rendering state. A root-state or descriptor-heap
+    // snapshot belongs to the suffix; no query/predicate/rendering scope crosses this split.
+    bool split_generation_wait(CommandList& before, CommandList& after) const {
+        if (!closed_ || queries_open() || ordered_acquires_ != 1) return false;
+        const auto at = commands_.begin() + ordered_acquire_at_;
+        const auto& acquire = std::get<HostMemoryAcquire>(*at);
+        if (acquire.reference != 2 || !is_generation_write_prefix(commands().first(ordered_acquire_at_), acquire.address))
+            return false;
+        before.commands_.assign(commands_.begin(), at);
+        before.closed_ = true;
+        after.commands_.assign(at, commands_.end());
+        after.descriptor_heaps_ = descriptor_heaps_;
+        after.ordered_acquires_ = 1;
+        after.ordered_acquire_at_ = 0;
+        after.closed_ = true;
+        return true;
     }
 
     // AtomicCopyBufferUINT/UINT64: both offsets aligned to the copy's size and each dependency on a named resource with
@@ -996,6 +1028,7 @@ public:
         commands_.clear();
         descriptor_heaps_.clear();
         active_.clear();
+        ordered_acquires_ = 0;
         closed_ = false;
         return true;
     }
@@ -1040,6 +1073,8 @@ private:
     std::vector<Command> commands_;
     std::vector<const DescriptorHeapMirror*> descriptor_heaps_;
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
+    std::size_t ordered_acquires_ = 0;
+    std::size_t ordered_acquire_at_ = 0;
     bool closed_ = false;
 };
 

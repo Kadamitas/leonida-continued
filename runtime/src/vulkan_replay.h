@@ -933,7 +933,8 @@ enum class ReplayResult {
     invalid_query,
     invalid_indirect_arguments,
     invalid_draw,  // DispatchMesh with a pipeline that has no mesh shader, or a vertex draw with one that has
-    unsupported
+    unsupported,
+    partial_submission  // a generation wait's preceding commands ran and its suffix could not be issued
 };
 
 // Collected while preparing the actual table bytes the shaders will see. One execution owns this set.
