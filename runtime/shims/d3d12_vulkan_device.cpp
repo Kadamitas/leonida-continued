@@ -3354,6 +3354,7 @@ public:
         const std::size_t source_span = layers > 1 ? std::size_t(layers) * 4096 : bytes;
         const HRESULT staged = allocate_texture_shadow(source, source_span, upload_layer_bytes * layers, physical);
         if (FAILED(staged)) return staged;
+        if (physical && volume && title_sampled_volume_4ks_query(desc_)) sampled_tile_bytes_ = 4096;
         shadow_snapshot_.resize(bytes);
         shadow_scratch_.resize(bytes);
         image_address_ = reinterpret_cast<std::uintptr_t>(source);
@@ -4495,7 +4496,9 @@ bool distinct_sampled_sources(CachedTextures::const_iterator first, CachedTextur
         const auto& other = *static_cast<Resource*>(item.second.owner.get());
         const auto& shape = other.desc();
         // These fixed fields are encoded in every T#, independently of the selected view range and tile mode.
-        return (other.linear_host_image() || other.sampled_tile_bytes()) && shape.DepthOrArraySize == 1 &&
+        const bool single_surface = shape.DepthOrArraySize == 1 ||
+            (other.sampled_tile_bytes() == 4096 && title_sampled_volume_4ks_query(shape));
+        return (other.linear_host_image() || other.sampled_tile_bytes()) && single_surface &&
             (shape.Dimension != requested.Dimension || shape.Width != requested.Width ||
              shape.Height != requested.Height || shape.MipLevels != requested.MipLevels);
     });
@@ -13901,7 +13904,10 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                 });
             if (!small_tiles) {
                 const bool distinct = distinct_sampled_sources(first, last, resource);
-                physical_alias = (linear_layout || tiled_layout) && !is_volume && faces == 1 && distinct && physical_snapshot;
+                // A 3D descriptor represents one volume, including its padded depth, in a single XMem span.
+                const bool one_surface = (!is_volume && faces == 1 && (linear_layout || tiled_layout)) ||
+                    (volume && title_sampled_volume_4ks_query(resource));
+                physical_alias = one_surface && distinct && physical_snapshot;
                 if (!physical_alias) {
                     report_sampled_siblings(address, first, last, int(backing), distinct);
                     return sampled_view_failure("incompatible cached shape at same address", E_NOTIMPL, address,
