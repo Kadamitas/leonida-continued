@@ -1353,7 +1353,7 @@ public:
             if (it == resources_.end()) return;
             img = it->second.image;
             unindex_buffer(id, it->second);
-            if (it->second.host_readonly_image || it->second.mutable_host_shadow)
+            if (it->second.tracked_host_image())
                 host_images_.erase(it->second.host_image_address, &*it);
             resources_.erase(it);
             replay_.has_host_readonly_images = !host_images_.empty();
@@ -1762,8 +1762,8 @@ private:
             binding.draw_activity_image = inserted || it->second.image != binding.image
                 ? ++next_activity_image_ : it->second.draw_activity_image;
         }
-        const bool was_host_image = !inserted && (it->second.host_readonly_image || it->second.mutable_host_shadow);
-        const bool host_image = binding.host_readonly_image || binding.mutable_host_shadow;
+        const bool was_host_image = !inserted && it->second.tracked_host_image();
+        const bool host_image = binding.tracked_host_image();
         const bool changed_key = it->second.host_image_address != binding.host_image_address;
         bool appended = false;
         try {

@@ -90,6 +90,7 @@ struct ResourceBinding {
     VkDeviceSize host_shadow_layer_bytes = 0;
     std::function<bool()> host_shadow_prepare;
     std::shared_ptr<MutableHostShadow> mutable_host_shadow;
+    bool tracked_host_image() const { return host_readonly_image || mutable_host_shadow; }
     // A descriptor in the bindless set 0 has one layout, but D3D12 lets a texture be sampled both in a
     // shader-resource state and while promoted from common (GENERAL). With this set, the shader-resource states
     // use GENERAL too, so the descriptor's layout is right in both.

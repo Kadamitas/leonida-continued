@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -436,6 +437,19 @@ inline std::string sha256_hex(std::span<const std::uint8_t> data) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// This exact compute module uses only three type-selected OpImageWrite instructions at set 0
+// storage-image bindings 17/18/19. Its sampled-image variable is never used. Check the words fed
+// to Vulkan so a different translation of the same guest program takes the ordinary full-scan path.
+inline bool compute_module_excludes_sampled_images(std::span<const std::uint32_t> words) {
+    if (words.size_bytes() != 123252) return false;
+    try {
+        const std::span bytes(reinterpret_cast<const std::uint8_t*>(words.data()), words.size_bytes());
+        return sha256_hex(bytes) == "db1c7be6f1d31a2af849ddfbd653d3a270e004acd8a2529e402086a9b60256eb";
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+}
+
 // DXBC containers and the FSSM program
 
 // The payload of one DXBC part ("DXIL", "PRIV", ...), or an empty span.

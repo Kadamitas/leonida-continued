@@ -2721,6 +2721,7 @@ public:
     VkImage image() const { return image_; }
     bool sparse_image() const { return sparse_image_; }
     bool readonly_host_image() const { return binding_.host_readonly_image; }
+    bool tracked_host_image() const { return binding_.tracked_host_image(); }
     bool linear_host_image() const { return linear_shadow_bytes_ != 0; }
     UINT sampled_tile_bytes() const { return sampled_tile_bytes_; }
     VkBuffer buffer() const { return buffer_; }
@@ -6590,6 +6591,7 @@ private:
         if (!pipeline_.pipeline && !create_native_compute()) return false;
         binding.pipeline = pipeline_.pipeline;
         binding.layout = pipeline_.layout;
+        binding.bounded_image_keys = pipeline_.bounded_image_keys;
         return true;
     }
 
@@ -6613,6 +6615,8 @@ private:
             VkShaderModule module = VK_NULL_HANDLE;
             if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return false;
             module_ = module;
+            if (!pipeline_.bounded_image_keys && leonida::compute_module_excludes_sampled_images(words))
+                pipeline_.bounded_image_keys = true;
         }
         if (!pipeline_.layout) {
             const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
@@ -11669,6 +11673,9 @@ private:
     // shown leaves the slot a null descriptor.
     void write_image_descriptor(const Resource& resource, const TextureView& view,
                                 D3D12_CPU_DESCRIPTOR_HANDLE destination, bool storage) {
+        // CPU-refreshed image views occupy only the sampled arrays. A compute module proven to use
+        // storage images alone can therefore omit shader-driven capture of these images.
+        if (storage && resource.tracked_host_image()) return;
         if (storage && resource.title_r32_reinterpret() && view.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) return;
         leonida::gfx10::Image image{};
         const bool described = image_descriptor(resource, view, image);
