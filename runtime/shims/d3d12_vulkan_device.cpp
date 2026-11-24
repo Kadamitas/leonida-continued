@@ -13654,13 +13654,13 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
         });
         if (found == last) {
             if (first != last) {
-                // These sampled-only 2D BC images independently detile the same guest bytes on submission.
+                // These sampled-only 2D images independently detile the same guest bytes on submission.
                 // Keep other alias types outside this path until their backing and update rules are known.
-                const bool aliasable = tiled_layout && tiled_layout->tile_bytes == 4096 && tiled_layout->block_dim == 4 &&
+                const bool aliasable = tiled_layout && tiled_layout->tile_bytes == 4096 &&
                     resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && faces == 1 &&
                     std::all_of(first, last, [](const auto& row) {
                         const auto& sibling = *static_cast<Resource*>(row.second.owner.get());
-                        return row.second.sampled_bc_bytes && sibling.sampled_tile_bytes() == 4096 &&
+                        return sibling.sampled_tile_bytes() == 4096 &&
                             sibling.desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && sibling.desc().DepthOrArraySize == 1;
                     });
                 if (!aliasable) return E_NOTIMPL;
