@@ -711,6 +711,13 @@ using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, Glo
 
 // A hook can place CPU descriptor handles outside the coherent GPU arena. The heap and both
 // allocations are retained by the recording list and by the submission's COM pins.
+struct PlacedHeapContents {
+    static constexpr std::size_t block = 64 * 1024, page = 4096;
+    using Block = std::array<std::byte, block>;
+    static constexpr Block zeros{};
+    std::vector<std::unique_ptr<Block>> nonzero;
+    std::unique_ptr<Block> scratch;
+};
 struct DescriptorHeapMirror {
     const void* title = nullptr;
     void* arena = nullptr;
@@ -720,7 +727,8 @@ struct DescriptorHeapMirror {
     const void* reservation = nullptr;
     bool (*valid)(const DescriptorHeapMirror&) = nullptr;
     bool (*compare)(const void*, const void*, std::size_t, bool&) = nullptr;
-    bool (*copy)(void*, const void*, std::size_t) = nullptr;
+    bool (*read)(void*, const void*, std::size_t) = nullptr;
+    PlacedHeapContents* contents = nullptr;
 };
 
 class CommandList {
@@ -1113,34 +1121,52 @@ bool refresh_descriptor_heaps(std::span<const CommandList* const> lists,
     }
     bool retired = false;
     for (const auto* heap : bound) {
-        if (heap->valid) {
+        if (heap->contents) {
             if (!heap->valid(*heap)) return false;
+            auto& cache = *heap->contents;
             const auto* title = static_cast<const std::byte*>(heap->title);
             auto* arena = static_cast<std::byte*>(heap->arena);
-            // Scan in large blocks; visit individual 4 KiB pages only where the source differs. An
-            // unchanged heap never writes its arena, and one modified descriptor copies at most one page.
-            constexpr std::size_t block = 256 * 1024, page = 4096;
-            for (std::size_t first = 0; first < heap->bytes; first += block) {
-                const auto count = (std::min)(block, heap->bytes - first);
-                bool equal = false;
-                if (!heap->compare(title + first, arena + first, count, equal)) return false;
-                if (equal) continue;
-                if (!retired) {
-                    if (!wait()) return false;
-                    retired = true;
+            constexpr auto block = PlacedHeapContents::block, page = PlacedHeapContents::page;
+            const auto& zeros = PlacedHeapContents::zeros;
+            const auto retire = [&] { return retired || (retired = wait()); };
+            try {
+                if (cache.nonzero.empty()) {
+                    if (!retire()) return false;
+                    cache.nonzero.resize((heap->bytes - 1) / block + 1);
+                    // An arena slice can be recycled. Initialize its zero baseline once; subsequent
+                    // comparisons exclusively read cached CPU memory, never the GPU's mapped aperture.
+                    std::memset(arena, 0, heap->bytes);
                 }
-                const auto end = first + count;
-                auto run = end;
-                for (std::size_t at = first; at < end; at += page) {
-                    const auto size = (std::min)(page, end - at);
-                    if (count > page && !heap->compare(title + at, arena + at, size, equal)) return false;
-                    if (!equal && run == end) run = at;
-                    if (equal && run != end) {
-                        if (!heap->copy(arena + run, title + run, at - run)) return false;
-                        run = end;
+                for (std::size_t i = 0; i < cache.nonzero.size(); ++i) {
+                    const auto first = i * block;
+                    const auto count = (std::min)(block, heap->bytes - first);
+                    auto& saved = cache.nonzero[i];
+                    const auto& previous = saved ? *saved : zeros;
+                    bool equal = false;
+                    if (!heap->compare(title + first, previous.data(), count, equal)) return false;
+                    if (equal) continue;
+                    if (!retire()) return false;
+                    if (!cache.scratch) cache.scratch = std::make_unique_for_overwrite<PlacedHeapContents::Block>();
+                    // A failing read never alters either published copy. The captured bytes are the
+                    // single source for the native update and for the next exact comparison.
+                    if (!heap->read(cache.scratch->data(), title + first, count)) return false;
+                    auto run = count;
+                    for (std::size_t at = 0; at < count; at += page) {
+                        const auto size = (std::min)(page, count - at);
+                        const bool dirty = std::memcmp(cache.scratch->data() + at, previous.data() + at, size) != 0;
+                        if (dirty && run == count) run = at;
+                        if (!dirty && run != count) {
+                            std::memcpy(arena + first + run, cache.scratch->data() + run, at - run);
+                            run = count;
+                        }
                     }
+                    if (run != count)
+                        std::memcpy(arena + first + run, cache.scratch->data() + run, count - run);
+                    if (std::memcmp(cache.scratch->data(), zeros.data(), count) == 0) saved.reset();
+                    else cache.scratch.swap(saved);
                 }
-                if (run != end && !heap->copy(arena + run, title + run, end - run)) return false;
+            } catch (const std::bad_alloc&) {
+                return false;
             }
             continue;
         }

@@ -2641,16 +2641,18 @@ public:
                     device.register_title_host_range(reinterpret_cast<leonida::ResourceId>(this), console_address_, bytes,
                                                      "placed_descriptor_heap", bytes)) {
                     placed_range_ = true;
+                    placed_contents_.reset(new (std::nothrow) leonida::PlacedHeapContents);
+                    if (!placed_contents_) return;
                     if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) return;
                     in_arena_ = true;
                     cpu_ = source;
                     mirror_ = {source, device.arena.mapped + arena_offset_, static_cast<std::size_t>(bytes), owner,
                         [](const leonida::DescriptorHeapMirror& m) {
                             return placed_heap_reservation(m.title, m.bytes) == m.reservation;
-                        }, placed_heap_equal, [](void* arena, const void* title, std::size_t size) {
+                        }, placed_heap_equal, [](void* output, const void* title, std::size_t size) {
                             SIZE_T copied = 0;
-                            return ReadProcessMemory(GetCurrentProcess(), title, arena, size, &copied) && copied == size;
-                        }};
+                            return ReadProcessMemory(GetCurrentProcess(), title, output, size, &copied) && copied == size;
+                        }, placed_contents_.get()};
                     return;
                 }
             }
@@ -2745,6 +2747,7 @@ private:
     std::uint64_t console_size_ = 0;
     bool console_addressed_ = false;
     bool placed_range_ = false;
+    std::unique_ptr<leonida::PlacedHeapContents> placed_contents_;
 };
 
 struct TitleDisplayAllocation {
