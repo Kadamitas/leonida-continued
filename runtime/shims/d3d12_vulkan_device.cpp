@@ -965,7 +965,16 @@ struct DeviceState {
     // its scoped registry does not imply native-memory aliasing or preservation of aliased pixel contents.
     struct TracedAttachment : leonida::AttachmentWriteTrace {
         unsigned page_count = 0;
+        bool gpu_only_color = false;
         std::array<rt::xmem::PhysicalPageIdentity, 4> at_placement{};
+    };
+    struct GuardedPhysicalSnapshot {
+        std::shared_ptr<TracedAttachment> attachment;
+        std::uint64_t target = 0, source = 0, bytes = 0;
+        leonida::VulkanContext* active_context = nullptr;
+        std::uint64_t serial = 0;
+        rt::xmem::PhysicalTextureProof proof() const { return {target, attachment->at_placement}; }
+        ~GuardedPhysicalSnapshot() { if (active_context) active_context->end_readonly_snapshot(*attachment); }
     };
     struct TitleImageAllocation {
         VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -1027,6 +1036,35 @@ struct DeviceState {
             return GetEnvironmentVariableW(L"LEONIDA_TRACE_TEXTURE_RANGES", value, 2) == 1 && value[0] == L'1';
         }();
         return enabled;
+    }
+    static bool guarded_bc5_snapshot_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("LEONIDA_UNWRITTEN_RT_BC5_SNAPSHOT");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        return enabled && trace_texture_ranges();
+    }
+    std::shared_ptr<GuardedPhysicalSnapshot> guard_square_bc5(std::uint64_t source, std::uint64_t bytes) {
+        constexpr std::uint64_t distance = 352256 - 229376;
+        if (bytes != 352256 || source > UINT64_MAX - bytes) return {};
+        const auto target = source + distance;
+        std::lock_guard lock(title_placement_mutex);
+        const auto it = title_images.find(target);
+        if (it == title_images.end()) return {};
+        const auto owner = it->second.lock();
+        if (!owner || !owner->trace || !owner->trace->gpu_only_color || owner->trace->page_count != 4 || owner->guest_bytes != 1048576) return {};
+        auto guard = std::make_shared<GuardedPhysicalSnapshot>();
+        guard->target = target;
+        guard->source = source;
+        guard->bytes = bytes;
+        guard->attachment = owner->trace;
+        const auto proof = guard->proof();
+        if (rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(source), bytes,
+                rt::xmem::TextureCoverage::fully_mapped, &proof) !=
+            rt::xmem::SparseTextureSnapshot::ready || !context->begin_readonly_snapshot(*owner->trace)) return {};
+        guard->active_context = context.get();
+        guard->serial = owner->serial;
+        return guard;
     }
     void trace_native_title_overlap(std::uint64_t address, std::uint64_t bytes,
                                            std::uint64_t other, std::uint64_t other_bytes,
@@ -1096,11 +1134,13 @@ struct DeviceState {
     }
     bool title_image_overlap_locked(std::uint64_t address, std::uint64_t bytes,
                                     DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN, UINT depth_metadata = 0,
-                                    TitleImageCollision* collision = nullptr) {
+                                    TitleImageCollision* collision = nullptr, const GuardedPhysicalSnapshot* guard = nullptr) {
         for (auto it = title_images.begin(); it != title_images.end();) {
             const auto allocation = it->second.lock();
             if (!allocation) { it = title_images.erase(it); continue; }
             if (ranges_overlap(address, bytes, it->first, allocation->guest_bytes)) {
+                if (guard && guard->active_context && guard->source == address && guard->bytes == bytes &&
+                    guard->target == it->first && guard->attachment == allocation->trace) { ++it; continue; }
                 trace_native_title_overlap(address, bytes, it->first, allocation->guest_bytes, allocation.get());
                 if (collision) *collision = {it->first, allocation->guest_bytes, "native image", allocation->serial};
                 return true;
@@ -1167,14 +1207,14 @@ struct DeviceState {
                                   const char* kind, std::uint64_t addressable_bytes,
                                   std::uint64_t buffer_address = 0, bool physical_snapshot = false,
                                   bool sampled_shadow = false, TitleImageCollision* conflict = nullptr,
-                                  DisplayBcShape typed_display = {}) {
+                                  DisplayBcShape typed_display = {}, const GuardedPhysicalSnapshot* guard = nullptr) {
         if (!address || !bytes || bytes > UINT64_MAX - address) return false;
         // Imported buffer memory is page-aligned. Replay exposes only the resource's logical byte range.
         const auto first = buffer_address ? buffer_address : address;
         const auto extent = buffer_address ? addressable_bytes : bytes;
         if (first < address || first - address >= bytes || !extent || extent > bytes - (first - address)) return false;
         std::lock_guard lock(title_placement_mutex);
-        if (title_image_overlap_locked(first, extent, DXGI_FORMAT_UNKNOWN, 0, conflict) ||
+        if (title_image_overlap_locked(first, extent, DXGI_FORMAT_UNKNOWN, 0, conflict, guard) ||
             linear_image_overlap_locked(first, extent, physical_snapshot, conflict, false, typed_display)) return false;
         if (!sampled_shadow || !physical_snapshot)
             for (const auto& [start, protected_bytes] : sampled_alias_spans)
@@ -1191,10 +1231,11 @@ struct DeviceState {
         return true;
     }
     bool register_title_address_view(std::uint64_t address, std::uint64_t bytes, bool physical_snapshot = false,
-                                     TitleImageCollision* collision = nullptr, bool buffer_srv = false) {
+                                     TitleImageCollision* collision = nullptr, bool buffer_srv = false,
+                                     const GuardedPhysicalSnapshot* guard = nullptr) {
         if (!address || !bytes || bytes > UINT64_MAX - address) return false;
         std::lock_guard lock(title_placement_mutex);
-        if (title_image_overlap_locked(address, bytes, DXGI_FORMAT_UNKNOWN, 0, collision) ||
+        if (title_image_overlap_locked(address, bytes, DXGI_FORMAT_UNKNOWN, 0, collision, guard) ||
             linear_image_overlap_locked(address, bytes, physical_snapshot, collision, buffer_srv)) return false;
         if (!physical_snapshot) {
             for (const auto& [start, protected_bytes] : sampled_alias_spans) {
@@ -1235,7 +1276,7 @@ struct DeviceState {
     // Called with the sampled-image cache locked after image, caller reference and cache node are ready.
     // Change placement protection only on successful publication, under the native placement/host range lock.
     bool reserve_sampled_alias(std::uint64_t start, std::uint64_t bytes, TitleImageCollision& conflict,
-                               bool revalidate_shared_span = false) {
+                               bool revalidate_shared_span = false, const GuardedPhysicalSnapshot* guard = nullptr) {
         std::lock_guard lock(title_placement_mutex);
         auto source = title_address_views.find(start);
         if (source == title_address_views.end()) {
@@ -1248,7 +1289,7 @@ struct DeviceState {
             conflict = {start, shared_span, "sampled BC source outside physical store"};
             return false;
         }
-        if (title_image_overlap_locked(start, bytes, DXGI_FORMAT_UNKNOWN, 0, &conflict) ||
+        if (title_image_overlap_locked(start, bytes, DXGI_FORMAT_UNKNOWN, 0, &conflict, guard) ||
             linear_image_overlap_locked(start, bytes, true, &conflict)) return false;
         for (const auto& [id, range] : title_host_ranges) {
             if (!ranges_overlap(start, bytes, range.address, range.bytes) ||
@@ -3623,7 +3664,7 @@ public:
         DeviceState::TitleImageCollision conflict{};
         const auto source_address = reinterpret_cast<std::uintptr_t>(source);
         if (!device_.register_title_host_range(id(), source_address, source_span, "static_texture_source", source_span,
-                                              0, physical_snapshot, true, &conflict, typed_display))
+                                              0, physical_snapshot, true, &conflict, typed_display, guarded_snapshot_.get()))
             return DeviceState::sampled_placement_failure("upload source range", E_NOTIMPL, source_address, source_span,
                                                          physical_snapshot, conflict);
         title_host_range_ = true;
@@ -3871,7 +3912,8 @@ public:
 
     HRESULT enable_tiled_texture_shadow(const void* source, const leonida::Surface4ksLayout& layout,
                                         UINT64 placed_bytes = 0, UINT64 guest_alignment = 0,
-                                        bool require_physical = false) {
+                                        bool require_physical = false, std::shared_ptr<DeviceState::GuardedPhysicalSnapshot> guard = {}) {
+        guarded_snapshot_ = std::move(guard);
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT layers = volume ? 1 : desc_.DepthOrArraySize;
         const std::size_t source_bytes = layout.tiled_bytes * layers;
@@ -3906,7 +3948,9 @@ public:
                 region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
                 region.imageExtent = {item.width, item.height, item.depth};
             }
-        shadow->capture = [source, capture, layout, layers, source_bytes, upload_bytes, volume, physical](bool& dirty) {
+        shadow->capture = [source, capture, layout, layers, source_bytes, upload_bytes, volume, physical,
+                           guard = guarded_snapshot_](bool& dirty) {
+            const auto proof = guard ? guard->proof() : rt::xmem::PhysicalTextureProof{};
             // A descriptor can exist for the entire session without any submission selecting it.
             // Allocate pending bytes before the queue wait. Failed capture leaves uploaded untouched.
             const auto resize = [](std::vector<std::byte>& buffer, std::size_t bytes) {
@@ -3918,7 +3962,7 @@ public:
             const auto previous = capture->initialized ? std::span<const std::byte>(capture->uploaded) :
                                                          std::span<const std::byte>{};
             if (physical && capture->tiled.empty() && !previous.empty()) {
-                const auto comparison = rt::xmem::compare_sparse_texture(source, previous);
+                const auto comparison = rt::xmem::compare_sparse_texture(source, previous, guard ? &proof : nullptr);
                 if (comparison == rt::xmem::SparseTextureSnapshot::unchanged) {
                     dirty = false;
                     return true;
@@ -3926,7 +3970,7 @@ public:
                 if (comparison != rt::xmem::SparseTextureSnapshot::ready) return false;
             }
             if (!resize(capture->tiled, source_bytes)) return false;
-            const auto sparse = rt::xmem::snapshot_sparse_texture(source, capture->tiled, previous);
+            const auto sparse = rt::xmem::snapshot_sparse_texture(source, capture->tiled, previous, nullptr, guard ? &proof : nullptr);
             if (sparse == rt::xmem::SparseTextureSnapshot::failed ||
                 (physical && sparse == rt::xmem::SparseTextureSnapshot::untracked)) return false;
             if (sparse == rt::xmem::SparseTextureSnapshot::unchanged) {
@@ -4187,6 +4231,8 @@ public:
             ((desc_.Width == 3840 && desc_.Height == 2160) || (desc_.Width == 512 && desc_.Height == 512))) {
             try {
                 owner->trace = std::make_shared<DeviceState::TracedAttachment>();
+                owner->trace->gpu_only_color = region.Protect == PAGE_NOACCESS && !linear_color &&
+                    !(create.info.usage & VK_IMAGE_USAGE_STORAGE_BIT);
                 owner->trace->page_count = desc_.Width == 3840 ? 1u : 4u;
                 for (unsigned i = 0; i < owner->trace->page_count; ++i)
                     owner->trace->at_placement[i] = rt::xmem::physical_page_identity(
@@ -4917,6 +4963,7 @@ private:
     VkBuffer shadow_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory shadow_memory_ = VK_NULL_HANDLE;
     void* shadow_mapped_ = nullptr;
+    std::shared_ptr<DeviceState::GuardedPhysicalSnapshot> guarded_snapshot_;
     const void* shadow_source_ = nullptr;
     std::size_t linear_shadow_bytes_ = 0;
     UINT sampled_tile_bytes_ = 0;
@@ -14497,6 +14544,13 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
             return same_texture_shape(image.desc(), resource) && bool(linear_layout) == image.linear_host_image() &&
                 (!tiled_layout || image.sampled_tile_bytes() == tiled_layout->tile_bytes);
         });
+        std::shared_ptr<DeviceState::GuardedPhysicalSnapshot> guarded_snapshot;
+        if (DeviceState::guarded_bc5_snapshot_enabled() && physical_snapshot && tiled_layout && tiled_layout->tile_bytes == 4096 &&
+            resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && resource.Width == 512 && resource.Height == 512 &&
+            resource.DepthOrArraySize == 1 && resource.MipLevels == 8 && resource.Format == DXGI_FORMAT_BC5_UNORM &&
+            unsigned(resource.Layout) == 0x105 && unsigned(resource.Flags) == 0x300000 && !resource.Alignment &&
+            resource.SampleDesc.Count == 1 && !resource.SampleDesc.Quality && view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+            guarded_snapshot = state.guard_square_bc5(address, source_bytes);
         bool sampled_bc_alias = false;
         bool physical_alias = false;
         if (found == last && first != last) {
@@ -14529,7 +14583,7 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
         }
         if (!physical_alias) {
             DeviceState::TitleImageCollision collision{};
-            if (!state.register_title_address_view(address, source_bytes, physical_snapshot, &collision))
+            if (!state.register_title_address_view(address, source_bytes, physical_snapshot, &collision, false, guarded_snapshot.get()))
                 return sampled_view_failure("source range registration", E_NOTIMPL, address, resource, view, source_bytes,
                                             collision, int(backing));
         }
@@ -14562,12 +14616,17 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                     return sampled_view_failure("linear CPU backing unavailable", E_INVALIDARG, address, resource, view,
                                                 source_bytes, {}, int(backing));
                 hr = texture->enable_linear_texture_shadow(source, *linear_layout, resource.Alignment, physical_snapshot, true);
-            } else hr = tiled_layout ? texture->enable_tiled_texture_shadow(source, *tiled_layout) :
+            } else hr = tiled_layout ? texture->enable_tiled_texture_shadow(source, *tiled_layout, 0, 0, false, guarded_snapshot) :
                 texture->enable_static_texture_shadow(source, physical_snapshot);
             if (FAILED(hr)) {
                 return sampled_view_failure("texture upload setup", hr, address, resource, view, source_bytes,
                                             {}, int(backing));
             }
+            if (guarded_snapshot)
+                std::fprintf(stderr, "[rt] d3d12: physical BC5 snapshot armed owner=0x%llx source=0x%llx "
+                    "target=0x%llx bytes=%llu; native writes guarded at submit\n",
+                    static_cast<unsigned long long>(guarded_snapshot->serial), static_cast<unsigned long long>(address),
+                    static_cast<unsigned long long>(guarded_snapshot->target), static_cast<unsigned long long>(source_bytes));
             if (physical_alias) {
                 // Stage the descriptor before reserving the range. A failed native view, cache allocation or
                 // overlap check destroys this private image without exposing a new descriptor to the caller.
@@ -14580,7 +14639,7 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                 CachedTextures staged;
                 const auto row = staged.emplace(address, DeviceState::CachedTexture{std::move(owner), placement_bytes});
                 DeviceState::TitleImageCollision conflict{};
-                if (!state.reserve_sampled_alias(address, source_bytes, conflict, sampled_bc_alias)) {
+                if (!state.reserve_sampled_alias(address, source_bytes, conflict, sampled_bc_alias, guarded_snapshot.get())) {
                     report_sampled_siblings(address, first, last, int(backing), true);
                     return sampled_view_failure("physical sampled alias overlaps an incompatible owner", E_NOTIMPL,
                                                 address, resource, view, source_bytes, conflict, int(backing));

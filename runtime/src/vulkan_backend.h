@@ -1708,6 +1708,20 @@ public:
         deletion_queue_.drain(current_ticket, device_, vk);
     }
 
+    bool begin_readonly_snapshot(AttachmentWriteTrace& trace) {
+        std::lock_guard lock(submit_mutex_);
+        if (trace.incomplete.load() || std::any_of(trace.last_ticket.begin(), trace.last_ticket.end(),
+            [](auto ticket) { return ticket != 0; })) return false;
+        trace.readonly_snapshots.fetch_add(1);
+        active_attachment_snapshots_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    void end_readonly_snapshot(AttachmentWriteTrace& trace) {
+        trace.readonly_snapshots.fetch_sub(1);
+        active_attachment_snapshots_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
     void report_attachment_writes(std::uint64_t owner, const AttachmentWriteTrace& trace) {
         std::unique_lock lock(submit_mutex_, std::try_to_lock);
         if (!lock || is_device_lost()) {
@@ -1715,7 +1729,7 @@ public:
                          static_cast<unsigned long long>(owner));
             return;
         }
-        constexpr const char* names[] = {"clear_full", "clear_rects", "copy", "resolve", "possible_draw_or_predicated_clear"};
+        constexpr const char* names[] = {"clear_full", "clear_rects", "copy", "resolve", "possible_draw_or_predicated_clear", "discard"};
         for (unsigned i = 0; i < trace.last_ticket.size(); ++i) {
             const auto ticket = trace.last_ticket[i];
             const auto retired = retire_tickets_.observe(ticket, [&](const QueueTimelineRef& timeline, std::uint64_t value)
@@ -1935,6 +1949,7 @@ private:
     std::uintptr_t next_activity_image_ = 0;  // under resource_mutex_
     RetireTickets<QueueTimelineRef> retire_tickets_;
     bool trace_native_attachments_ = false;  // protected by resource_mutex_
+    std::atomic<unsigned> active_attachment_snapshots_{0};
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
@@ -4054,6 +4069,12 @@ private:
         VkResult res = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
+            if (attachment_writes && context_.active_attachment_snapshots_.load(std::memory_order_relaxed) &&
+                (attachment_writes->missing_item || std::any_of(attachment_writes->items.begin(), attachment_writes->items.end(),
+                    [](const auto& item) { return item.trace->readonly_snapshots.load() != 0; }))) {
+                std::fprintf(stderr, "[rt] d3d12: refused native render-target write while a physical read-only snapshot is live\n");
+                return false;
+            }
             VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
             std::uint64_t signal_values[2]{ticket, 0};
             std::uint32_t signal_count = 1;

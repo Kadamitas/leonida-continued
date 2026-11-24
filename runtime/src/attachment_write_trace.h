@@ -10,22 +10,27 @@ namespace leonida {
 
 // Draw coverage and conditional rendering are unknown on the CPU. Keep those command observations distinct
 // from unconditional color clears, image copies, and resolves. None identifies which physical guest bytes changed.
-enum class AttachmentWrite { clear_full, clear_rects, copy, resolve, possible, count };
+enum class AttachmentWrite { clear_full, clear_rects, copy, resolve, possible, discard, count };
 struct AttachmentWriteTrace : std::enable_shared_from_this<AttachmentWriteTrace> {
     std::array<std::uint64_t, unsigned(AttachmentWrite::count)> last_ticket{};  // protected by the submission mutex
     std::atomic<bool> incomplete{false};
+    std::atomic<unsigned> readonly_snapshots{0};
 
 };
 
 struct AttachmentWriteBatch {
     struct Item { std::shared_ptr<AttachmentWriteTrace> trace; unsigned kinds; };
     std::vector<Item> items;
+    bool missing_item = false;
     void add(AttachmentWriteTrace* trace, AttachmentWrite kind) {
         if (!trace) return;
         const unsigned bit = 1u << unsigned(kind);
         for (auto& item : items) if (item.trace.get() == trace) { item.kinds |= bit; return; }
         try { items.push_back({trace->shared_from_this(), bit}); }
-        catch (const std::bad_alloc&) { trace->incomplete.store(true, std::memory_order_relaxed); }
+        catch (const std::bad_alloc&) {
+            trace->incomplete.store(true, std::memory_order_relaxed);
+            missing_item = true;
+        }
     }
     void submit(std::uint64_t ticket) const {
         for (const auto& item : items)

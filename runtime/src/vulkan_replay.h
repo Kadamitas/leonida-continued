@@ -4200,6 +4200,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const bool discard = (texture->flags & texture_barrier_discard) ||
                                  texture->layout_before == d3d12_layout::undefined;
+            if (discard && vk.attachment_writes)
+                vk.attachment_writes->add(p.binding.attachment_write_trace, AttachmentWrite::discard);
             const VkImageLayout new_layout =
                 image_layout(p.binding, vulkan_layout(texture->layout_after, p.binding.presentable));
             LayoutPieces pieces;
@@ -4606,6 +4608,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 --labels;
             }
         } else if (std::holds_alternative<DiscardResource>(command)) {
+            if (!p.discards.empty() && vk.attachment_writes)
+                vk.attachment_writes->add(p.binding.attachment_write_trace, AttachmentWrite::discard);
             // oldLayout = UNDEFINED tells the driver the contents may go; the image stays in the layout the tracker
             // has for it, so later commands see no change. Without a tracker the layout is unknown, and a part
             // never used yet is still to be zero-filled: both are left alone. Without separate depth/stencil

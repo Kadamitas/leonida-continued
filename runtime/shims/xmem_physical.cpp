@@ -1052,7 +1052,8 @@ rt::xmem::SparseTextureSnapshot snapshot_sparse_texture(const void* source, std:
                                                        std::span<std::byte> destination,
                                                        std::span<const std::byte> previous,
                                                        rt::xmem::SparseTextureMismatch* mismatch,
-                                                       rt::xmem::TextureCoverage coverage) noexcept {
+                                                       rt::xmem::TextureCoverage coverage,
+                                                       const rt::xmem::PhysicalTextureProof* proof) noexcept {
     using Result = rt::xmem::SparseTextureSnapshot;
     if (!size) return Result::ready;
     const auto start = reinterpret_cast<uintptr_t>(source);
@@ -1088,10 +1089,19 @@ rt::xmem::SparseTextureSnapshot snapshot_sparse_texture(const void* source, std:
         const auto page_base = page_address(base, index);
         const auto piece_end = (std::min)(end, page_base + kPage);
         const auto slot = region.page[index];
-        if (!slot && coverage == rt::xmem::TextureCoverage::fully_mapped) return Result::failed;
+        if (!slot && (proof || coverage == rt::xmem::TextureCoverage::fully_mapped)) return Result::failed;
         if (slot && (slot > g_slots.size() || !g_slots[slot - 1].allocated ||
             (slot - 1) / kChunkPages >= g_chunks.size() || !g_chunks[(slot - 1) / kChunkPages].view))
             return Result::failed;
+        if (proof && page_base >= proof->overlap_start) {
+            const auto i = (page_base - proof->overlap_start) / kPage;
+            if (i >= proof->overlap_pages.size()) return Result::failed;
+            const auto& expected = proof->overlap_pages[i];
+            const auto& current = g_slots[slot - 1];
+            if (expected.state != rt::xmem::PhysicalPageState::mapped || expected.frame != frame_of(slot - 1) ||
+                expected.allocation_epoch == UINT32_MAX || current.allocation_epoch != expected.allocation_epoch ||
+                expected.physical_store_writes || current.physical_store_writes) return Result::failed;
+        }
         while (cursor < piece_end) {
             // An unbroken reservation can cover many empty slots. One native query describes the entire
             // run; each slot's allocation, state and protection are still checked under the mapping lock.
@@ -1102,6 +1112,7 @@ rt::xmem::SparseTextureSnapshot snapshot_sparse_texture(const void* source, std:
                     native_base + info.RegionSize <= cursor) return Result::failed;
                 native_end = native_base + info.RegionSize;
             }
+            if (proof && info.Protect != PAGE_NOACCESS) return Result::failed;
             if (slot ? (info.State != MEM_COMMIT || info.Type != MEM_MAPPED ||
                         info.AllocationBase != reinterpret_cast<void*>(page_base) || (info.Protect & PAGE_GUARD)) :
                        info.State != MEM_RESERVE) return Result::failed;

@@ -71,6 +71,13 @@ struct PhysicalImportOps {
 
 enum class TextureCoverage { sparse, fully_mapped };
 
+// A sampled view overlaps an otherwise unwritten native render target. Every source page must
+// remain mapped; the overlapping frames must still match the identities established at placement.
+struct PhysicalTextureProof {
+    std::uintptr_t overlap_start;
+    std::span<const PhysicalPageIdentity> overlap_pages;
+};
+
 struct SparseTextureMismatch {
     std::size_t offset = 0;
     std::size_t bytes = 0;
@@ -83,7 +90,8 @@ using PhysicalPageAliasFn = bool (*)(std::span<const PhysicalPageAliasRange>) no
 using PhysicalPageIdentityFn = PhysicalPageIdentity (*)(const void*) noexcept;
 using PhysicalCpuViewFn = PhysicalCpuView (*)(const void*, std::size_t) noexcept;
 using SparseTextureSnapshotFn = SparseTextureSnapshot (*)(const void*, std::size_t, std::span<std::byte>,
-                                                         std::span<const std::byte>, SparseTextureMismatch*, TextureCoverage) noexcept;
+                                                         std::span<const std::byte>, SparseTextureMismatch*,
+                                                         TextureCoverage, const PhysicalTextureProof*) noexcept;
 // The device proxy is also compiled without the physical store. Constant initialization keeps those targets
 // independent of xmem_physical.cpp; the real store publishes its handler during shim registration.
 inline constinit std::atomic<PhysicalPageAliasFn> physical_page_alias_handler{nullptr};
@@ -138,24 +146,29 @@ inline PhysicalCpuView find_physical_cpu_view(const void* source, std::size_t si
 // before treating the block as dirty: a writer through a CPU alias can change the data before the copy.
 inline SparseTextureSnapshot snapshot_sparse_texture(const void* source, std::span<std::byte> destination,
                                                      std::span<const std::byte> previous = {},
-                                                     SparseTextureMismatch* mismatch = nullptr) noexcept {
+                                                     SparseTextureMismatch* mismatch = nullptr,
+                                                     const PhysicalTextureProof* proof = nullptr) noexcept {
     if (mismatch) *mismatch = {};
     const auto handler = detail::sparse_texture_snapshot_handler.load(std::memory_order_acquire);
-    return handler ? handler(source, destination.size(), destination, previous, mismatch, TextureCoverage::sparse) : SparseTextureSnapshot::untracked;
+    return handler ? handler(source, destination.size(), destination, previous, mismatch,
+                             TextureCoverage::sparse, proof) : SparseTextureSnapshot::untracked;
 }
 
 // Validate the same physical mappings before allocating a texture, without copying its contents.
 inline SparseTextureSnapshot validate_sparse_texture(const void* source, std::size_t size,
-                                                      TextureCoverage coverage = TextureCoverage::sparse) noexcept {
+                                                     TextureCoverage coverage = TextureCoverage::sparse,
+                                                     const PhysicalTextureProof* proof = nullptr) noexcept {
     const auto handler = detail::sparse_texture_snapshot_handler.load(std::memory_order_acquire);
-    return handler ? handler(source, size, {}, {}, nullptr, coverage) : SparseTextureSnapshot::untracked;
+    return handler ? handler(source, size, {}, {}, nullptr, coverage, proof) : SparseTextureSnapshot::untracked;
 }
 
 // Compare all current physical bytes, including holes, before reserving scratch for a refresh.
 // Ready means a difference was observed. A later capture validates the mapping again.
-inline SparseTextureSnapshot compare_sparse_texture(const void* source, std::span<const std::byte> previous) noexcept {
+inline SparseTextureSnapshot compare_sparse_texture(const void* source, std::span<const std::byte> previous,
+                                                    const PhysicalTextureProof* proof = nullptr) noexcept {
     const auto handler = detail::sparse_texture_snapshot_handler.load(std::memory_order_acquire);
-    return handler ? handler(source, previous.size(), {}, previous, nullptr, TextureCoverage::sparse) : SparseTextureSnapshot::untracked;
+    return handler ? handler(source, previous.size(), {}, previous, nullptr,
+                             TextureCoverage::sparse, proof) : SparseTextureSnapshot::untracked;
 }
 
 }  // namespace rt::xmem
