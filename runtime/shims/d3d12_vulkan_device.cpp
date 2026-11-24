@@ -949,7 +949,7 @@ struct DeviceState {
         std::shared_ptr<void> owner;
         std::size_t sampled_bc_bytes;
     };
-    std::map<std::uint64_t, CachedTexture> host_static_textures;
+    std::multimap<std::uint64_t, CachedTexture> host_static_textures;
     // Marker pages are kept by their recorded/submitted lists, not by the device: each imported resource holds
     // its device alive. Weak cache entries share a live import without making a device/resource reference cycle.
     std::mutex host_marker_mutex;
@@ -1650,7 +1650,7 @@ struct DeviceState {
         std::uint32_t index;
         VkImageView sampled;
         VkImageView storage;  // the same range without a component mapping, for the storage bindings; or null
-        std::uint64_t address;
+        std::uint64_t address;  // Resource object address for retirement, independent of its guest VA.
     };
     std::unique_ptr<leonida::BindlessSet> bindless;
     std::mutex descriptor_mutex;  // the set and the containers below
@@ -1659,8 +1659,8 @@ struct DeviceState {
     bool bindless_legacy_idle = false;
     std::atomic<bool> bindless_cap_logged{false};
     std::map<leonida::DescriptorKey, ImageEntry> image_entries;
-    std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
-    // Kept until their texture goes (work in flight may still use them), by the texture's address.
+    std::multimap<leonida::ResourceId, leonida::DescriptorKey> image_keys;  // by native resource owner
+    // Kept until their owning resource goes (work in flight may still use them).
     leonida::ReplacedImages<ImageEntry> replaced_images;
     std::map<leonida::DescriptorKey, VkSampler> sampler_entries;
     leonida::BorderColorTable border_color_table;  // hashed: CreateSampler looks a colour up without a scan
@@ -1722,7 +1722,8 @@ struct DeviceState {
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
     // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
-    bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
+    bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image,
+                    leonida::ResourceId owner, bool& ambiguous, VkImage vk_image,
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
                     bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED,
                     bool restricted_view_usage = false, bool packed4444_projection = false) {
@@ -1730,6 +1731,11 @@ struct DeviceState {
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
         const auto existing = image_entries.find(words);
+        if (existing != image_entries.end() && existing->second.address != owner) {
+            // A shader sees only the encoded T#. It cannot distinguish two images with identical words.
+            ambiguous = true;
+            return false;
+        }
         if (existing != image_entries.end() && (existing->second.storage || !storage)) return true;
 
         leonida::ImageDimension dimension;
@@ -1828,7 +1834,7 @@ struct DeviceState {
                                : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
                                                                        : VK_IMAGE_ASPECT_COLOR_BIT),
             image.first_mip, image.mip_count, image.first_layer, image.layer_count};
-        ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
+        ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, owner};
         if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
         leonida::StorageViews views{};
         if (storage) {
@@ -1866,11 +1872,20 @@ struct DeviceState {
                 return false;
             }
             existing->second = entry;
+            bindless->insert_key(words, entry.index);
         } else {
-            image_entries.emplace(words, entry);
-            image_keys.emplace(image.address, words);
+            auto reverse = image_keys.end();
+            try {
+                reverse = image_keys.emplace(owner, words);
+                image_entries.emplace(words, entry);
+                bindless->insert_key(words, entry.index);
+            } catch (const std::bad_alloc&) {
+                image_entries.erase(words);
+                if (reverse != image_keys.end()) image_keys.erase(reverse);
+                release(entry, true);
+                return false;
+            }
         }
-        bindless->insert_key(words, entry.index);
         if (g::multisampled(image.type) && depth_or_stencil) {
             static std::atomic<unsigned> registered_depth_ms_views{0};
             if (registered_depth_ms_views.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -1880,14 +1895,20 @@ struct DeviceState {
         return true;
     }
 
-    // The texture at `address` is gone: its T#s leave the hash table. A synchronous owner can retain the views
+    bool owns_image_key(leonida::ResourceId owner, const leonida::DescriptorKey& key) {
+        std::lock_guard lock(descriptor_mutex);
+        const auto found = image_entries.find(key);
+        return found != image_entries.end() && found->second.address == owner;
+    }
+
+    // The resource is gone: its T#s leave the hash table. A synchronous owner can retain the views
     // and slots until it has joined preparations and waited submitted work; other owners defer their release.
-    void forget_image(std::uint64_t address, bool immediate_views = false, std::vector<ImageEntry>* retained = nullptr) {
+    void forget_image(leonida::ResourceId owner, bool immediate_views = false, std::vector<ImageEntry>* retained = nullptr) {
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return;
-        const auto [first, last] = image_keys.equal_range(address);
+        const auto [first, last] = image_keys.equal_range(owner);
         if (retained) {
-            const auto count = std::size_t(std::distance(first, last)) + replaced_images.count(address);
+            const auto count = std::size_t(std::distance(first, last)) + replaced_images.count(owner);
             retained->reserve(retained->size() + count);
         }
         const auto retire = [&](const ImageEntry& entry) {
@@ -1901,7 +1922,7 @@ struct DeviceState {
             image_entries.erase(entry);
         }
         image_keys.erase(first, last);
-        replaced_images.take(address, retire);
+        replaced_images.take(owner, retire);
     }
 
     // Gives the S# `words` a sampler in set 0 and an entry in the hash table, unless it has them.
@@ -2480,14 +2501,14 @@ public:
             // Unpublish shader keys before detaching the binding. A later shader submission cannot resolve this
             // image indirectly; preparations that already captured its descriptors are joined by remove_resource.
             std::vector<DeviceState::ImageEntry> retained;
-            if (image_address_) device_.forget_image(image_address_, false, &retained);
+            if (image_address_) device_.forget_image(id(), false, &retained);
             device_.context->remove_resource(id(), true);
             if (!retained.empty()) {
                 std::lock_guard lock(device_.descriptor_mutex);
                 for (const auto& entry : retained) device_.release(entry, true);
             }
         } else {
-            if (image_address_) device_.forget_image(image_address_);
+            if (image_address_) device_.forget_image(id());
             device_.context->remove_resource(id());
         }
         if (host_import_ || title_image_allocation_) {
@@ -9694,23 +9715,24 @@ public:
             }
             {
                 std::lock_guard lock(state_.host_static_texture_mutex);
-                const auto cached = state_.host_static_textures.find(start);
-                if (cached != state_.host_static_textures.end()) {
-                    auto& image = *static_cast<Resource*>(cached->second.owner.get());
-                    if (image.sampled_tile_bytes() != layout->tile_bytes ||
-                        cached->second.sampled_bc_bytes != guest_bytes || image.image_address() != start ||
-                        image.GetDesc().Alignment != alignment ||
-                        !same_texture_shape(image.desc(), native)) {
+                const auto [first, last] = state_.host_static_textures.equal_range(start);
+                if (first != last) {
+                    const auto cached = std::find_if(first, last, [&](const auto& row) {
+                        auto& image = *static_cast<Resource*>(row.second.owner.get());
+                        return image.sampled_tile_bytes() == layout->tile_bytes &&
+                            row.second.sampled_bc_bytes == guest_bytes && image.image_address() == start &&
+                            image.GetDesc().Alignment == alignment && same_texture_shape(image.desc(), native);
+                    });
+                    if (cached == last) {
                         static std::atomic<unsigned> mismatches{};
                         if (mismatches.fetch_add(1, std::memory_order_relaxed) < 12)
-                            std::fprintf(stderr, "[rt] d3d12: cached BC placement mismatch va=%p format=%u/%u "
-                                "size=%llux%u/%llux%u bytes=%llu/%zu alignment=%llu/%llu\n", address, unsigned(desc.Format),
-                                unsigned(image.desc().Format), static_cast<unsigned long long>(desc.Width), desc.Height,
-                                static_cast<unsigned long long>(image.desc().Width), image.desc().Height,
-                                static_cast<unsigned long long>(guest_bytes), cached->second.sampled_bc_bytes,
-                                static_cast<unsigned long long>(alignment), static_cast<unsigned long long>(image.GetDesc().Alignment));
+                            std::fprintf(stderr, "[rt] d3d12: no matching cached BC placement va=%p format=%u "
+                                "size=%llux%u bytes=%llu alignment=%llu\n", address, unsigned(desc.Format),
+                                static_cast<unsigned long long>(desc.Width), desc.Height,
+                                static_cast<unsigned long long>(guest_bytes), static_cast<unsigned long long>(alignment));
                         return d3d12_trace::result(method, E_NOTIMPL);
                     }
+                    auto& image = *static_cast<Resource*>(cached->second.owner.get());
                     static std::atomic<unsigned> reused{};
                     if (reused.fetch_add(1, std::memory_order_relaxed) < 16)
                         std::fprintf(stderr, "[rt] d3d12: placed sampled BC texture shares address SRV image "
@@ -11383,11 +11405,13 @@ private:
         };
         if (!described) { report_video(false); return; }
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
-        const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
+        bool ambiguous = false;
+        const bool registered = state_.bind_image(words, image, resource.id(), ambiguous, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
                                                   resource.uint_backed(), resource.title_r32_reinterpret(),
                                                   resource.packed4444_projection());
         report_video(registered);
+        if (ambiguous) return;  // Leave this slot null: writing these words would select the other resource.
         if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
         if (!registered && (leonida::gfx10::multisampled(image.type) ||
                             (storage && image.type == leonida::gfx10::ImageType::image_3d))) return;
@@ -13531,9 +13555,7 @@ HRESULT create_live_title_texture_view(ID3D12Device* device, const D3D12_RESOURC
     d->CreateShaderResourceView(texture, &view, destination);
     leonida::DescriptorKey key{};
     std::memcpy(key.data(), reinterpret_cast<const void*>(destination.ptr), sizeof(key));
-    std::lock_guard descriptor_lock(state.descriptor_mutex);
-    const auto [first, last] = state.image_keys.equal_range(texture->image_address());
-    if (!std::any_of(first, last, [&](const auto& item) { return item.second == key; }))
+    if (!state.owns_image_key(texture->id(), key))
         return refuse("native view not registered");
     static std::atomic<unsigned> creations{0};
     if (creations.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -13624,8 +13646,25 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
         const bool physical_snapshot = backing == rt::xmem::SparseTextureSnapshot::ready;
         if (!state.register_title_address_view(address, source_bytes, physical_snapshot)) return E_NOTIMPL;
         std::lock_guard cache_lock(state.host_static_texture_mutex);
-        auto found = state.host_static_textures.find(address);
-        if (found == state.host_static_textures.end()) {
+        const auto [first, last] = state.host_static_textures.equal_range(address);
+        auto found = std::find_if(first, last, [&](const auto& row) {
+            const auto& image = *static_cast<Resource*>(row.second.owner.get());
+            return same_texture_shape(image.desc(), resource) && bool(linear_layout) == image.linear_host_image() &&
+                (!tiled_layout || image.sampled_tile_bytes() == tiled_layout->tile_bytes);
+        });
+        if (found == last) {
+            if (first != last) {
+                // These sampled-only 2D BC images independently detile the same guest bytes on submission.
+                // Keep other alias types outside this path until their backing and update rules are known.
+                const bool aliasable = tiled_layout && tiled_layout->tile_bytes == 4096 && tiled_layout->block_dim == 4 &&
+                    resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && faces == 1 &&
+                    std::all_of(first, last, [](const auto& row) {
+                        const auto& sibling = *static_cast<Resource*>(row.second.owner.get());
+                        return row.second.sampled_bc_bytes && sibling.sampled_tile_bytes() == 4096 &&
+                            sibling.desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && sibling.desc().DepthOrArraySize == 1;
+                    });
+                if (!aliasable) return E_NOTIMPL;
+            }
             auto desc = resource;
             desc.Flags = D3D12_RESOURCE_FLAG_NONE;
             desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -13658,7 +13697,7 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                 log_once("address SRV texture upload setup failed (HRESULT)", int(hr));
                 return hr;
             }
-            found = state.host_static_textures.emplace(address, DeviceState::CachedTexture{std::move(owner), bc_bytes}).first;
+            found = state.host_static_textures.emplace_hint(last, address, DeviceState::CachedTexture{std::move(owner), bc_bytes});
             if (tiled_layout)
                 std::fprintf(stderr, "[rt] d3d12: %s %s texture shadow created with %u mips across %u layers "
                                      "address=0x%llx bytes=%zu size=%llux%u format=%u\n",
@@ -13677,16 +13716,10 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                                      r8_atlas ? "4KB_S R8 atlas" : single_array ? "4KB_S single color array" : "4KB_S single color texel");
         }
         auto* texture = static_cast<Resource*>(found->second.owner.get());
-        const auto& cached = texture->desc();
-        if (!same_texture_shape(cached, resource) || bool(linear_layout) != texture->linear_host_image() ||
-            (tiled_layout && texture->sampled_tile_bytes() != tiled_layout->tile_bytes))
-            return E_NOTIMPL;  // reinterpretation or reuse of one VA needs explicit alias lifetime handling
         d->CreateShaderResourceView(texture, &view, destination);
         leonida::DescriptorKey key{};
         std::memcpy(key.data(), reinterpret_cast<const void*>(destination.ptr), sizeof(key));
-        std::lock_guard descriptor_lock(state.descriptor_mutex);
-        const auto [first, last] = state.image_keys.equal_range(address);
-        return std::any_of(first, last, [&](const auto& item) { return item.second == key; }) ? S_OK : E_NOTIMPL;
+        return state.owns_image_key(texture->id(), key) ? S_OK : E_NOTIMPL;
     } catch (const std::bad_alloc&) {
         return E_OUTOFMEMORY;
     }
