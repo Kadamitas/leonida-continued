@@ -1566,6 +1566,17 @@ PC answers 0 and leaves buffers and resources with a PC address unchanged
 sets a slot-133 fallback texture's `GetGPUVirtualAddress` to the title address; the image itself still does not
 alias the title's pages.
 
+Slot 133 creates the Vulkan image for a GPU-only render target, depth/stencil target or unordered-access texture
+immediately. A logical RTV or DSV needs only its metadata. The first replay, shader view or CPU subresource copy
+that needs the image binds its private memory. Concurrent users share one successful bind, and a failed allocation
+can be retried. Set `LEONIDA_PLACED_IMAGE_DEFER=0` to allocate at creation.
+
+In observed-color mode, set `LEONIDA_PLACED_IMAGE_DEFER=1` to defer private memory for single-owner,
+GPU-only render targets and depth attachments. Placement still validates the full guest range, reserves the native
+image and enforces overlaps. The log reports cumulative counts and Vulkan allocation budgets for created, bound
+and released-unbound images, plus the currently pending bytes. Reports are emitted for the first 16 events, every 32
+events thereafter, and requests of at least 32 MiB. The default in this mode allocates at creation.
+
 Non-arena buffers (upload/readback) can still be addressed by the shader without putting them in the arena: pass
 `console_va = host_bda - heap_base` (mod 2^64) in root descriptors and vertex/index/indirect views, so the shader's
 `heap_base + console_va` equals the host BDA. For descriptors, patch the V# base field the same way when the layer

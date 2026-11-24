@@ -1788,7 +1788,9 @@ private:
 
     const ResourceBinding* resolve(ResourceId id) const {
         const auto it = resources_.find(id);
-        return it == resources_.end() ? nullptr : &it->second;
+        if (it == resources_.end()) return nullptr;
+        if (auto* memory = it->second.deferred_memory; memory && !memory->ensure()) return nullptr;
+        return &it->second;
     }
 
     // Called from prepare; protected by views_mutex_ so concurrent shared_lock readers are safe.

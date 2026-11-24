@@ -10,9 +10,13 @@
 #include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
+#include "../src/deferred_image_binding.h"
 #include <dxgi1_4.h>
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -251,6 +255,103 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     return 0;
 }
 
+// An RTV descriptor needs no image backing. Replaying the first clear binds the placement.
+int check_placed_target_backing(ID3D12Device* device) {
+    const char* who = "slot-133 first GPU use";
+    std::atomic<unsigned> attempts{0};
+    leonida::DeferredImageBinding retry(&attempts, [](void* p) {
+        return static_cast<std::atomic<unsigned>*>(p)->fetch_add(1) != 0;
+    });
+    EXPECT(!retry.ensure() && !retry.bound());
+    std::array<std::thread, 4> callers;
+    std::atomic<unsigned> successes{0};
+    for (auto& thread : callers) {
+        thread = std::thread([&] {
+            if (retry.ensure()) ++successes;
+        });
+    }
+    for (auto& thread : callers) thread.join();
+    EXPECT(retry.bound() && attempts == 2 && successes == callers.size());
+
+    constexpr UINT width = 16, height = 8, pitch = 256;
+    void* pages = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_NOACCESS);
+    EXPECT(pages);
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = width;
+    d.Height = height;
+    d.DepthOrArraySize = d.MipLevels = d.SampleDesc.Count = 1;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    Ref<ID3D12Resource> target;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, d, 2, IID_PPV_ARGS(&target.p)), S_OK);
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT_HR(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap.p)), S_OK);
+    auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+    device->CreateRenderTargetView(target.p, nullptr, rtv);
+    char setting[2]{};
+    const bool lazy = GetEnvironmentVariableA("LEONIDA_PLACED_IMAGE_DEFER", setting, 2) != 1 || setting[0] != '0';
+    const auto backed = [](ID3D12Resource* r) { return rt::d3d12::vulkan_memory_flags(r) != 0; };
+    EXPECT(backed(target.p) == !lazy);
+    D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    Ref<ID3D12Resource> committed;
+    EXPECT_HR(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON,
+                                              nullptr, IID_PPV_ARGS(&committed.p)), S_OK);
+    EXPECT(backed(committed.p));
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = pitch * height;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> readback;
+    EXPECT_HR(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.p)), S_OK);
+    D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    EXPECT_HR(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p)), S_OK);
+    EXPECT_HR(device->CreateCommandAllocator(queue_desc.Type, IID_PPV_ARGS(&allocator.p)), S_OK);
+    EXPECT_HR(device->CreateCommandList(0, queue_desc.Type, allocator.p, nullptr, IID_PPV_ARGS(&list.p)), S_OK);
+    EXPECT_HR(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)), S_OK);
+    const float color[]{1, 0, 1, 1};
+    list->ClearRenderTargetView(rtv, color, 0, nullptr);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Transition = {target.p, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION src{target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    dst.PlacedFootprint.Footprint = {d.Format, width, height, 1, pitch};
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    EXPECT_HR(list->Close(), S_OK);
+    EXPECT(backed(target.p) == !lazy);
+    ID3D12CommandList* lists[]{list.p};
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT_HR(queue->Signal(fence.p, 1), S_OK);
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    EXPECT(done);
+    EXPECT_HR(fence->SetEventOnCompletion(1, done), S_OK);
+    EXPECT(WaitForSingleObject(done, 30000) == WAIT_OBJECT_0);
+    CloseHandle(done);
+    EXPECT(backed(target.p));
+    void* mapped = nullptr;
+    EXPECT_HR(readback->Map(0, nullptr, &mapped), S_OK);
+    for (UINT y = 0; y < height; ++y) {
+        const auto* pixels = reinterpret_cast<const std::uint32_t*>(static_cast<const char*>(mapped) + y * pitch);
+        EXPECT(std::all_of(pixels, pixels + width, [](auto px) { return px == 0xffff00ff; }));
+    }
+    readback->Unmap(0, nullptr);
+    std::printf("%s: %s backing, %u cleared pixels matched; four first-use callers, two bind attempts\n",
+                who, lazy ? "deferred" : "eager", width * height);
+    target.p->Release();
+    target.p = nullptr;
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
 int check_title_placed_all(ID3D12Device* device) {
     constexpr SIZE_T size = 4 * 0x10000;
     int failures = 0;
@@ -324,6 +425,7 @@ int main() {
         info.host_pointer_alignment = vk.host_pointer_alignment;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         failures += check(ours.p, "vulkan");
+        failures += check_placed_target_backing(ours.p);
         const std::vector<Case> vulkan_cases = open_cases(ours.p);
         print_cases(vulkan_cases, "vulkan");
         failures += check_import(ours.p, vk.host_pointer_alignment != 0);

@@ -2768,6 +2768,10 @@ public:
 
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
+    bool uses_deferred_image_memory() const { return bool(deferred_memory_); }
+    VkImage bound_image() const {
+        return deferred_memory_ && !deferred_memory_->binding.ensure() ? VK_NULL_HANDLE : image_;
+    }
     bool sparse_image() const { return sparse_image_; }
     bool readonly_host_image() const { return binding_.host_readonly_image; }
     bool tracked_host_image() const { return binding_.tracked_host_image(); }
@@ -2813,7 +2817,9 @@ public:
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
-    VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
+    VkMemoryPropertyFlags memory_flags() const {
+        return deferred_memory_ && !deferred_memory_->binding.bound() ? 0 : memory_flags_;
+    }
     const DeviceState& device_state() const { return device_; }
 
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
@@ -3955,9 +3961,17 @@ public:
         need.size = budget;
         std::uint32_t memory_type = 0;
         VkMemoryPropertyFlags flags = 0;
-        const VkDeviceMemory memory = device_.allocate(need, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                                       &flags, false, &memory_type);
-        if (!memory) return failed("native memory allocation", E_OUTOFMEMORY);
+        const bool deferred = defer_placed_images(true) && region.Protect == PAGE_NOACCESS && !linear_color &&
+            !depth_projection && !dedicated.prefersDedicatedAllocation &&
+            (desc_.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET ||
+             desc_.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        if (deferred) {
+            if (!defer_image_memory(need, true)) return failed("deferred memory owner", E_OUTOFMEMORY);
+        } else {
+            memory = device_.allocate(need, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &flags, false, &memory_type);
+            if (!memory) return failed("native memory allocation", E_OUTOFMEMORY);
+        }
         auto* owner = new (std::nothrow) DeviceState::TitleImageAllocation{
             memory, guest_bytes, need.alignment, memory_type, flags, device_.next_title_image_allocation.fetch_add(1),
             depth_projection ? desc_.Format : DXGI_FORMAT_UNKNOWN, depth_projection_metadata, {}};
@@ -3969,7 +3983,7 @@ public:
             owner->first_page_at_placement = rt::xmem::physical_page_identity(reinterpret_cast<const void*>(start));
         std::shared_ptr<const DeviceState::TitleImageAllocation> allocation(owner,
             [context = device_.context.get(), device = device_.info.device](const DeviceState::TitleImageAllocation* value) {
-                context->vk.vkFreeMemory(device, value->memory, nullptr);
+                if (value->memory) context->vk.vkFreeMemory(device, value->memory, nullptr);
                 delete value;
             });
         title_image_allocation_ = allocation;
@@ -3978,7 +3992,7 @@ public:
         title_guest_alignment_ = guest_alignment;
         title_depth_projection_ = depth_projection;
         title_depth_projection_metadata_ = depth_projection_metadata;
-        if (vk.vkBindImageMemory(device_.info.device, image_, allocation->memory, 0) != VK_SUCCESS)
+        if (!deferred && vk.vkBindImageMemory(device_.info.device, image_, allocation->memory, 0) != VK_SUCCESS)
             return failed("vkBindImageMemory", E_OUTOFMEMORY);
         try {
             if (depth_projection) device_.title_depth_images.emplace(start, allocation);
@@ -4018,11 +4032,12 @@ public:
         // A placed allocation is not implicitly cleared. The caller's optimized clear value is metadata, not
         // a command. The first real use transitions the image, and actual Clear/Copy/Draw commands supply data.
         binding_.not_zeroed = true;
+        binding_.deferred_memory = deferred ? &deferred_memory_->binding : nullptr;
         binding_.castable_view_formats = !view_formats_.empty();
         device_.context->add_resource(id(), binding_, VK_IMAGE_LAYOUT_UNDEFINED);
         // Both sampled and unordered-access descriptors can be the first GPU use. The existing pre-shader pass
         // transitions the real, still-UNDEFINED image to GENERAL for shader reads/writes without inventing contents.
-        device_.context->note_shader_image(id());
+        if (!deferred) device_.context->note_shader_image(id());
         try {
             if (depth_projection)
                 device_.title_depth_image_resources.emplace(start, DeviceState::TitleImageResource{this});
@@ -4060,7 +4075,8 @@ public:
     }
 
     HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {},
-                           VkImageCreateFlags extra_flags = 0, bool sampled_title_image = false) {
+                           VkImageCreateFlags extra_flags = 0, bool sampled_title_image = false,
+                           bool title_placement = false) {
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
@@ -4151,7 +4167,12 @@ public:
             const char* setting = std::getenv("LEONIDA_TITLE_IMAGE_POOL");
             return !setting || std::strcmp(setting, "0") != 0;
         }();
-        if (sampled_title_image && pool_images && device_.get_image_memory_requirements2 &&
+        const auto attachments = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (title_placement && defer_placed_images() && (desc_.Flags & attachments) &&
+            !cpu_visible() && !sampled_title_image && !title_display_allocation_) {
+            if (!defer_image_memory(requirements)) return E_OUTOFMEMORY;
+        } else if (sampled_title_image && pool_images && device_.get_image_memory_requirements2 &&
             !dedicated.requiresDedicatedAllocation && !dedicated.prefersDedicatedAllocation) {
             try {
                 pooled_image_ = device_.title_image_pool.bind(device_.info.device, image_, requirements,
@@ -4165,15 +4186,13 @@ public:
         }
         if (pooled_image_) {
             memory_flags_ = device_.memory.memoryTypes[pooled_image_->page->type].propertyFlags;
-        } else {
+        } else if (!deferred_memory_) {
             const bool use_dedicated = dedicated.requiresDedicatedAllocation || dedicated.prefersDedicatedAllocation;
-            memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_, false,
-                                       nullptr, use_dedicated ? image_ : VK_NULL_HANDLE);
-            if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
-                return E_OUTOFMEMORY;
+            if (!bind_texture_memory(requirements, use_dedicated)) return E_OUTOFMEMORY;
         }
 
         leonida::ResourceBinding binding{};
+        binding.deferred_memory = deferred_memory_ ? &deferred_memory_->binding : nullptr;
         binding.image = image_;
         binding.typeless = format.typeless && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT;  // views name their format
         binding.castable_view_formats = !view_formats_.empty();  // a castable list made the image mutable
@@ -4383,12 +4402,78 @@ private:
         return true;
     }
 
+    struct PendingImageMemory {
+        enum Event { created, bound, released_unbound };
+        Resource& image;
+        VkMemoryRequirements requirements;
+        bool native;
+        leonida::DeferredImageBinding binding;
+        PendingImageMemory(Resource& resource, const VkMemoryRequirements& need, bool native_target)
+            : image(resource), requirements(need), native(native_target), binding(this, [](void* owner) {
+                const auto& pending = *static_cast<PendingImageMemory*>(owner);
+                if (!pending.image.bind_texture_memory(pending.requirements, false)) return false;
+                if (pending.native) report(bound, pending.requirements.size);
+                return true;
+            }) {
+            if (native) report(created, need.size);
+        }
+        ~PendingImageMemory() {
+            if (native && !binding.bound()) report(released_unbound, requirements.size);
+        }
+        // Allocations are private to the image. A released-unbound byte was never allocated by the driver;
+        // pending is the total validated allocation budget of currently unmaterialized native targets.
+        static void report(Event event, std::uint64_t bytes) {
+            static std::atomic<std::uint64_t> counts[3]{}, totals[3]{}, pending{}, events{};
+            counts[event].fetch_add(1, std::memory_order_relaxed);
+            totals[event].fetch_add(bytes, std::memory_order_relaxed);
+            if (event == created) pending.fetch_add(bytes, std::memory_order_relaxed);
+            else pending.fetch_sub(bytes, std::memory_order_relaxed);
+            const auto sequence = events.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (sequence > 16 && sequence % 32 && bytes < (32u << 20)) return;
+            std::fprintf(stderr, "[rt] d3d12: deferred native attachments created=%llu/%lluB bound=%llu/%lluB "
+                "released_unbound=%llu/%lluB pending_bytes=%llu\n",
+                (unsigned long long)counts[created].load(std::memory_order_relaxed),
+                (unsigned long long)totals[created].load(std::memory_order_relaxed),
+                (unsigned long long)counts[bound].load(std::memory_order_relaxed),
+                (unsigned long long)totals[bound].load(std::memory_order_relaxed),
+                (unsigned long long)counts[released_unbound].load(std::memory_order_relaxed),
+                (unsigned long long)totals[released_unbound].load(std::memory_order_relaxed),
+                (unsigned long long)pending.load(std::memory_order_relaxed));
+        }
+    };
+    static bool defer_placed_images(bool native = false) {
+        static const char mode = [] {
+            wchar_t value[2]{};
+            return GetEnvironmentVariableW(L"LEONIDA_PLACED_IMAGE_DEFER", value, 2) == 1 ? char(value[0]) : char(0);
+        }();
+        return native ? mode == '1' : mode != '0';
+    }
+    bool defer_image_memory(const VkMemoryRequirements& requirements, bool native = false) {
+        deferred_memory_.reset(new (std::nothrow) PendingImageMemory(*this, requirements, native));
+        return bool(deferred_memory_);
+    }
+    bool bind_texture_memory(const VkMemoryRequirements& requirements, bool dedicated) {
+        auto& vk = device_.context->vk;
+        VkMemoryPropertyFlags flags{};
+        auto memory = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &flags, false,
+                                       nullptr, dedicated ? image_ : VK_NULL_HANDLE);
+        if (!memory) return false;
+        if (vk.vkBindImageMemory(device_.info.device, image_, memory, 0) != VK_SUCCESS) {
+            vk.vkFreeMemory(device_.info.device, memory, nullptr);
+            return false;
+        }
+        memory_ = memory;
+        memory_flags_ = flags;
+        return true;
+    }
+
     HRESULT cpu_copy(bool write, UINT subresource, const D3D12_BOX* box, void* data, UINT row_pitch,
                      UINT depth_pitch) {
         if (!image_ || !data) return E_INVALIDARG;
         Region r{};
         if (!region(subresource, box, r)) return E_INVALIDARG;
         if (!r.rows || !r.slices) return S_OK;  // an empty box: nothing to copy
+        if (!bound_image()) return E_OUTOFMEMORY;
         // The pitches are not checked, as on the host runtime: rows or slices that overlap (a pitch smaller than a
         // row, or 0) are copied in order, row by row and slice by slice, so on a read the last one wins.
         if (!cpu_visible())
@@ -4626,6 +4711,7 @@ private:
     std::vector<std::byte> shadow_snapshot_, shadow_scratch_;
     bool shadow_captured_ = false;
     VkMemoryPropertyFlags memory_flags_ = 0;
+    std::unique_ptr<PendingImageMemory> deferred_memory_;
     VkAccelerationStructureKHR accel_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
@@ -9620,7 +9706,7 @@ public:
             return;
         }
         write_image_descriptor(*r, view, destination, true);
-        state_.context->note_shader_image(r->id());
+        if (!r->uses_deferred_image_memory()) state_.context->note_shader_image(r->id());
     }
 
     // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
@@ -10045,10 +10131,10 @@ public:
             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
             const D3D12_RESOURCE_STATES initial = state_for_barrier_layout(initial_layout);
             HRESULT hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, nullptr,
-                                                    0, nullptr, riid, out);
+                                                    0, nullptr, riid, out, true);
             if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
                 hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc,
-                                                D3D12_RESOURCE_STATE_COMMON, nullptr, 0, nullptr, riid, out);
+                                                D3D12_RESOURCE_STATE_COMMON, nullptr, 0, nullptr, riid, out, true);
             if (SUCCEEDED(hr) && out && *out) {
                 // The console answers the texture's GetGPUVirtualAddress with the title's address; without it a
                 // title that clears the texture through that pointer writes at address 0 (XCL measured this on a
@@ -11886,14 +11972,17 @@ private:
         };
         if (!described) { report_video(false); return; }
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
+        const VkImage backing = resource.bound_image();
+        if (!backing) return;
         bool ambiguous = false;
-        const bool registered = state_.bind_image(words, image, resource.id(), ambiguous, resource.image(), resource.format(),
+        const bool registered = state_.bind_image(words, image, resource.id(), ambiguous, backing, resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
                                                   resource.uint_backed(), resource.title_r32_reinterpret(),
                                                   resource.packed4444_projection());
         report_video(registered);
         if (ambiguous) return;  // Leave this slot null: writing these words would select the other resource.
-        if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
+        if (registered && (resource.sparse_image() || resource.uses_deferred_image_memory()))
+            state_.context->note_shader_image(resource.id());
         if (!registered && (leonida::gfx10::multisampled(image.type) ||
                             (storage && image.type == leonida::gfx10::ImageType::image_3d))) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
@@ -11904,7 +11993,8 @@ private:
     HRESULT create_committed_validated(const char* method, const D3D12_HEAP_PROPERTIES* heap,
                                        D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* desc,
                                        D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
-                                       UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
+                                       UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out,
+                                       bool title_placement = false) {
         const auto finish = [&](HRESULT hr) { return method ? d3d12_trace::result(method, hr) : hr; };
         if (out) *out = nullptr;
         if (!heap || !desc) return finish(E_INVALIDARG);
@@ -11926,7 +12016,7 @@ private:
                      int(desc->Dimension));
             return finish(E_INVALIDARG);
         }
-        return finish(create_committed(heap, heap_flags, desc, state, castable_count, castable, riid, out));
+        return finish(create_committed(heap, heap_flags, desc, state, castable_count, castable, riid, out, title_placement));
     }
 
     // Shared by CreateCommittedResource, CreateCommittedResource3 and CreateReservedResource*. A castable-format list
@@ -11935,7 +12025,8 @@ private:
     // runtime.
     HRESULT create_committed(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                              const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
-                             UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
+                             UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out,
+                             bool title_placement = false) {
         if (out) *out = nullptr;
         if (!heap || !desc) return E_INVALIDARG;
         if (castable_count && castable && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -11980,7 +12071,7 @@ private:
             } else {
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats);
-                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats, 0, false, title_placement);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
         }
@@ -12311,7 +12402,7 @@ const leonida::DescriptorHeapMirror* descriptor_heap_mirror(ID3D12DescriptorHeap
 
 VkImage vulkan_image(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
-    return r ? r->image() : VK_NULL_HANDLE;
+    return r ? r->bound_image() : VK_NULL_HANDLE;
 }
 
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource) {

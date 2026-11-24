@@ -31,6 +31,7 @@
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
+#include "deferred_image_binding.h"
 #include "frame_draw_activity.h"
 #include "depth24.h"
 #include "uav_clear.h"
@@ -129,6 +130,7 @@ struct ResourceBinding {
     bool packed4444_projection = false;  // a console 16-bit render target backed by a wider native image
     std::uint64_t host_image_address = 0;  // descriptor identity, zero when no bounded identity is available
     std::uintptr_t draw_activity_image = 0;  // diagnostic identity for this native image's registration lifetime
+    DeferredImageBinding* deferred_memory = nullptr;  // owned by the registered resource
 };
 
 struct VulkanAccess {
