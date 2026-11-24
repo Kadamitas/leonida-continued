@@ -10,6 +10,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "shims.h"
@@ -18,9 +19,15 @@
 namespace rt::shims {
 namespace {
 
-std::map<std::string, void*>& table() {
-    static std::map<std::string, void*> t;  // "dll!name"
-    return t;
+struct ShimModule {
+    std::unordered_map<std::string, void*> exports;
+    bool owned = false;
+    bool complete_exports = false;
+};
+
+std::unordered_map<std::string, ShimModule>& modules() {
+    static std::unordered_map<std::string, ShimModule> registered;
+    return registered;
 }
 
 std::string lower_ascii(std::string s) {
@@ -544,25 +551,40 @@ const XMemAllocationHooks* xmem_allocation_hooks() {
     return list.empty() ? nullptr : list.back().hooks;
 }
 
-Table::Table(const Entry* entries, size_t count) {
-    for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
-}
-
-void* find(const std::string& dll_lower, const std::string& name) {
-    auto it = table().find(dll_lower + "!" + name);
-    return it == table().end() ? nullptr : it->second;
-}
-
-bool owns_dll(const std::string& dll_lower) {
+static bool host_module(const std::string& dll_lower) {
     static const char* const host[] = {"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
                                        "vulkan-1.dll", "ntdll.dll", "user32.dll", "ws2_32.dll",
                                        "wsock32.dll"};
-    if (starts_with(dll_lower, "api-ms-") || starts_with(dll_lower, "ext-ms-")) return false;
-    for (const char* h : host)
-        if (dll_lower == h) return false;
-    const std::string prefix = dll_lower + "!";
-    auto it = table().lower_bound(prefix);
-    return it != table().end() && it->first.compare(0, prefix.size(), prefix) == 0;
+    if (starts_with(dll_lower, "api-ms-") || starts_with(dll_lower, "ext-ms-")) return true;
+    for (const char* name : host)
+        if (dll_lower == name) return true;
+    return false;
+}
+
+Table::Table(const Entry* entries, size_t count, bool complete_exports) {
+    for (size_t i = 0; i < count; ++i) {
+        const auto [mod, inserted] = modules().try_emplace(lower_ascii(entries[i].dll));
+        if (inserted) mod->second.owned = !host_module(mod->first);
+        if (complete_exports) mod->second.owned = mod->second.complete_exports = true;
+        mod->second.exports.insert_or_assign(entries[i].name, entries[i].fn);
+    }
+}
+
+void* find(const std::string& dll_lower, const std::string& name) {
+    const auto mod = modules().find(dll_lower);
+    if (mod == modules().end()) return nullptr;
+    const auto entry = mod->second.exports.find(name);
+    return entry == mod->second.exports.end() ? nullptr : entry->second;
+}
+
+bool owns_dll(const std::string& dll_lower) {
+    const auto mod = modules().find(dll_lower);
+    return mod != modules().end() && mod->second.owned;
+}
+
+bool has_complete_exports(const std::string& dll_lower) {
+    const auto mod = modules().find(dll_lower);
+    return mod != modules().end() && mod->second.complete_exports;
 }
 
 void* make_unimplemented_thunk(const std::string& dll, const std::string& name) {

@@ -273,6 +273,10 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         void* shim = dll.empty() ? nullptr : find(dll, what);
         SetLastError(error);
         if (shim) return reinterpret_cast<FARPROC>(shim);
+        if (has_complete_exports(dll)) {
+            SetLastError(ERROR_PROC_NOT_FOUND);
+            return nullptr;
+        }
     }
     return GetProcAddress(module, name);
 }

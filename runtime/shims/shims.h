@@ -14,7 +14,7 @@ struct Entry {
 
 // Registers a static table at startup.
 struct Table {
-    Table(const Entry* entries, size_t count);
+    Table(const Entry* entries, size_t count, bool complete_exports = false);
 };
 
 void* find(const std::string& dll_lower, const std::string& name);
@@ -24,6 +24,8 @@ void* find(const std::string& dll_lower, const std::string& name);
 // LoadLibrary/GetModuleHandle of an owned module gets a pseudo-handle that GetProcAddress resolves through find()
 // (library_loader.cpp). `dll_lower` is a lower-case file name with ".dll".
 bool owns_dll(const std::string& dll_lower);
+// A provider declaring a complete export table handles every lookup of its DLL.
+bool has_complete_exports(const std::string& dll_lower);
 
 // What a call to an import that has no binding does. Chosen by the environment variable LEONIDA_UNIMPLEMENTED
 // (read once, on the first call):
@@ -112,6 +114,9 @@ void report_called_unimplemented();
 
 }  // namespace rt::shims
 
-#define SHIM_TABLE(id, ...)                                                       \
-    static const ::rt::shims::Entry id##_entries[] = {__VA_ARGS__};               \
-    static ::rt::shims::Table id##_table(id##_entries, sizeof(id##_entries) / sizeof(id##_entries[0]))
+#define SHIM_TABLE_IMPL(id, complete, ...)                                           \
+    static const ::rt::shims::Entry id##_entries[] = {__VA_ARGS__};                     \
+    static ::rt::shims::Table id##_table(id##_entries, sizeof(id##_entries) / sizeof(id##_entries[0]), complete)
+
+#define SHIM_TABLE(id, ...) SHIM_TABLE_IMPL(id, false, __VA_ARGS__)
+#define SHIM_OWNED_TABLE(id, ...) SHIM_TABLE_IMPL(id, true, __VA_ARGS__)

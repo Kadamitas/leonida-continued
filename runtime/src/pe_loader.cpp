@@ -2002,6 +2002,8 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
         return p;
     }
 
+    if (shims::has_complete_exports(shim_key)) return nullptr;
+
     const bool by_ordinal = symbol.size() > 1 && symbol[0] == '#';
     uint32_t ordinal = 0;
     if (by_ordinal) {
@@ -2083,6 +2085,10 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
     if (void* p = shims::find(key, sym)) {
         m.imports.push_back({dll, sym, Binding::Shim});
         return p;
+    }
+    if (shims::has_complete_exports(key)) {
+        m.imports.push_back({dll, sym, Binding::Unimplemented});
+        return shims::make_unimplemented_thunk(dll, sym);
     }
     // Bundled game module (an Xbox build that ships beside the game)?
     auto bundled = game_dir_ / dll;

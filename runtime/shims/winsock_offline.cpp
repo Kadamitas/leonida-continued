@@ -85,12 +85,14 @@ int WSAAPI address_info(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA* result) {
 // static ordinal imports and named GetProcAddress. Unknown dynamic exports on the owned pseudo-module fail closed.
 #define WS(name, ordinal, function) \
     {"ws2_32.dll", name, reinterpret_cast<void*>(function)}, \
-    {"ws2_32.dll", "#" #ordinal, reinterpret_cast<void*>(function)}
+    {"ws2_32.dll", "#" #ordinal, reinterpret_cast<void*>(function)}, \
+    {"wsock32.dll", name, reinterpret_cast<void*>(function)}, \
+    {"wsock32.dll", "#" #ordinal, reinterpret_cast<void*>(function)}
 
 }  // namespace
 }  // namespace rt::winsock
 
-SHIM_TABLE(winsock_offline,
+SHIM_OWNED_TABLE(winsock_offline,
     WS("accept", 1, &rt::winsock::accept_offline),
     WS("bind", 2, &rt::winsock::bind_offline),
     WS("closesocket", 3, &rt::winsock::close_offline),
@@ -115,9 +117,9 @@ SHIM_TABLE(winsock_offline,
     {"ws2_32.dll", "WSASend", reinterpret_cast<void*>(&rt::winsock::wsa_send)},
     {"ws2_32.dll", "WSASendTo", reinterpret_cast<void*>(&rt::winsock::wsa_send_to)},
     WS("WSAGetLastError", 111, &::WSAGetLastError),
-    {"ws2_32.dll", "WSASetLastError", reinterpret_cast<void*>(&::WSASetLastError)},
+    WS("WSASetLastError", 112, &::WSASetLastError),
     WS("WSAStartup", 115, &::WSAStartup),
-    {"ws2_32.dll", "WSACleanup", reinterpret_cast<void*>(&::WSACleanup)},
+    WS("WSACleanup", 116, &::WSACleanup),
     {"ws2_32.dll", "WSASocketA", reinterpret_cast<void*>(&rt::winsock::socket_a)},
     {"ws2_32.dll", "WSASocketW", reinterpret_cast<void*>(&rt::winsock::socket_w)},
     WS("__WSAFDIsSet", 151, &::__WSAFDIsSet),

@@ -136,6 +136,12 @@ int main() {
           "guest lookup through a real module handle still gets offline socket");
     check(GetProcAddress(host, "socket") == reinterpret_cast<FARPROC>(&::socket) && sock != &::socket,
           "host Windows export remains unchanged");
+    check(!get_proc(host, "WSAIoctl") && GetLastError() == ERROR_PROC_NOT_FOUND,
+          "unknown guest export also fails through a host Winsock handle");
+    const HMODULE legacy = load(L"wsock32.dll");
+    check(legacy && rt::shims::owns_dll("wsock32.dll") &&
+              get_proc(legacy, MAKEINTRESOURCEA(23)) == reinterpret_cast<FARPROC>(sock),
+          "legacy Winsock has the same guest socket implementation");
     WSASetLastError(1234);
     bool thread_ok = false;
     std::thread thread([&] {
