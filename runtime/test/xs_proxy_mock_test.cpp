@@ -1225,11 +1225,12 @@ int run_env_slots(bool valid) {
     EXPECT(device);
     xs::reset_device_proxy_stats();
     std::uint64_t token = 0;
+    constexpr DWORD timeout_ms = 1000;  // allow the scheduled 16.667 ms origin to arrive
     if (valid) {
         // Every route moved: the new slot is handled, the default slot is forwarded to the mock.
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);
         EXPECT(hr_of(raw(device, 97, 0, 0, 0, 0)) == S_OK && mock->calls[97] == 0);
-        EXPECT(hr_of(raw(device, 98, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
+        EXPECT(hr_of(raw(device, 98, 0, timeout_ms, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
         void* queue = nullptr;
         EXPECT(hr_of(raw(device, 99, word(kXboxQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
         EXPECT(xs::is_queue_proxy(queue) && mock->calls[99] == 0);
@@ -1281,7 +1282,7 @@ int run_env_slots(bool valid) {
         // forwarded unchanged.
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
-        EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
+        EXPECT(hr_of(raw(device, 80, 0, timeout_ms, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
         EXPECT(hr_of(raw(device, 81, 0, 0, 0, 0)) == S_FALSE);  // the default GetFrameStatisticsX slot, unattached
         EXPECT(hr_of(raw(device, 71)) == S_OK && mock->calls[71] == 1);  // not an Xbox slot: forwarded
     }

@@ -28,7 +28,6 @@
 #include "d3d12_title_resource_profile.h"
 #include "xbox_linear_texture.h"
 #include "xmem_pages.h"
-#include "d3d12_com.h"
 #include "d3d12_trace.h"
 #include "shims.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
@@ -4768,9 +4767,6 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 86) {
         return hr_to_u64(proxy_create_pipeline_state(self, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DESC*>(a1),
                                                      reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
-    } else if constexpr (Slot == 101) {
-        return hr_to_u64(proxy_create_state_object(self, reinterpret_cast<const D3D12_STATE_OBJECT_DESC*>(a1),
-                                                   reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 108) {
         return proxy_get_resource_allocation_info2(self, a1, a2, a3, a4, a5,
             reinterpret_cast<std::uint64_t>(_ReturnAddress()));
@@ -4826,16 +4822,20 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
                                                          reinterpret_cast<void**>(a5)));
         }
-        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        if constexpr (Slot == 101) {
+            return hr_to_u64(proxy_create_state_object(self, reinterpret_cast<const D3D12_STATE_OBJECT_DESC*>(a1),
+                                                       reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+        } else {
+            if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
-        // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
-        // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
-        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t);
-        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
-        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+            // Forward the PC vtable entry with its original receiver and register/stack argument positions.
+            using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t);
+            auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
+            return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        }
     }
 }
 
