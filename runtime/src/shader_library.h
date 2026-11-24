@@ -437,17 +437,26 @@ inline std::string sha256_hex(std::span<const std::uint8_t> data) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// This exact compute module uses only three type-selected OpImageWrite instructions at set 0
+// Each reviewed compute module uses only three type-selected OpImageWrite instructions at set 0
 // storage-image bindings 17/18/19. Its sampled-image variable is never used. Check the words fed
 // to Vulkan so a different translation of the same guest program takes the ordinary full-scan path.
 inline bool compute_module_excludes_sampled_images(std::span<const std::uint32_t> words) {
-    if (words.size_bytes() != 123252) return false;
+    static constexpr std::pair<std::size_t, std::string_view> modules[] = {
+        {86840, "c83ee055babd395f0701586fd962a7b94672657f523eb38d2872803c97528320"},
+        {123252, "db1c7be6f1d31a2af849ddfbd653d3a270e004acd8a2529e402086a9b60256eb"},
+    };
     try {
-        const std::span bytes(reinterpret_cast<const std::uint8_t*>(words.data()), words.size_bytes());
-        return sha256_hex(bytes) == "db1c7be6f1d31a2af849ddfbd653d3a270e004acd8a2529e402086a9b60256eb";
+        std::string digest;
+        for (const auto& [size, expected] : modules) {
+            if (words.size_bytes() != size) continue;
+            if (digest.empty())
+                digest = sha256_hex({reinterpret_cast<const std::uint8_t*>(words.data()), size});
+            if (digest == expected) return true;
+        }
     } catch (const std::bad_alloc&) {
         return false;
     }
+    return false;
 }
 
 // DXBC containers and the FSSM program
