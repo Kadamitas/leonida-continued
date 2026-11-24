@@ -11308,6 +11308,16 @@ private:
         // texture. Slot 25 may request that footprint before slot 70 supplies the resolved 0x105 layout.
         // Ordinary PC queries and creation-time native memory requirements keep their independent rules.
         const bool implicit_sampled = xbox_query && title_implicit_sampled_4ks_query(desc);
+        if (xbox_query && title_sampled_volume_4ks_query(desc) && title_linear_texture_enabled()) {
+            const auto native = title_linear_native_desc(desc);
+            const auto format = state_.texture_format(native);
+            const auto volume = title_volume_shadow(desc, format);
+            if (!volume || !state_.sampled_usable(format.format) ||
+                FAILED(state_.check_image_support(TextureCreateInfo(native, format, false).info)))
+                return kInvalidAllocation;
+            const UINT64 alignment = std::max<UINT64>(align_4k, desc.Alignment);
+            return {align_up(volume->tiled_bytes, alignment), alignment};
+        }
         if (title_linear_texture_enabled() &&
             (implicit_sampled || title_sampled_4ks_texture_shape(desc) || title_default_bc_texture_shape(desc) ||
              title_display_bc_texture_shape(desc))) {

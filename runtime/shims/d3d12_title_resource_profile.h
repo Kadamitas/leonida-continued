@@ -163,6 +163,16 @@ inline constexpr bool title_implicit_sampled_4ks_query(const D3D12_RESOURCE_DESC
     return desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN && title_sampled_2d_texture_shape(desc, true);
 }
 
+// The single-mip float16 RDS5 volumes use thick SW_4KB_S tiles, including padding on the depth axis.
+inline constexpr bool title_sampled_volume_4ks_query(const D3D12_RESOURCE_DESC& desc) {
+    return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && desc.MipLevels == 1 &&
+        desc.SampleDesc.Count == 1 && !desc.SampleDesc.Quality &&
+        (desc.Format == DXGI_FORMAT_R16_FLOAT || desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) &&
+        (desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN || UINT(desc.Layout) == 0x105) &&
+        (!desc.Alignment || desc.Alignment == 4096 || desc.Alignment == 65536) &&
+        (desc.Flags == D3D12_RESOURCE_FLAG_NONE || UINT(desc.Flags) == kTitleTextureMetadata);
+}
+
 inline constexpr bool title_sampled_bc_format(DXGI_FORMAT format) {
     switch (format) {
     case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:

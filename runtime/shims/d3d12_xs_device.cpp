@@ -3946,7 +3946,8 @@ bool observed_linear_texture_enabled(const D3D12_RESOURCE_DESC& desc, bool alloc
            (rt::d3d12::title_linear_texture_shape(desc) || rt::d3d12::title_default_bc_texture_shape(desc) ||
             rt::d3d12::title_display_bc_texture_shape(desc) ||
             (allocation_query && (rt::d3d12::title_sampled_4ks_texture_shape(desc) ||
-                                  rt::d3d12::title_implicit_sampled_4ks_query(desc))));
+                                  rt::d3d12::title_implicit_sampled_4ks_query(desc) ||
+                                  rt::d3d12::title_sampled_volume_4ks_query(desc))));
 }
 
 // PR #7201's console slot uses packed 56-byte DESC entries, not the PC's 64-byte DESC1 array. Both hidden-return
@@ -3958,8 +3959,16 @@ void trace_small_texture_query(unsigned slot, const D3D12_RESOURCE_DESC* descs, 
         wchar_t value[2]{};
         return GetEnvironmentVariableW(L"LEONIDA_TRACE_TEXTURE_RANGES", value, 2) == 1 && value[0] == L'1';
     }();
-    if (!trace || count != 1 || !descs || descs->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-        descs->Height > 16 || descs->Width < 32) return;
+    if (!trace || count != 1 || !descs) return;
+    if (descs->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        std::fprintf(stderr, "[rt] d3d12_xs: volume allocation slot=%u size=%llux%ux%u mips=%u format=%u "
+                     "layout=0x%x flags=0x%x bytes=%llu alignment=%llu\n", slot,
+                     static_cast<unsigned long long>(descs->Width), descs->Height, unsigned(descs->DepthOrArraySize),
+                     unsigned(descs->MipLevels), unsigned(descs->Format), unsigned(descs->Layout), unsigned(descs->Flags),
+                     static_cast<unsigned long long>(result.SizeInBytes), static_cast<unsigned long long>(result.Alignment));
+        return;
+    }
+    if (descs->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || descs->Height > 16 || descs->Width < 32) return;
     std::fprintf(stderr, "[rt] d3d12_xs: texture allocation slot=%u size=%llux%u format=%u layout=0x%x "
                  "bytes=%llu alignment=%llu\n", slot, static_cast<unsigned long long>(descs->Width),
                  descs->Height, unsigned(descs->Format), unsigned(descs->Layout),
