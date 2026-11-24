@@ -995,6 +995,8 @@ struct DeviceState {
     struct TitleImageCollision {
         std::uint64_t address = 0, bytes = 0;
         const char* kind = "none";
+        std::uint64_t allocation = 0;
+        bool physical = false;
     };
     bool title_image_overlap_locked(std::uint64_t address, std::uint64_t bytes,
                                     DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN, UINT depth_metadata = 0,
@@ -1003,7 +1005,7 @@ struct DeviceState {
             const auto allocation = it->second.lock();
             if (!allocation) { it = title_images.erase(it); continue; }
             if (ranges_overlap(address, bytes, it->first, allocation->guest_bytes)) {
-                if (collision) *collision = {it->first, allocation->guest_bytes, "native image"};
+                if (collision) *collision = {it->first, allocation->guest_bytes, "native image", allocation->serial};
                 return true;
             }
             ++it;
@@ -1014,7 +1016,7 @@ struct DeviceState {
             const bool same_projection = depth_metadata && allocation->depth_projection_format == depth_format &&
                 allocation->depth_projection_metadata == depth_metadata;
             if (!same_projection && ranges_overlap(address, bytes, it->first, allocation->guest_bytes)) {
-                if (collision) *collision = {it->first, allocation->guest_bytes, "independent depth image"};
+                if (collision) *collision = {it->first, allocation->guest_bytes, "independent depth image", allocation->serial};
                 return true;
             }
             ++it;
@@ -1028,11 +1030,16 @@ struct DeviceState {
         return ranges_overlap(address, bytes, other, length) &&
             (address == other || !physical_snapshot || !other_snapshot);
     }
-    bool linear_image_overlap_locked(std::uint64_t address, std::uint64_t bytes, bool physical_snapshot = false) const {
-        return std::any_of(title_image_resources.begin(), title_image_resources.end(), [&](const auto& entry) {
-            return entry.second.linear_bytes && conflicting_host_range(address, bytes, physical_snapshot,
-                entry.first, entry.second.linear_bytes, entry.second.physical_snapshot);
-        });
+    bool linear_image_overlap_locked(std::uint64_t address, std::uint64_t bytes, bool physical_snapshot = false,
+                                     TitleImageCollision* collision = nullptr) const {
+        for (const auto& [start, image] : title_image_resources) {
+            if (!image.linear_bytes || !conflicting_host_range(address, bytes, physical_snapshot,
+                start, image.linear_bytes, image.physical_snapshot)) continue;
+            if (collision) *collision = {start, image.linear_bytes, "host-backed placed image",
+                reinterpret_cast<std::uintptr_t>(image.resource), image.physical_snapshot};
+            return true;
+        }
+        return false;
     }
     bool register_title_host_range(leonida::ResourceId id, std::uint64_t address, std::uint64_t bytes,
                                   const char* kind, std::uint64_t addressable_bytes,
@@ -1052,10 +1059,12 @@ struct DeviceState {
                 static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(addressable_bytes));
         return true;
     }
-    bool register_title_address_view(std::uint64_t address, std::uint64_t bytes, bool physical_snapshot = false) {
+    bool register_title_address_view(std::uint64_t address, std::uint64_t bytes, bool physical_snapshot = false,
+                                     TitleImageCollision* collision = nullptr) {
         if (!address || !bytes || bytes > UINT64_MAX - address) return false;
         std::lock_guard lock(title_placement_mutex);
-        if (title_image_overlap_locked(address, bytes) || linear_image_overlap_locked(address, bytes, physical_snapshot)) return false;
+        if (title_image_overlap_locked(address, bytes, DXGI_FORMAT_UNKNOWN, 0, collision) ||
+            linear_image_overlap_locked(address, bytes, physical_snapshot, collision)) return false;
         auto [it, inserted] = title_address_views.try_emplace(address, AddressView{bytes, physical_snapshot});
         if (!inserted) {
             it->second.bytes = std::max(it->second.bytes, bytes);
@@ -1895,9 +1904,11 @@ struct DeviceState {
         return true;
     }
 
-    bool owns_image_key(leonida::ResourceId owner, const leonida::DescriptorKey& key) {
+    bool owns_image_key(leonida::ResourceId owner, const leonida::DescriptorKey& key,
+                        leonida::ResourceId* actual_owner = nullptr) {
         std::lock_guard lock(descriptor_mutex);
         const auto found = image_entries.find(key);
+        if (actual_owner) *actual_owner = found == image_entries.end() ? 0 : found->second.address;
         return found != image_entries.end() && found->second.address == owner;
     }
 
@@ -13333,6 +13344,32 @@ HRESULT create_console_sampler(ID3D12Device* device, std::span<const std::uint32
 }
 
 namespace {
+HRESULT sampled_view_failure(const char* stage, HRESULT hr, std::uint64_t address,
+                             const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view,
+                             std::size_t source_bytes = 0, const DeviceState::TitleImageCollision& collision = {},
+                             int backing = -1, leonida::ResourceId expected = 0, leonida::ResourceId actual = 0) {
+    static std::atomic<unsigned> reports{};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+        // The view union is copied as bytes so diagnostics never select an inactive dimension.
+        std::array<std::uint32_t, 6> args{};
+        static_assert(offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Texture2D) + sizeof(args) <= sizeof(view));
+        std::memcpy(args.data(), &view.Texture2D, sizeof(args));
+        std::fprintf(stderr, "[rt] d3d12: sampled address SRV refused stage=%s hr=0x%08x va=0x%llx bytes=%zu "
+            "resource=%u/%llux%ux%u/mips%u/fmt%u/layout0x%x/flags0x%x/align%llu/samples%u:%u "
+            "view=%u/fmt%u/map0x%x args=%x,%x,%x,%x,%x,%x source_snapshot=%d "
+            "collider=%s/va0x%llx/bytes%llu/allocation0x%llx/physical%u key_owner=0x%llx expected=0x%llx\n",
+            stage, unsigned(hr), static_cast<unsigned long long>(address), source_bytes, unsigned(resource.Dimension),
+            static_cast<unsigned long long>(resource.Width), resource.Height, unsigned(resource.DepthOrArraySize),
+            unsigned(resource.MipLevels), unsigned(resource.Format), unsigned(resource.Layout), unsigned(resource.Flags),
+            static_cast<unsigned long long>(resource.Alignment), resource.SampleDesc.Count, resource.SampleDesc.Quality,
+            unsigned(view.ViewDimension), unsigned(view.Format), view.Shader4ComponentMapping, args[0], args[1], args[2],
+            args[3], args[4], args[5], backing, collision.kind, static_cast<unsigned long long>(collision.address),
+            static_cast<unsigned long long>(collision.bytes), static_cast<unsigned long long>(collision.allocation),
+            unsigned(collision.physical), static_cast<unsigned long long>(actual), static_cast<unsigned long long>(expected));
+    }
+    return hr;
+}
+
 HRESULT create_live_title_texture_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& resource,
                                        const D3D12_SHADER_RESOURCE_VIEW_DESC& view, std::uint64_t address,
                                        D3D12_CPU_DESCRIPTOR_HANDLE destination) {
@@ -13363,15 +13400,20 @@ HRESULT create_live_title_texture_view(ID3D12Device* device, const D3D12_RESOURC
                     (resource.Flags != native.Flags && UINT(resource.Flags) != legacy_flags &&
                      UINT(resource.Flags) != candidate->title_depth_projection_metadata())) continue;
                 // There is no principled newest-by-VA choice for two identical native resource descriptions.
-                if (texture) return E_NOTIMPL;
+                if (texture) return sampled_view_failure("ambiguous depth owners", E_NOTIMPL, address, resource, view);
                 texture = candidate;
             }
-            if (!texture)
-                return state.title_image_overlap_locked(address, 1) || state.linear_image_overlap_locked(address, 1, true)
-                    ? E_NOTIMPL : S_FALSE;
+            if (!texture) {
+                DeviceState::TitleImageCollision collision{};
+                if (state.title_image_overlap_locked(address, 1, DXGI_FORMAT_UNKNOWN, 0, &collision) ||
+                    state.linear_image_overlap_locked(address, 1, true, &collision))
+                    return sampled_view_failure("base inside live placement", E_NOTIMPL, address, resource, view, 1, collision);
+                return S_FALSE;
+            }
         }
         // Final Release unpublishes before delete under this mutex. CAS never revives a zero reference count.
-        if (!texture->pin_title_image()) return E_NOTIMPL;
+        if (!texture->pin_title_image())
+            return sampled_view_failure("live placement retiring", E_NOTIMPL, address, resource, view);
     }
     const auto release = [](Resource* value) { value->Release(); };
     const std::unique_ptr<Resource, decltype(release)> pinned(texture, release);
@@ -13562,8 +13604,10 @@ HRESULT create_live_title_texture_view(ID3D12Device* device, const D3D12_RESOURC
     d->CreateShaderResourceView(texture, &view, destination);
     leonida::DescriptorKey key{};
     std::memcpy(key.data(), reinterpret_cast<const void*>(destination.ptr), sizeof(key));
-    if (!state.owns_image_key(texture->id(), key))
-        return refuse("native view not registered");
+    leonida::ResourceId actual = 0;
+    if (!state.owns_image_key(texture->id(), key, &actual))
+        return sampled_view_failure(actual ? "live descriptor key collision" : "live descriptor key missing",
+            E_NOTIMPL, address, resource, view, 0, {}, -1, texture->id(), actual);
     static std::atomic<unsigned> creations{0};
     if (creations.fetch_add(1, std::memory_order_relaxed) < 8)
         std::fprintf(stderr, "[rt] d3d12: registered live native title SRV va=0x%llx format=%u\n",
@@ -13576,7 +13620,8 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                                         D3D12_CPU_DESCRIPTOR_HANDLE destination) {
     char mode[32]{};
     if (GetEnvironmentVariableA("LEONIDA_XBOX_TEXTURE_LAYOUT", mode, sizeof(mode)) != 15 ||
-        std::strcmp(mode, "observed_r8_4ks") != 0) return E_NOTIMPL;
+        std::strcmp(mode, "observed_r8_4ks") != 0)
+        return sampled_view_failure("texture layout mode", E_NOTIMPL, address, resource, view);
     const bool r8_atlas = resource.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         resource.Format == DXGI_FORMAT_R8_UNORM && resource.Width == 256 && resource.Height == 128;
     const Format format = texture_storage_format(resource.Format, false);
@@ -13629,7 +13674,11 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
             view.TextureCubeArray.ResourceMinLODClamp == 0 && view.TextureCubeArray.First2DArrayFace < faces &&
             view.TextureCubeArray.First2DArrayFace % 6 == 0 && view.TextureCubeArray.NumCubes > 0 &&
             view.TextureCubeArray.NumCubes <= (faces - view.TextureCubeArray.First2DArrayFace) / 6;
-    if (!view_usable || (!r8_atlas && !single_color && !linear_layout && !volume && !tiled_layout) ||
+    const auto failure = [&](const char* stage, HRESULT hr) {
+        return sampled_view_failure(stage, hr, address, resource, view, source_bytes);
+    };
+    if (!view_usable) return failure("view dimensions, mip range, plane or LOD", E_NOTIMPL);
+    if ((!r8_atlas && !single_color && !linear_layout && !volume && !tiled_layout) ||
         (faces != 1 && !array_view && !volume && !(is_volume && tiled_layout)) ||
         (!tiled_layout && !linear_layout && resource.MipLevels != 1) ||
         resource.SampleDesc.Count != 1 ||
@@ -13638,11 +13687,11 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
         static_cast<UINT>(resource.Flags) != 0x300000 ||
         view.Format != resource.Format || !address ||
         address % (linear_layout ? std::max<UINT64>(256, resource.Alignment) : display_bc ? 65536u : 4096u) ||
-        address > UINTPTR_MAX - source_bytes) return E_NOTIMPL;
-    if (!writable_descriptor(destination)) return E_POINTER;
+        address > UINTPTR_MAX - source_bytes) return failure("resource shape, flags, layout or source span", E_NOTIMPL);
+    if (!writable_descriptor(destination)) return failure("descriptor destination", E_POINTER);
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     auto* d = Device::from<Device>(real ? real : device);
-    if (!d) return E_INVALIDARG;
+    if (!d) return failure("device", E_INVALIDARG);
     auto& state = d->state();
     try {
         // Reserve the CPU source span atomically with the overlap check. A later native image cannot claim it
@@ -13651,7 +13700,10 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
             rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(address), source_bytes) :
             rt::xmem::SparseTextureSnapshot::untracked;
         const bool physical_snapshot = backing == rt::xmem::SparseTextureSnapshot::ready;
-        if (!state.register_title_address_view(address, source_bytes, physical_snapshot)) return E_NOTIMPL;
+        DeviceState::TitleImageCollision collision{};
+        if (!state.register_title_address_view(address, source_bytes, physical_snapshot, &collision))
+            return sampled_view_failure("source range registration", E_NOTIMPL, address, resource, view, source_bytes,
+                                        collision, int(backing));
         std::lock_guard cache_lock(state.host_static_texture_mutex);
         const auto [first, last] = state.host_static_textures.equal_range(address);
         auto found = std::find_if(first, last, [&](const auto& row) {
@@ -13670,7 +13722,7 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                         return sibling.sampled_tile_bytes() == 4096 &&
                             sibling.desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && sibling.desc().DepthOrArraySize == 1;
                     });
-                if (!aliasable) return E_NOTIMPL;
+                if (!aliasable) return failure("incompatible cached shape at same address", E_NOTIMPL);
             }
             auto desc = resource;
             desc.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -13690,19 +13742,20 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
             HRESULT hr = texture->create_texture(texture_storage_format(desc.Format, false), {},
                 cube_faces ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0, true);
             if (FAILED(hr)) {
-                log_once("address SRV native image creation failed (HRESULT)", int(hr));
-                return hr;
+                return failure("native image creation", hr);
             }
             const auto* source = reinterpret_cast<const void*>(address);
             if (linear_layout) {
                 if (!physical_snapshot && (backing != rt::xmem::SparseTextureSnapshot::untracked ||
-                    !linear_texture_cpu_writable(source, source_bytes))) return E_INVALIDARG;
+                    !linear_texture_cpu_writable(source, source_bytes)))
+                    return sampled_view_failure("linear CPU backing unavailable", E_INVALIDARG, address, resource, view,
+                                                source_bytes, {}, int(backing));
                 hr = texture->enable_linear_texture_shadow(source, *linear_layout, resource.Alignment, physical_snapshot, true);
             } else hr = tiled_layout ? texture->enable_tiled_texture_shadow(source, *tiled_layout) :
                 texture->enable_static_texture_shadow(source);
             if (FAILED(hr)) {
-                log_once("address SRV texture upload setup failed (HRESULT)", int(hr));
-                return hr;
+                return sampled_view_failure("texture upload setup", hr, address, resource, view, source_bytes,
+                                            {}, int(backing));
             }
             found = state.host_static_textures.emplace_hint(last, address, DeviceState::CachedTexture{std::move(owner), bc_bytes});
             if (tiled_layout)
@@ -13726,9 +13779,13 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
         d->CreateShaderResourceView(texture, &view, destination);
         leonida::DescriptorKey key{};
         std::memcpy(key.data(), reinterpret_cast<const void*>(destination.ptr), sizeof(key));
-        return state.owns_image_key(texture->id(), key) ? S_OK : E_NOTIMPL;
+        leonida::ResourceId actual = 0;
+        if (!state.owns_image_key(texture->id(), key, &actual))
+            return sampled_view_failure(actual ? "sampled descriptor key collision" : "sampled descriptor key missing",
+                E_NOTIMPL, address, resource, view, source_bytes, {}, int(backing), texture->id(), actual);
+        return S_OK;
     } catch (const std::bad_alloc&) {
-        return E_OUTOFMEMORY;
+        return failure("cache allocation", E_OUTOFMEMORY);
     }
 }
 }  // namespace
