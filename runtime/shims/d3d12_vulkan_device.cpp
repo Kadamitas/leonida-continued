@@ -983,7 +983,7 @@ struct DeviceState {
     std::map<std::uint64_t, TitleImageResource> title_image_resources;
     std::multimap<std::uint64_t, TitleImageResource> title_depth_image_resources;
     struct HostRange { std::uint64_t address, bytes; bool physical_snapshot, sampled_shadow; };
-    struct AddressView { std::uint64_t bytes; bool physical_snapshot; };
+    struct AddressView { std::uint64_t bytes; bool physical_snapshot, buffer_srv, texture_srv; };
     std::map<leonida::ResourceId, HostRange> title_host_ranges;
     // Address-only views have no resource lifetime to follow. Remember their ranges conservatively until the
     // device goes away rather than later accepting an unrelated optimal-image alias over those CPU bytes.
@@ -1081,33 +1081,66 @@ struct DeviceState {
         return true;
     }
     bool register_title_address_view(std::uint64_t address, std::uint64_t bytes, bool physical_snapshot = false,
-                                     TitleImageCollision* collision = nullptr) {
+                                     TitleImageCollision* collision = nullptr, bool buffer_srv = false) {
         if (!address || !bytes || bytes > UINT64_MAX - address) return false;
         std::lock_guard lock(title_placement_mutex);
         if (title_image_overlap_locked(address, bytes, DXGI_FORMAT_UNKNOWN, 0, collision) ||
             linear_image_overlap_locked(address, bytes, physical_snapshot, collision)) return false;
-        if (!physical_snapshot)
-            for (const auto& [start, protected_bytes] : sampled_alias_spans)
-                if (ranges_overlap(address, bytes, start, protected_bytes)) return false;
-        auto [it, inserted] = title_address_views.try_emplace(address, AddressView{bytes, physical_snapshot});
+        if (!physical_snapshot) {
+            for (const auto& [start, protected_bytes] : sampled_alias_spans) {
+                if (!ranges_overlap(address, bytes, start, protected_bytes)) continue;
+                // A buffer SRV only describes a read. Any writable physical import is separately registered and
+                // remains excluded. Require the entire descriptor span to belong to the XMem store right now.
+                if (!buffer_srv || rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(address), bytes) !=
+                    rt::xmem::SparseTextureSnapshot::ready) return false;
+                physical_snapshot = true;
+                break;
+            }
+        }
+        auto [it, inserted] = title_address_views.try_emplace(address, AddressView{bytes, physical_snapshot, buffer_srv, !buffer_srv});
         if (!inserted) {
             it->second.bytes = std::max(it->second.bytes, bytes);
             it->second.physical_snapshot &= physical_snapshot;
+            it->second.buffer_srv |= buffer_srv;
+            it->second.texture_srv |= !buffer_srv;
         }
         return true;
     }
     // Called with the sampled-image cache locked after image, caller reference and cache node are ready.
     // Change placement protection only on successful publication, under the native placement/host range lock.
-    bool reserve_sampled_alias(std::uint64_t start, std::uint64_t bytes) {
+    bool reserve_sampled_alias(std::uint64_t start, std::uint64_t bytes, TitleImageCollision& conflict) {
         std::lock_guard lock(title_placement_mutex);
         auto source = title_address_views.find(start);
-        if (source == title_address_views.end() || !source->second.physical_snapshot ||
-            title_image_overlap_locked(start, bytes) || linear_image_overlap_locked(start, bytes, true)) return false;
-        for (const auto& [id, range] : title_host_ranges)
-            if (ranges_overlap(start, bytes, range.address, range.bytes) &&
-                (!range.physical_snapshot || !range.sampled_shadow)) return false;
-        for (const auto& [base, view] : title_address_views)
-            if (ranges_overlap(start, bytes, base, view.bytes) && !view.physical_snapshot) return false;
+        if (source == title_address_views.end()) {
+            conflict = {start, 0, "no previous source registration"};
+            return false;
+        }
+        if (title_image_overlap_locked(start, bytes, DXGI_FORMAT_UNKNOWN, 0, &conflict) ||
+            linear_image_overlap_locked(start, bytes, true, &conflict)) return false;
+        for (const auto& [id, range] : title_host_ranges) {
+            if (!ranges_overlap(start, bytes, range.address, range.bytes) ||
+                (range.physical_snapshot && range.sampled_shadow)) continue;
+            conflict = {range.address, range.bytes, range.sampled_shadow ? "untracked sampled shadow" : "other host resource",
+                        id, range.physical_snapshot};
+            return false;
+        }
+        for (const auto& [base, view] : title_address_views) {
+            if (!ranges_overlap(start, bytes, base, view.bytes) || view.physical_snapshot) continue;
+            // Address-view history describes reads only. A buffer SRV may never have needed a physical snapshot,
+            // or an earlier view at this VA may have recorded a shorter/untracked range. Revalidate its entire
+            // recorded extent, not just the intersection, without changing provenance for later calls.
+            const auto backing = rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(base), view.bytes);
+            const char* kind = view.buffer_srv && view.texture_srv ? "buffer and texture SRVs" :
+                view.buffer_srv ? "buffer SRV" : "texture SRV";
+            if (backing != rt::xmem::SparseTextureSnapshot::ready) {
+                conflict = {base, view.bytes, kind};
+                return false;
+            }
+            static std::atomic<unsigned> reports{};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] d3d12: revalidated read-only %s span va=0x%llx bytes=%llu for sampled alias\n",
+                    kind, static_cast<unsigned long long>(base), static_cast<unsigned long long>(view.bytes));
+        }
         auto& protected_bytes = sampled_alias_spans[start];
         protected_bytes = std::max(protected_bytes, bytes);
         source->second.bytes = std::max(source->second.bytes, bytes);
@@ -3293,7 +3326,7 @@ public:
         return S_OK;
     }
 
-    HRESULT enable_static_texture_shadow(const void* source) {
+    HRESULT enable_static_texture_shadow(const void* source, bool physical) {
         const bool r8_atlas = desc_.Format == DXGI_FORMAT_R8_UNORM && desc_.Width == 256 && desc_.Height == 128;
         const Format format = texture_storage_format(desc_.Format, false);
         const auto volume = title_volume_shadow(desc_, format);
@@ -3310,14 +3343,14 @@ public:
         const std::size_t upload_layer_bytes = volume ? volume->packed_bytes :
             (layer_bytes + 3) & ~std::size_t(3);
         const std::size_t source_span = layers > 1 ? std::size_t(layers) * 4096 : bytes;
-        const HRESULT staged = allocate_texture_shadow(source, source_span, upload_layer_bytes * layers);
+        const HRESULT staged = allocate_texture_shadow(source, source_span, upload_layer_bytes * layers, physical);
         if (FAILED(staged)) return staged;
         shadow_snapshot_.resize(bytes);
         shadow_scratch_.resize(bytes);
         image_address_ = reinterpret_cast<std::uintptr_t>(source);
         binding_.host_image_address = image_address_;
         binding_.host_shadow_layer_bytes = upload_layer_bytes;
-        binding_.host_shadow_prepare = [this, layers, layer_bytes, upload_layer_bytes, volume] {
+        binding_.host_shadow_prepare = [this, layers, layer_bytes, upload_layer_bytes, volume, physical] {
             for (UINT layer = 0; layer < layers; ++layer) {
                 SIZE_T read = 0;
                 // A one-mip 1x1 uncompressed SW_4KB_S slice occupies one 4096-byte block at every admitted BPE.
@@ -3329,7 +3362,8 @@ public:
                 const std::span<std::byte> destination{shadow_scratch_.data() + std::size_t(layer) * layer_bytes,
                     layer_bytes};
                 const auto sparse = rt::xmem::snapshot_sparse_texture(source, destination);
-                if (sparse == rt::xmem::SparseTextureSnapshot::failed) return false;
+                if (sparse == rt::xmem::SparseTextureSnapshot::failed ||
+                    (physical && sparse == rt::xmem::SparseTextureSnapshot::untracked)) return false;
                 if (sparse == rt::xmem::SparseTextureSnapshot::untracked &&
                     (!ReadProcessMemory(GetCurrentProcess(), source, destination.data(), destination.size(), &read) ||
                      read != destination.size())) return false;
@@ -9044,7 +9078,7 @@ public:
             }
             buffer.oob_select = leonida::gfx10::OobSelect::structured;
         }
-        if (!state_.register_title_address_view(base_va, width)) return E_NOTIMPL;
+        if (!state_.register_title_address_view(base_va, width, false, nullptr, true)) return E_NOTIMPL;
         const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         return S_OK;
@@ -9858,11 +9892,14 @@ public:
                                 decltype(state_.host_static_textures) staged;
                                 const auto row = staged.emplace(start,
                                     DeviceState::CachedTexture{std::move(owner), std::size_t(guest_bytes)});
-                                if (state_.reserve_sampled_alias(start, guest_bytes)) {
+                                DeviceState::TitleImageCollision conflict{};
+                                if (state_.reserve_sampled_alias(start, guest_bytes, conflict)) {
                                     state_.host_static_textures.insert(last, staged.extract(row));
                                     *out = reference.release();
                                     return d3d12_trace::result(method, hr);
                                 }
+                                DeviceState::sampled_placement_failure("physical cached alias reserve", E_NOTIMPL, start,
+                                                                     guest_bytes, true, conflict);
                             }
                         } catch (const std::bad_alloc&) { return d3d12_trace::result(method, E_OUTOFMEMORY); }
                         report_sampled_siblings(start, first, last, int(backing), distinct);
@@ -13821,9 +13858,9 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
     try {
         // Reserve the CPU source span atomically with the overlap check. A later native image cannot claim it
         // between this check and descriptor publication; address-only views conservatively live until teardown.
-        const auto backing = (tiled_layout || linear_layout) ?
-            rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(address), source_bytes) :
-            rt::xmem::SparseTextureSnapshot::untracked;
+        // Legacy singleton/atlas captures also read through the XMem store. Classify their declared source
+        // exactly like linear and tiled captures; an ordinary range remains untracked and cannot share a placement.
+        const auto backing = rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(address), source_bytes);
         const bool physical_snapshot = backing == rt::xmem::SparseTextureSnapshot::ready;
         std::lock_guard cache_lock(state.host_static_texture_mutex);
         const auto [first, last] = state.host_static_textures.equal_range(address);
@@ -13887,7 +13924,7 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                                                 source_bytes, {}, int(backing));
                 hr = texture->enable_linear_texture_shadow(source, *linear_layout, resource.Alignment, physical_snapshot, true);
             } else hr = tiled_layout ? texture->enable_tiled_texture_shadow(source, *tiled_layout) :
-                texture->enable_static_texture_shadow(source);
+                texture->enable_static_texture_shadow(source, physical_snapshot);
             if (FAILED(hr)) {
                 return sampled_view_failure("texture upload setup", hr, address, resource, view, source_bytes,
                                             {}, int(backing));
@@ -13903,10 +13940,11 @@ HRESULT create_observed_static_texture_view(ID3D12Device* device, const D3D12_RE
                         E_NOTIMPL, address, resource, view, source_bytes, {}, int(backing), texture->id(), actual);
                 CachedTextures staged;
                 const auto row = staged.emplace(address, DeviceState::CachedTexture{std::move(owner), bc_bytes});
-                if (!state.reserve_sampled_alias(address, source_bytes)) {
+                DeviceState::TitleImageCollision conflict{};
+                if (!state.reserve_sampled_alias(address, source_bytes, conflict)) {
                     report_sampled_siblings(address, first, last, int(backing), true);
                     return sampled_view_failure("physical sampled alias overlaps an incompatible owner", E_NOTIMPL,
-                                                address, resource, view, source_bytes, {}, int(backing));
+                                                address, resource, view, source_bytes, conflict, int(backing));
                 }
                 state.host_static_textures.insert(last, staged.extract(row));
                 std::memcpy(reinterpret_cast<void*>(destination.ptr), staged_key.data(), sizeof(staged_key));
