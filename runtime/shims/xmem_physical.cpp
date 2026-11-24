@@ -100,6 +100,8 @@ struct Chunk {
 struct Slot {
     bool allocated = false;
     bool needs_zero = false;
+    std::uint16_t physical_store_writes = 0;
+    std::uint32_t allocation_epoch = 0;
     std::vector<uintptr_t> mapped_at;
 };
 
@@ -418,6 +420,8 @@ BOOL WINAPI XMemAllocatePhysicalPages(ULONG64 attributes, ULONG_PTR* count, ULON
                 s.needs_zero = false;
             }
             s.allocated = true;
+            if (s.allocation_epoch != UINT32_MAX) ++s.allocation_epoch;
+            s.physical_store_writes = 0;
             page_array[i] = frame_of(slot);
         }
         return TRUE;
@@ -855,6 +859,25 @@ bool alias_physical_page_ranges(std::span<const rt::xmem::PhysicalPageAliasRange
     }
 }
 
+rt::xmem::PhysicalPageIdentity physical_page_identity(const void* source) noexcept {
+    using State = rt::xmem::PhysicalPageState;
+    const auto page = reinterpret_cast<uintptr_t>(source) & ~(kPage - 1);
+    const std::lock_guard lock(g_mutex);
+    uintptr_t base = 0;
+    size_t index = 0;
+    const auto* region = region_of(page, 1, base, index);
+    if (!region) return {};
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(source, &info, sizeof(info))) return {State::inconsistent};
+    const auto entry = region->page[index];
+    if (!entry) return {info.State == MEM_RESERVE ? State::reserved : State::inconsistent};
+    if (entry > g_slots.size() || !g_slots[entry - 1].allocated || info.State != MEM_COMMIT ||
+        info.Type != MEM_MAPPED || reinterpret_cast<uintptr_t>(info.AllocationBase) != page ||
+        (info.Protect & PAGE_GUARD)) return {State::inconsistent};
+    const auto& slot = g_slots[entry - 1];
+    return {State::mapped, frame_of(entry - 1), slot.allocation_epoch, slot.physical_store_writes};
+}
+
 rt::xmem::PhysicalCpuView find_physical_cpu_view(const void* source, std::size_t size) noexcept {
     rt::xmem::PhysicalCpuView view;
     const auto address = reinterpret_cast<uintptr_t>(source);
@@ -1033,6 +1056,8 @@ const bool g_registered = (rt::xmem::set_physical_reserve(&reserve_physical),
                            rt::xmem::set_placeholder_reserve(&reserve_placeholder),
                            rt::xmem::detail::physical_page_alias_handler.store(&alias_physical_page_ranges,
                                std::memory_order_release),
+                           rt::xmem::detail::physical_page_identity_handler.store(&physical_page_identity,
+                               std::memory_order_release),
                            rt::xmem::detail::physical_cpu_view_handler.store(&find_physical_cpu_view,
                                std::memory_order_release),
                            rt::xmem::detail::sparse_texture_snapshot_handler.store(&snapshot_sparse_texture,
@@ -1055,6 +1080,10 @@ bool rt::xmem::write_physical_pages(const uint64_t* page_array, size_t offset, c
         uint32_t slot;
         if (!slot_of(page_array[i], slot)) return false;
     }
+    static const bool trace_writes = [] {
+        wchar_t value[2]{};
+        return GetEnvironmentVariableW(L"LEONIDA_TRACE_TEXTURE_RANGES", value, 2) == 1 && value[0] == L'1';
+    }();
     auto* from = static_cast<const uint8_t*>(source);
     for (size_t i = 0; i < count; ++i) {
         uint32_t slot;
@@ -1062,6 +1091,8 @@ bool rt::xmem::write_physical_pages(const uint64_t* page_array, size_t offset, c
         const size_t bytes = (std::min)(size, kPage - offset);
         auto* destination = g_chunks[slot / kChunkPages].view + static_cast<size_t>(slot % kChunkPages) * kPage;
         std::memcpy(destination + offset, from, bytes);
+        if (trace_writes && g_slots[slot].physical_store_writes != UINT16_MAX)
+            ++g_slots[slot].physical_store_writes;
         from += bytes;
         size -= bytes;
         offset = 0;

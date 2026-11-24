@@ -48,6 +48,14 @@ struct PhysicalCpuView {
     std::size_t total_pages = 0;
 };
 
+enum class PhysicalPageState : std::uint8_t { unavailable, reserved, mapped, inconsistent };
+struct PhysicalPageIdentity {
+    PhysicalPageState state = PhysicalPageState::unavailable;
+    std::uint64_t frame = 0;
+    std::uint32_t allocation_epoch = 0;  // Saturating, so UINT32_MAX cannot distinguish later allocations.
+    std::uint16_t physical_store_writes = 0;  // Saturating writes through write_physical_pages to this whole page.
+};
+
 struct SparseTextureMismatch {
     std::size_t offset = 0;
     std::size_t bytes = 0;
@@ -55,12 +63,14 @@ struct SparseTextureMismatch {
 
 namespace detail {
 using PhysicalPageAliasFn = bool (*)(std::span<const PhysicalPageAliasRange>) noexcept;
+using PhysicalPageIdentityFn = PhysicalPageIdentity (*)(const void*) noexcept;
 using PhysicalCpuViewFn = PhysicalCpuView (*)(const void*, std::size_t) noexcept;
 using SparseTextureSnapshotFn = SparseTextureSnapshot (*)(const void*, std::size_t, std::span<std::byte>,
                                                          std::span<const std::byte>, SparseTextureMismatch*) noexcept;
 // The device proxy is also compiled without the physical store. Constant initialization keeps those targets
 // independent of xmem_physical.cpp; the real store publishes its handler during shim registration.
 inline constinit std::atomic<PhysicalPageAliasFn> physical_page_alias_handler{nullptr};
+inline constinit std::atomic<PhysicalPageIdentityFn> physical_page_identity_handler{nullptr};
 inline constinit std::atomic<PhysicalCpuViewFn> physical_cpu_view_handler{nullptr};
 inline constinit std::atomic<SparseTextureSnapshotFn> sparse_texture_snapshot_handler{nullptr};
 }  // namespace detail
@@ -73,6 +83,12 @@ inline constinit std::atomic<SparseTextureSnapshotFn> sparse_texture_snapshot_ha
 inline bool alias_physical_page_ranges(std::span<const PhysicalPageAliasRange> ranges) noexcept {
     const auto handler = detail::physical_page_alias_handler.load(std::memory_order_acquire);
     return handler && handler(ranges);
+}
+
+// Debug identity at this instant. It does not pin the page or observe direct writes through a mapped alias.
+inline PhysicalPageIdentity physical_page_identity(const void* source) noexcept {
+    const auto handler = detail::physical_page_identity_handler.load(std::memory_order_acquire);
+    return handler ? handler(source) : PhysicalPageIdentity{};
 }
 
 // Look up an existing guest-owned writable mapping of the exact same physical pages in the same order.

@@ -971,6 +971,7 @@ struct DeviceState {
         std::uint64_t serial = 0;
         DXGI_FORMAT depth_projection_format = DXGI_FORMAT_UNKNOWN;
         UINT depth_projection_metadata = 0;
+        std::optional<rt::xmem::PhysicalPageIdentity> first_page_at_placement;
     };
     std::atomic<std::uint64_t> next_title_image_allocation{1};
     std::mutex title_placement_mutex;
@@ -1024,12 +1025,42 @@ struct DeviceState {
         return enabled;
     }
     static void trace_native_title_overlap(std::uint64_t address, std::uint64_t bytes,
-                                           std::uint64_t other, std::uint64_t other_bytes) {
-        static std::atomic<unsigned> reports{};
-        if (!trace_texture_ranges() || reports.fetch_add(1, std::memory_order_relaxed) >= 24) return;
+                                           std::uint64_t other, std::uint64_t other_bytes,
+                                           const TitleImageAllocation* owner = nullptr) {
+        if (!trace_texture_ranges()) return;
         const auto start = std::max(address, other);
         const auto overlap = std::min(bytes - (start - address), other_bytes - (start - other));
         const auto* shared = reinterpret_cast<const void*>(start);
+        static std::atomic<unsigned> reports{}, first_page_reports{};
+        if (owner && owner->first_page_at_placement && start == other && address < other &&
+            bytes == 700416 && overlap <= rt::xmem::kPhysicalPageBytes &&
+            first_page_reports.fetch_add(1, std::memory_order_relaxed) < 24) {
+            using State = rt::xmem::PhysicalPageState;
+            const auto& before = *owner->first_page_at_placement;
+            const auto now = rt::xmem::physical_page_identity(shared);
+            auto state_name = [](State state) {
+                switch (state) {
+                case State::reserved: return "reserved";
+                case State::mapped: return "mapped";
+                case State::inconsistent: return "inconsistent";
+                default: return "unavailable";
+                }
+            };
+            const char* relation = "unknown";
+            if (before.state == State::mapped && now.state == State::mapped) {
+                if (before.frame != now.frame || before.allocation_epoch != now.allocation_epoch) relation = "replaced";
+                else if (now.allocation_epoch != UINT32_MAX) relation = "same";
+            }
+            std::fprintf(stderr, "[rt] d3d12: native RT first-page overlap owner=0x%llx va=0x%llx bytes=%llu "
+                "placement=%s/frame%llu/epoch%u/store_writes%u current=%s/frame%llu/epoch%u/store_writes%u "
+                "frame_relation=%s last_gpu_write=unknown direct_cpu_writes=unknown\n",
+                static_cast<unsigned long long>(owner->serial), static_cast<unsigned long long>(start),
+                static_cast<unsigned long long>(overlap), state_name(before.state),
+                static_cast<unsigned long long>(before.frame), unsigned(before.allocation_epoch),
+                unsigned(before.physical_store_writes), state_name(now.state), static_cast<unsigned long long>(now.frame),
+                unsigned(now.allocation_epoch), unsigned(now.physical_store_writes), relation);
+        }
+        if (reports.fetch_add(1, std::memory_order_relaxed) >= 24) return;
         const auto pages = rt::xmem::find_physical_cpu_view(shared, overlap);
         MEMORY_BASIC_INFORMATION info{};
         VirtualQuery(shared, &info, sizeof(info));
@@ -1056,7 +1087,7 @@ struct DeviceState {
             const auto allocation = it->second.lock();
             if (!allocation) { it = title_images.erase(it); continue; }
             if (ranges_overlap(address, bytes, it->first, allocation->guest_bytes)) {
-                trace_native_title_overlap(address, bytes, it->first, allocation->guest_bytes);
+                trace_native_title_overlap(address, bytes, it->first, allocation->guest_bytes, allocation.get());
                 if (collision) *collision = {it->first, allocation->guest_bytes, "native image", allocation->serial};
                 return true;
             }
@@ -3899,8 +3930,13 @@ public:
         if (!memory) return failed("native memory allocation", E_OUTOFMEMORY);
         auto* owner = new (std::nothrow) DeviceState::TitleImageAllocation{
             memory, guest_bytes, need.alignment, memory_type, flags, device_.next_title_image_allocation.fetch_add(1),
-            depth_projection ? desc_.Format : DXGI_FORMAT_UNKNOWN, depth_projection_metadata};
+            depth_projection ? desc_.Format : DXGI_FORMAT_UNKNOWN, depth_projection_metadata, {}};
         if (!owner) { vk.vkFreeMemory(device_.info.device, memory, nullptr); return failed("allocation owner", E_OUTOFMEMORY); }
+        if (DeviceState::trace_texture_ranges() && desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            desc_.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && desc_.Width == 3840 && desc_.Height == 2160 &&
+            desc_.DepthOrArraySize == 1 && desc_.MipLevels == 1 && desc_.SampleDesc.Count == 1 &&
+            desc_.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET && start % rt::xmem::kPhysicalPageBytes == 0)
+            owner->first_page_at_placement = rt::xmem::physical_page_identity(reinterpret_cast<const void*>(start));
         std::shared_ptr<const DeviceState::TitleImageAllocation> allocation(owner,
             [context = device_.context.get(), device = device_.info.device](const DeviceState::TitleImageAllocation* value) {
                 context->vk.vkFreeMemory(device, value->memory, nullptr);
