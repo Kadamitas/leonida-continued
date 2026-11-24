@@ -544,7 +544,8 @@ public:
         bool replaced = false;
         bool written = true;
         const bool must_replace = flush_replaces_table();
-        if (table_dirty_ || !table_uploaded_) written = upload_table(command_buffer, retire_ticket, replaced);
+        if (table_dirty_ || !table_uploaded_)
+            written = upload_table(command_buffer, retire_ticket, replaced, profile_start != FrameProfile::Time{});
         last_flush_replaced_ = replaced;
         // The new generation could not be made: the current set is the one running work reads, so its descriptors are
         // not written in place either. The pending writes and the table's changes stay for the next flush.
@@ -866,7 +867,7 @@ private:
 
     // Uploads what changed since the last call: the whole table when it grew (the mask moved) or was never uploaded,
     // the changed slots otherwise. The copy and its barrier go into `command_buffer`, before the draws.
-    bool upload_table(VkCommandBuffer command_buffer, std::uint64_t retire_ticket, bool& replaced) {
+    bool upload_table(VkCommandBuffer command_buffer, std::uint64_t retire_ticket, bool& replaced, bool profile) {
         if (!command_buffer) return false;
         const std::size_t bytes = table_.size_bytes();
         // A table that grew, or whose live entries change, goes to a new generation; the old one may still be read.
@@ -903,6 +904,9 @@ private:
         const auto slot_count = std::uint32_t((bytes - sizeof(std::uint32_t)) / entry_bytes);
         note_changed_pages(slot_count, changes);
         bool recorded = false;
+        std::uint64_t copied_bytes = 0;
+        enum class UploadKind : std::size_t { full, retired_pages, in_place };
+        auto upload_kind = UploadKind::in_place;
         // Only a new or fully retired generation can reuse mapped staging. In-place updates use vkCmdUpdateBuffer.
         const bool fresh = replace || !table_uploaded_;
         const auto upload_all = [&]() {
@@ -914,12 +918,16 @@ private:
                 update_table_range(command_buffer, 0, words.data(), bytes);
             }
             recorded = true;
+            copied_bytes += bytes;
+            upload_kind = UploadKind::full;
         };
         if (full) {
-            if (replace && !force_full_upload_ && table_epoch_ && upload_changed_pages(command_buffer, slot_count))
+            if (replace && !force_full_upload_ && table_epoch_)
+                copied_bytes = upload_changed_pages(command_buffer, slot_count);
+            if (copied_bytes) {
                 recorded = true;
-            else
-                upload_all();
+                upload_kind = UploadKind::retired_pages;
+            } else upload_all();
         } else if (!changes.slots.empty()) {
             std::vector<std::uint32_t> slots = std::move(changes.slots);
             std::sort(slots.begin(), slots.end());
@@ -933,8 +941,9 @@ private:
                 words.resize(std::size_t(count) * 10);
                 staged = table_.read_slots(slots[first], count, words.data());
                 if (staged) {
-                    update_table_range(command_buffer, entry_offset(slots[first]), words.data(),
-                                       VkDeviceSize(words.size() * sizeof(std::uint32_t)));
+                    const auto chunk_bytes = VkDeviceSize(words.size() * sizeof(std::uint32_t));
+                    update_table_range(command_buffer, entry_offset(slots[first]), words.data(), chunk_bytes);
+                    copied_bytes += chunk_bytes;
                     recorded = true;
                 }
                 first = last + 1;
@@ -942,6 +951,18 @@ private:
             if (!staged) upload_all();  // an inconsistent slot list: the whole table is still correct
         }
         if (!recorded) return true;  // nothing was copied: keep the obligation for the next flush
+        if (profile) {
+            const auto kind = static_cast<std::size_t>(upload_kind);
+            ++table_upload_calls_[kind];
+            table_upload_bytes_[kind] += copied_bytes;
+            const auto total = table_upload_calls_[0] + table_upload_calls_[1] + table_upload_calls_[2];
+            if (total <= 8 || total % 32 == 0)
+                std::fprintf(stderr, "[rt] descriptor table uploads (full,retired-pages,in-place) calls=%llu,%llu,%llu "
+                    "bytes=%llu,%llu,%llu table_bytes=%zu\n",
+                    static_cast<unsigned long long>(table_upload_calls_[0]), static_cast<unsigned long long>(table_upload_calls_[1]),
+                    static_cast<unsigned long long>(table_upload_calls_[2]), static_cast<unsigned long long>(table_upload_bytes_[0]),
+                    static_cast<unsigned long long>(table_upload_bytes_[1]), static_cast<unsigned long long>(table_upload_bytes_[2]), bytes);
+        }
         record_table_barrier(command_buffer);
         // Never treat a merely recorded buffer as a baseline. An in-place update of an unknown buffer also
         // stays unknown until a full initialization has successfully reached the queue.
@@ -983,7 +1004,7 @@ private:
         }
     }
 
-    bool upload_changed_pages(VkCommandBuffer command_buffer, std::uint32_t slots) {
+    VkDeviceSize upload_changed_pages(VkCommandBuffer command_buffer, std::uint32_t slots) {
         std::array<VkBufferCopy, 64> ranges;
         std::uint32_t count = 0;
         std::size_t dirty = 0;
@@ -992,23 +1013,25 @@ private:
             const auto first = i;
             do { ++i; } while (i < page_epochs_.size() && page_epochs_[i] > table_epoch_);
             dirty += i - first;
-            if (dirty > page_epochs_.size() / 2 || count == ranges.size()) return false;
+            if (dirty > page_epochs_.size() / 2 || count == ranges.size()) return 0;
             const auto start = std::uint32_t(first * page_slots);
             const auto end = std::min<std::size_t>(slots, i * page_slots);
             const auto offset = entry_offset(start);
             ranges[count++] = {offset, offset, (end - start) * entry_bytes};
         }
-        if (!count) return false;
+        if (!count) return 0;
         auto* const staging = static_cast<std::uint8_t*>(table_buffers_.staging.mapped);
+        VkDeviceSize copied_bytes = 0;
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto& range = ranges[i];
             const auto slot = std::uint32_t((range.srcOffset - sizeof(std::uint32_t)) / entry_bytes);
             if (!table_.read_slots(slot, std::uint32_t(range.size / entry_bytes),
-                                   reinterpret_cast<std::uint32_t*>(staging + range.srcOffset))) return false;
+                                   reinterpret_cast<std::uint32_t*>(staging + range.srcOffset))) return 0;
+            copied_bytes += range.size;
         }
         vk_.vkCmdCopyBuffer(command_buffer, table_buffers_.staging.buffer, table_buffers_.table.buffer,
                             count, ranges.data());
-        return true;
+        return copied_bytes;
     }
 
     // Copies the data into the command buffer while recording (64 KiB per call, the Vulkan limit), so no staging
@@ -1177,6 +1200,8 @@ private:
     std::vector<Generation> retired_;
     std::uint64_t generations_made_ = 0;
     FrameProfile flush_profile_;
+    std::array<std::uint64_t, 3> table_upload_calls_{};
+    std::array<std::uint64_t, 3> table_upload_bytes_{};
     bool last_flush_replaced_ = false;
     std::array<VkDescriptorPoolSize, bindless::bindings.size()> pool_sizes_{};
     std::uint32_t pool_size_count_ = 0;
