@@ -1543,7 +1543,7 @@ struct DeviceState {
                          (unsigned long long)va, (unsigned long long)bytes);
     }
 
-    // Printed once at device release, so a run reports the size the arena needs.
+    // A run may terminate before device release. Import failures report the same high-water marks.
     void report_arena() {
         std::lock_guard lock(arena.mutex);
         if (!arena.size) return;
@@ -3124,6 +3124,7 @@ public:
     void trace_host_import_failure(const void* address, std::size_t bytes, std::uint32_t types) const {
         static std::atomic<unsigned> reports{};
         if (!DeviceState::trace_texture_ranges() || reports.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+        device_.report_arena();
         MEMORY_BASIC_INFORMATION region{};
         VirtualQuery(address, &region, sizeof(region));
         const auto pages = rt::xmem::find_physical_cpu_view(address, bytes);
