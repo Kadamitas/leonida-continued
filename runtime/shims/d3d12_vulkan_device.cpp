@@ -44,6 +44,7 @@
 #include "../src/vulkan13_features.h"
 
 #include <vulkan/vulkan_win32.h>
+#include <psapi.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib")
 #endif
@@ -1013,14 +1014,17 @@ struct DeviceState {
         std::uint64_t allocation = 0;
         bool physical = false;
     };
-    static void trace_native_title_overlap(std::uint64_t address, std::uint64_t bytes,
-                                           std::uint64_t other, std::uint64_t other_bytes) {
+    static bool trace_texture_ranges() {
         static const bool enabled = [] {
             wchar_t value[2]{};
             return GetEnvironmentVariableW(L"LEONIDA_TRACE_TEXTURE_RANGES", value, 2) == 1 && value[0] == L'1';
         }();
+        return enabled;
+    }
+    static void trace_native_title_overlap(std::uint64_t address, std::uint64_t bytes,
+                                           std::uint64_t other, std::uint64_t other_bytes) {
         static std::atomic<unsigned> reports{};
-        if (!enabled || reports.fetch_add(1, std::memory_order_relaxed) >= 24) return;
+        if (!trace_texture_ranges() || reports.fetch_add(1, std::memory_order_relaxed) >= 24) return;
         const auto start = std::max(address, other);
         const auto overlap = std::min(bytes - (start - address), other_bytes - (start - other));
         const auto* shared = reinterpret_cast<const void*>(start);
@@ -2893,6 +2897,59 @@ public:
         return S_OK;
     }
 
+    void trace_host_import_failure(const void* address, std::size_t bytes, std::uint32_t types) const {
+        static std::atomic<unsigned> reports{};
+        if (!DeviceState::trace_texture_ranges() || reports.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+        MEMORY_BASIC_INFORMATION region{};
+        VirtualQuery(address, &region, sizeof(region));
+        const auto pages = rt::xmem::find_physical_cpu_view(address, bytes);
+        const auto sparse = rt::xmem::validate_sparse_texture(address, bytes);
+        PROCESS_MEMORY_COUNTERS_EX process{};
+        const BOOL process_ok = GetProcessMemoryInfo(GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&process), sizeof(process));
+        PERFORMANCE_INFORMATION system{sizeof(system)};
+        const BOOL system_ok = GetPerformanceInfo(&system, sizeof(system));
+        BOOL in_job = FALSE;
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION job{};
+        const bool job_ok = IsProcessInJob(GetCurrentProcess(), nullptr, &in_job) && in_job &&
+            QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &job, sizeof(job), nullptr);
+        std::fprintf(stderr, "[rt] d3d12: host import evidence va=%p bytes=%zu type=0x%lx protect=0x%lx "
+            "sparse=%d mapped_pages=%zu/%zu writable_alias=%p process_ok=%d private_bytes=%zu "
+            "system_ok=%d commit_bytes=%zu commit_limit=%zu available_ram=%zu job_ok=%u job_flags=0x%lx "
+            "process_memory_limit=%zu job_memory_limit=%zu\n", address, bytes, region.Type, region.Protect,
+            int(sparse), pages.mapped_pages, pages.total_pages, pages.address, int(process_ok), process.PrivateUsage,
+            int(system_ok), system.CommitTotal * system.PageSize, system.CommitLimit * system.PageSize,
+            system.PhysicalAvailable * system.PageSize, unsigned(job_ok), job.BasicLimitInformation.LimitFlags,
+            job.ProcessMemoryLimit, job.JobMemoryLimit);
+        const auto& gpu = device_.info;
+        if (!gpu.get_instance_proc || !gpu.physical) return;
+        const auto list = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+            gpu.get_instance_proc(gpu.instance, "vkEnumerateDeviceExtensionProperties"));
+        const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+            gpu.get_instance_proc(gpu.instance, "vkGetPhysicalDeviceMemoryProperties2"));
+        std::uint32_t count = 0;
+        if (!list || !get || list(gpu.physical, nullptr, &count, nullptr) != VK_SUCCESS || !count) return;
+        // The error being diagnosed may be an allocation failure. Budget data is optional in that case.
+        std::unique_ptr<VkExtensionProperties[]> extensions(new (std::nothrow) VkExtensionProperties[count]);
+        if (!extensions || list(gpu.physical, nullptr, &count, extensions.get()) != VK_SUCCESS ||
+            std::none_of(extensions.get(), extensions.get() + count, [](const auto& extension) {
+                return std::strcmp(extension.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0;
+            })) return;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
+        get(gpu.physical, &info);
+        for (std::uint32_t i = 0; i < info.memoryProperties.memoryHeapCount; ++i) {
+            constexpr auto coherent = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+            std::uint32_t eligible_types = 0;
+            for (std::uint32_t t = 0; t < info.memoryProperties.memoryTypeCount; ++t)
+                if ((types & (1u << t)) && info.memoryProperties.memoryTypes[t].heapIndex == i &&
+                    (info.memoryProperties.memoryTypes[t].propertyFlags & coherent) == coherent)
+                    eligible_types |= 1u << t;
+            std::fprintf(stderr, "[rt] d3d12: host import heap %u flags=0x%x types=0x%x usage=%llu budget=%llu\n",
+                i, info.memoryProperties.memoryHeaps[i].flags, eligible_types,
+                static_cast<unsigned long long>(budget.heapUsage[i]), static_cast<unsigned long long>(budget.heapBudget[i]));
+        }
+    }
     // A buffer on the caller's own pages (Xbox device slot 133, create_buffer_at_host_address): `address` is imported
     // with VK_EXT_external_memory_host and the buffer bound to it at offset 0, so the CPU's writes there are the GPU's
     // reads with no copy. Its console VA is `address` itself, the VA the title chose, so vertex, index and immediate
@@ -3036,7 +3093,10 @@ public:
                 memory_ = VK_NULL_HANDLE;
         }
         if (!compatible_type) return failed("no coherent host-visible import memory type", E_NOTIMPL);
-        if (!memory_) return failed("vkAllocateMemory", E_OUTOFMEMORY);
+        if (!memory_) {
+            trace_host_import_failure(imported_address, bytes, types);
+            return failed("vkAllocateMemory", E_OUTOFMEMORY);
+        }
         // Import ownership starts at allocation, even if binding fails. Destruction must free it before the
         // failed creation returns and the caller can release its pages.
         host_import_ = true;
