@@ -2050,7 +2050,7 @@ if(TARGET Vulkan::Headers)
 
     # These tests compile the same non-Vulkan Xbox proxy. Their shader fixture definitions belong to their test sources.
     add_library(gta6rt_d3d12_test_proxy OBJECT EXCLUDE_FROM_ALL shims/d3d12_xs_device.cpp)
-    target_link_libraries(gta6rt_d3d12_test_proxy PRIVATE Vulkan::Headers gta6rt_root_signature)
+    target_link_libraries(gta6rt_d3d12_test_proxy PRIVATE Vulkan::Headers gta6rt_root_signature gta6rt_json_reader)
     target_compile_definitions(gta6rt_d3d12_test_proxy PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(gta6rt_d3d12_test_proxy PRIVATE /W4 /permissive- /utf-8)
     set(_d3d12_test_proxy_objects $<TARGET_OBJECTS:gta6rt_d3d12_test_proxy>)
