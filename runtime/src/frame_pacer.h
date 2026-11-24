@@ -492,7 +492,7 @@ private:
         if (token != 0) {
             for (const Record& r : records_) {
                 if (r.token == token) {
-                    if (now >= r.origin_us) {
+                    if (r.origin_observed && now >= r.origin_us) {
                         latency_ring_[latency_head_] = now - r.origin_us;
                         latency_head_ = (latency_head_ + 1) % frame_pacing_window;
                         if (latency_count_ < frame_pacing_window) ++latency_count_;
