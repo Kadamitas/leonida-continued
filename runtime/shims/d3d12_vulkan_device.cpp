@@ -2565,13 +2565,48 @@ const char* barrier_layout_refusal(const D3D12_RESOURCE_DESC& desc, D3D12_BARRIE
 // Console Xbox D3D12 CreateDescriptorHeap (device slot 14) passes the PC description followed by the heap address
 // and size, as measured in the retail boot (issue #313 comment 7107265058): a 16-byte PC D3D12_DESCRIPTOR_HEAP_DESC,
 // then address at +0x10 and size at +0x18. The title asserts GetCPUDescriptorHandleForHeapStart() == address.
-// Backing this range with title memory / section 3.3 aliasing is tracked separately; this path only satisfies the
-// observed ABI contract and must not be inferred from normal PC 16-byte CreateDescriptorHeap calls.
+// Explicit placement is a different ABI from the normal PC 16-byte CreateDescriptorHeap call.
 struct ConsoleDescriptorHeapDesc {
     D3D12_DESCRIPTOR_HEAP_DESC desc{};
     std::uint64_t address = 0;
     std::uint64_t size = 0;
 };
+
+// A console descriptor heap can name arbitrary caller storage. Mirror only a single committed
+// private write-back reservation, with no alias into the device's own mapped arena.
+const void* placed_heap_reservation(const void* source, std::size_t bytes) {
+    const auto start = reinterpret_cast<std::uintptr_t>(source);
+    if (!start || !bytes || bytes > UINTPTR_MAX - start) return nullptr;
+    MEMORY_BASIC_INFORMATION region{};
+    if (!VirtualQuery(source, &region, sizeof(region)) || region.State != MEM_COMMIT ||
+        region.Type != MEM_PRIVATE || region.Protect != PAGE_READWRITE) return nullptr;
+    const auto base = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+    if (start < base || region.RegionSize <= start - base || bytes > region.RegionSize - (start - base)) return nullptr;
+    return region.AllocationBase;
+}
+
+bool placed_heap_equal(const void* title, const void* arena, std::size_t bytes, bool& equal) {
+#ifdef _MSC_VER
+    __try {
+        equal = std::memcmp(title, arena, bytes) == 0;
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+                    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+#else
+    std::array<std::byte, 4096> scratch;
+    equal = true;
+    for (std::size_t at = 0; equal && at < bytes; at += scratch.size()) {
+        const auto size = (std::min)(scratch.size(), bytes - at);
+        SIZE_T copied = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), static_cast<const std::byte*>(title) + at, scratch.data(),
+                               size, &copied) || copied != size) return false;
+        equal = std::memcmp(scratch.data(), static_cast<const std::byte*>(arena) + at, size) == 0;
+    }
+    return true;
+#endif
+}
 
 class DescriptorHeap final
     : public Child<DescriptorHeap, ID3D12DescriptorHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
@@ -2591,9 +2626,36 @@ public:
           console_addressed_(console_address != 0) {
         const VkDeviceSize bytes = VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize;
         if (console_addressed_) {
-            // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address. Report the requested title VA
-            // now; backing this range with title memory / Ãƒâ€šÃ‚Â§3.3 aliasing is tracked separately.
-            log_once("descriptor heap uses console address/size (not backed by title memory)", int(desc_.Type));
+            static const bool enable_mirror = [] {
+                const char* value = std::getenv("LEONIDA_PLACED_HEAP_MIRROR");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            auto* source = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(console_address_));
+            if (enable_mirror && device.arena.mapped && bytes && bytes <= SIZE_MAX && bytes == console_size_ &&
+                console_address_ <= UINTPTR_MAX &&
+                console_address_ % kDescriptorSize == 0 && desc_.Flags == D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE &&
+                (desc_.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || desc_.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)) {
+                const auto owner = placed_heap_reservation(source, static_cast<std::size_t>(bytes));
+                if (owner && !DeviceState::ranges_overlap(console_address_, bytes,
+                        reinterpret_cast<std::uintptr_t>(device.arena.mapped), device.arena.size) &&
+                    device.register_title_host_range(reinterpret_cast<leonida::ResourceId>(this), console_address_, bytes,
+                                                     "placed_descriptor_heap", bytes)) {
+                    placed_range_ = true;
+                    if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) return;
+                    in_arena_ = true;
+                    cpu_ = source;
+                    mirror_ = {source, device.arena.mapped + arena_offset_, static_cast<std::size_t>(bytes), owner,
+                        [](const leonida::DescriptorHeapMirror& m) {
+                            return placed_heap_reservation(m.title, m.bytes) == m.reservation;
+                        }, placed_heap_equal, [](void* arena, const void* title, std::size_t size) {
+                            SIZE_T copied = 0;
+                            return ReadProcessMemory(GetCurrentProcess(), title, arena, size, &copied) && copied == size;
+                        }};
+                    return;
+                }
+            }
+            // A handle-only placement still reports the requested guest address.
+            log_once("descriptor heap uses console address/size without a shader arena mirror", int(desc_.Type));
             cpu_ = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(console_address_));
             in_arena_ = false;
             return;
@@ -2614,6 +2676,10 @@ public:
     }
 
     ~DescriptorHeap() override {
+        if (placed_range_) {
+            std::lock_guard lock(device_.title_placement_mutex);
+            device_.title_host_ranges.erase(reinterpret_cast<leonida::ResourceId>(this));
+        }
         if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
                                             DeviceState::arena_descriptor_heap);
         if (release_cpu_backing_) release_cpu_backing_(cpu_, rt::d3d12_xs::kXmemDescriptorHeapAttributes);
@@ -2622,7 +2688,7 @@ public:
     bool ok() const { return cpu_ != nullptr; }
 
     bool adopt_cpu_backing(void* backing, std::uint64_t bytes, rt::d3d12_xs::DescriptorHeapBackingFree release) {
-        if (!backing || !release || release_cpu_backing_ ||
+        if (console_addressed_ || !backing || !release || release_cpu_backing_ ||
             bytes != VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize || bytes > SIZE_MAX) return false;
         if (in_arena_) {
             // Preserve title bytes, including descriptors installed by the allocator. All CPU
@@ -2678,6 +2744,7 @@ private:
     std::uint64_t console_address_ = 0;
     std::uint64_t console_size_ = 0;
     bool console_addressed_ = false;
+    bool placed_range_ = false;
 };
 
 struct TitleDisplayAllocation {
