@@ -852,7 +852,37 @@ struct ComputePipeline {
     bool resolve_native() { return pipeline || (realize && realize(owner, *this)); }
     bool bounded_image_keys = false;
     const char* profile_unbounded_name = nullptr;
+    bool profile_direct_s5 = false;
 };
+
+// A dispatch may read its table through s5. Observe the relationship to the recorded, owner-checked
+// tables without reading descriptor bytes or modifying the shader's root arguments or image selection.
+inline void profile_compute_s5(const Dispatch& dispatch) {
+    const auto word = dispatch.user_data[5];
+    const auto* tables = dispatch.descriptor_tables.get();
+    unsigned same_dword = 0;
+    bool low_matches = false, covers_96 = false, matches_both = false;
+    if (tables) for (const auto& table : *tables) {
+        if (table.dword != 5) continue;
+        ++same_dword;
+        const bool matches = word == static_cast<std::uint32_t>(table.gpu_va);
+        const bool covers = table.cpu_address && table.remaining_bytes >= 96;
+        low_matches |= matches;
+        covers_96 |= covers;
+        matches_both |= matches && covers;
+    }
+    const unsigned outcome = unsigned(word != 0) | (unsigned(same_dword != 0) << 1) |
+        (unsigned(same_dword > 1) << 2) | (unsigned(low_matches) << 3) |
+        (unsigned(covers_96) << 4) | (unsigned(matches_both) << 5);
+    const auto bit = std::uint64_t{1} << outcome;
+    // Report each distinct outcome once, including a later dispatch whose bindings differ.
+    static std::atomic<std::uint64_t> seen{};
+    if (!(seen.load(std::memory_order_relaxed) & bit) && !(seen.fetch_or(bit, std::memory_order_relaxed) & bit))
+        std::fprintf(stderr, "[rt] compute table probe: direct=1 s5_nonzero=%u tables=%zu at_s5=%u "
+            "low_matches=%u covers_96=%u same_binding_matches_both=%u\n",
+            unsigned(word != 0), tables ? tables->size() : 0, same_dword,
+            unsigned(low_matches), unsigned(covers_96), unsigned(matches_both));
+}
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
 // reads. code_base: as for compute (one per pipeline; two stages that both read theirs are refused, question 14).
@@ -3738,6 +3768,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
             if (!p.pipeline.resolve_native()) return where.missing("compute-native", dispatch->pipeline);
+            if (p.pipeline.profile_direct_s5) profile_compute_s5(*dispatch);
             if (!detail::prepare_compute_table(p, vk, dispatch->descriptor_tables)) return ReplayResult::unsupported;
             out.wrote_readback = true;
             out.readback_src_stages |= VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;

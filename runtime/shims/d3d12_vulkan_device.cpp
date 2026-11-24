@@ -6166,6 +6166,11 @@ public:
         compute_library_ = library;
         compute_entry_ = entry;
         pipeline_.bounded_image_keys = entry->bounded_image_keys();
+        static const std::string probe_s5 = [] {
+            const char* name = std::getenv("LEONIDA_PROFILE_COMPUTE_S5");
+            return std::string(name ? name : "");
+        }();
+        pipeline_.profile_direct_s5 = !probe_s5.empty() && entry->name == probe_s5;
         if (profile_video_enabled() && !pipeline_.bounded_image_keys) pipeline_.profile_unbounded_name = entry->name.c_str();
         if (entry->binding_count) pipeline_.bindless_set = device_.bindless->set();
         if (entry->root_table) {
