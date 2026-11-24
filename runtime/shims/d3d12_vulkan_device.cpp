@@ -1013,6 +1013,25 @@ struct DeviceState {
         std::uint64_t allocation = 0;
         bool physical = false;
     };
+    static void trace_native_title_overlap(std::uint64_t address, std::uint64_t bytes,
+                                           std::uint64_t other, std::uint64_t other_bytes) {
+        static const bool enabled = [] {
+            wchar_t value[2]{};
+            return GetEnvironmentVariableW(L"LEONIDA_TRACE_TEXTURE_RANGES", value, 2) == 1 && value[0] == L'1';
+        }();
+        static std::atomic<unsigned> reports{};
+        if (!enabled || reports.fetch_add(1, std::memory_order_relaxed) >= 24) return;
+        const auto start = std::max(address, other);
+        const auto overlap = std::min(bytes - (start - address), other_bytes - (start - other));
+        const auto* shared = reinterpret_cast<const void*>(start);
+        const auto pages = rt::xmem::find_physical_cpu_view(shared, overlap);
+        MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(shared, &info, sizeof(info));
+        std::fprintf(stderr, "[rt] d3d12: native title overlap va=0x%llx bytes=%llu mapped_pages=%zu/%zu "
+                     "writable_cpu_alias=%u native_state=0x%lx native_protect=0x%lx\n",
+                     static_cast<unsigned long long>(start), static_cast<unsigned long long>(overlap),
+                     pages.mapped_pages, pages.total_pages, unsigned(pages.address != nullptr), info.State, info.Protect);
+    }
     static HRESULT sampled_placement_failure(const char* stage, HRESULT hr, std::uint64_t address,
                                              std::uint64_t bytes, bool physical, const TitleImageCollision& conflict) {
         static std::atomic<unsigned> reports{};
@@ -1031,6 +1050,7 @@ struct DeviceState {
             const auto allocation = it->second.lock();
             if (!allocation) { it = title_images.erase(it); continue; }
             if (ranges_overlap(address, bytes, it->first, allocation->guest_bytes)) {
+                trace_native_title_overlap(address, bytes, it->first, allocation->guest_bytes);
                 if (collision) *collision = {it->first, allocation->guest_bytes, "native image", allocation->serial};
                 return true;
             }
@@ -1056,11 +1076,23 @@ struct DeviceState {
         return ranges_overlap(address, bytes, other, length) &&
             (address == other || !physical_snapshot || !other_snapshot);
     }
+    // A buffer V# reads the source bytes directly; a display-BC T# names a separate snapshot image.
+    // A complete, current XMem proof of the larger span covers both descriptors at their shared base.
+    static bool physical_buffer_prefix(std::uint64_t base, std::uint64_t buffer_bytes, std::uint64_t image_bytes) {
+        return buffer_bytes && buffer_bytes <= image_bytes &&
+            rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(base), image_bytes) ==
+                rt::xmem::SparseTextureSnapshot::ready;
+    }
     bool linear_image_overlap_locked(std::uint64_t address, std::uint64_t bytes, bool physical_snapshot = false,
                                      TitleImageCollision* collision = nullptr, bool buffer_srv = false) const {
         for (const auto& [start, image] : title_image_resources) {
             if (!image.linear_bytes || !conflicting_host_range(address, bytes, physical_snapshot,
                 start, image.linear_bytes, image.physical_snapshot)) continue;
+            if (buffer_srv && address == start && image.display_bc_snapshot) {
+                const auto prior = title_address_views.find(start);
+                if ((prior == title_address_views.end() || !prior->second.texture_srv) &&
+                    physical_buffer_prefix(start, bytes, image.linear_bytes)) continue;
+            }
             if (collision) *collision = {start, image.linear_bytes, "host-backed placed image",
                 reinterpret_cast<std::uintptr_t>(image.resource), image.physical_snapshot};
             return true;
@@ -1076,23 +1108,11 @@ struct DeviceState {
         const auto first = buffer_address ? buffer_address : address;
         const auto extent = buffer_address ? addressable_bytes : bytes;
         if (first < address || first - address >= bytes || !extent || extent > bytes - (first - address)) return false;
-    // A buffer V# reads the source bytes directly; a display-BC T# names a separate snapshot image.
-    // A complete, current XMem proof of the larger span covers both descriptors at their shared base.
-    static bool physical_buffer_prefix(std::uint64_t base, std::uint64_t buffer_bytes, std::uint64_t image_bytes) {
-        return buffer_bytes && buffer_bytes <= image_bytes &&
-            rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(base), image_bytes) ==
-                rt::xmem::SparseTextureSnapshot::ready;
-    }
         std::lock_guard lock(title_placement_mutex);
         if (title_image_overlap_locked(first, extent, DXGI_FORMAT_UNKNOWN, 0, conflict) ||
             linear_image_overlap_locked(first, extent, physical_snapshot, conflict)) return false;
         if (!sampled_shadow || !physical_snapshot)
             for (const auto& [start, protected_bytes] : sampled_alias_spans)
-            if (buffer_srv && address == start && image.display_bc_snapshot) {
-                const auto prior = title_address_views.find(start);
-                if ((prior == title_address_views.end() || !prior->second.texture_srv) &&
-                    physical_buffer_prefix(start, bytes, image.linear_bytes)) continue;
-            }
                 if (ranges_overlap(first, extent, start, protected_bytes)) {
                     if (conflict) *conflict = {start, protected_bytes, "protected physical sampled alias", 0, true};
                     return false;
@@ -3737,6 +3757,7 @@ public:
         }
         for (const auto& [id, range] : device_.title_host_ranges)
             if (DeviceState::ranges_overlap(start, guest_bytes, range.address, range.bytes)) {
+                DeviceState::trace_native_title_overlap(start, guest_bytes, range.address, range.bytes);
                 std::fprintf(stderr, "[rt] d3d12: title image/host overlap image_va=0x%llx image_bytes=%llu "
                     "host_id=0x%llx host_va=0x%llx host_bytes=%llu\n",
                     static_cast<unsigned long long>(start), static_cast<unsigned long long>(guest_bytes),
