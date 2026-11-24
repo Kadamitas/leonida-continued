@@ -980,6 +980,7 @@ struct DeviceState {
         Resource* resource;
         std::uint64_t linear_bytes = 0;
         bool physical_snapshot = false;
+        bool display_bc_snapshot = false;
     };
     std::map<std::uint64_t, TitleImageResource> title_image_resources;
     std::multimap<std::uint64_t, TitleImageResource> title_depth_image_resources;
@@ -1056,7 +1057,7 @@ struct DeviceState {
             (address == other || !physical_snapshot || !other_snapshot);
     }
     bool linear_image_overlap_locked(std::uint64_t address, std::uint64_t bytes, bool physical_snapshot = false,
-                                     TitleImageCollision* collision = nullptr) const {
+                                     TitleImageCollision* collision = nullptr, bool buffer_srv = false) const {
         for (const auto& [start, image] : title_image_resources) {
             if (!image.linear_bytes || !conflicting_host_range(address, bytes, physical_snapshot,
                 start, image.linear_bytes, image.physical_snapshot)) continue;
@@ -1075,11 +1076,23 @@ struct DeviceState {
         const auto first = buffer_address ? buffer_address : address;
         const auto extent = buffer_address ? addressable_bytes : bytes;
         if (first < address || first - address >= bytes || !extent || extent > bytes - (first - address)) return false;
+    // A buffer V# reads the source bytes directly; a display-BC T# names a separate snapshot image.
+    // A complete, current XMem proof of the larger span covers both descriptors at their shared base.
+    static bool physical_buffer_prefix(std::uint64_t base, std::uint64_t buffer_bytes, std::uint64_t image_bytes) {
+        return buffer_bytes && buffer_bytes <= image_bytes &&
+            rt::xmem::validate_sparse_texture(reinterpret_cast<const void*>(base), image_bytes) ==
+                rt::xmem::SparseTextureSnapshot::ready;
+    }
         std::lock_guard lock(title_placement_mutex);
         if (title_image_overlap_locked(first, extent, DXGI_FORMAT_UNKNOWN, 0, conflict) ||
             linear_image_overlap_locked(first, extent, physical_snapshot, conflict)) return false;
         if (!sampled_shadow || !physical_snapshot)
             for (const auto& [start, protected_bytes] : sampled_alias_spans)
+            if (buffer_srv && address == start && image.display_bc_snapshot) {
+                const auto prior = title_address_views.find(start);
+                if ((prior == title_address_views.end() || !prior->second.texture_srv) &&
+                    physical_buffer_prefix(start, bytes, image.linear_bytes)) continue;
+            }
                 if (ranges_overlap(first, extent, start, protected_bytes)) {
                     if (conflict) *conflict = {start, protected_bytes, "protected physical sampled alias", 0, true};
                     return false;
@@ -1097,7 +1110,7 @@ struct DeviceState {
         if (!address || !bytes || bytes > UINT64_MAX - address) return false;
         std::lock_guard lock(title_placement_mutex);
         if (title_image_overlap_locked(address, bytes, DXGI_FORMAT_UNKNOWN, 0, collision) ||
-            linear_image_overlap_locked(address, bytes, physical_snapshot, collision)) return false;
+            linear_image_overlap_locked(address, bytes, physical_snapshot, collision, buffer_srv)) return false;
         if (!physical_snapshot) {
             for (const auto& [start, protected_bytes] : sampled_alias_spans) {
                 if (!ranges_overlap(address, bytes, start, protected_bytes)) continue;
@@ -1178,10 +1191,11 @@ struct DeviceState {
             }
         for (const auto& [start, view] : title_address_candidates_locked(address, bytes))
             if (conflicting_host_range(address, bytes, physical_snapshot, start, view.bytes, view.physical_snapshot)) {
-                // The addresses and native image identities stay distinct. Only a read-only display-BC placement
-                // with verified physical backing can admit a neighboring, separately revalidated read-only SRV.
-                if (display_sampled && physical_snapshot && address != start && physical_readonly_view(start, view))
-                    continue;
+                if (display_sampled && physical_snapshot) {
+                    if (address != start && physical_readonly_view(start, view)) continue;
+                    if (address == start && view.buffer_srv && !view.texture_srv &&
+                        physical_buffer_prefix(start, view.bytes, bytes)) continue;
+                }
                 if (conflict) *conflict = {start, view.bytes, view_kind(view), 0, view.physical_snapshot};
                 return true;
             }
@@ -3635,7 +3649,7 @@ public:
                     return refused(DeviceState::sampled_placement_failure("placed source intersects earlier owner",
                         E_NOTIMPL, address, placed_bytes, physical, conflict));
                 const auto [existing, inserted] = device_.title_image_resources.emplace(address,
-                    DeviceState::TitleImageResource{this, placed_bytes, physical});
+                    DeviceState::TitleImageResource{this, placed_bytes, physical, display_sampled && physical});
                 if (!inserted) {
                     conflict = {address, existing->second.linear_bytes, "exact placed source",
                                 existing->second.resource->id(), existing->second.physical_snapshot};
