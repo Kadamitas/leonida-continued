@@ -53,6 +53,8 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <new>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -577,14 +579,17 @@ public:
         return written;
     }
 
-    // Frees the generations (table buffers and descriptor set) that flush() retired with a ticket up to `completed`.
-    // The default frees all of them: when nothing submitted before the last flush() still runs.
+    // Completed generations are free to recycle. Keep at most one matching allocation while the table is active.
+    // With the default, release all completed storage, including the idle allocation.
     void release_retired(std::uint64_t completed = UINT64_MAX) {
+        if (completed == UINT64_MAX) destroy_generation(spare_);
         std::size_t kept = 0;
         for (auto& generation : retired_) {
             if (generation.ticket <= completed) {
-                destroy(generation.buffers);
-                if (generation.pool) vk_.vkDestroyDescriptorPool(device_, generation.pool, nullptr);
+                if (completed != UINT64_MAX && !spare_.pool && generation.buffers.table.size == table_buffers_.table.size)
+                    spare_ = generation;
+                else
+                    destroy_generation(generation);
             } else {
                 retired_[kept++] = generation;
             }
@@ -868,20 +873,25 @@ private:
                              (table_uploaded_ && (existing_entries_changed_ || force_full_upload_));
         bool full = force_full_upload_ || !table_uploaded_ || replace;
         if (replace) {
-            TableBuffers larger;
-            VkDescriptorPool pool = VK_NULL_HANDLE;
-            VkDescriptorSet set = VK_NULL_HANDLE;
-            bool device_local = false;
-            if (!create(larger.table, bytes, true, &device_local) || !create(larger.staging, bytes, false) ||
-                !make_set(pool, set)) {
-                destroy(larger);
-                return false;
+            try { retired_.emplace_back(); }
+            catch (const std::bad_alloc&) { return false; }
+            Generation next;
+            if (spare_.pool && spare_.buffers.table.size == bytes) {
+                next = std::exchange(spare_, {});
+            } else {
+                destroy_generation(spare_);  // release the smaller capacity before growth
+                if (!create(next.buffers.table, bytes, true, &next.device_local) ||
+                    !create(next.buffers.staging, bytes, false) || !make_set(next.pool, next.set)) {
+                    destroy_generation(next);
+                    retired_.pop_back();
+                    return false;
+                }
             }
-            table_device_local_ = device_local;
-            retired_.push_back({table_buffers_, pool_, set_, retire_ticket});
-            table_buffers_ = larger;
-            pool_ = pool;
-            set_ = set;
+            retired_.back() = {table_buffers_, pool_, set_, retire_ticket, table_device_local_};
+            table_buffers_ = next.buffers;
+            pool_ = next.pool;
+            set_ = next.set;
+            table_device_local_ = next.device_local;
             write_table_binding(table_buffers_.table.buffer);
             replaced = true;
             ++generations_made_;
@@ -889,9 +899,8 @@ private:
         DescriptorTable::Changes changes = table_.take_changes();
         full = full || changes.all;
         bool recorded = false;
-        // The staging buffer is written only for buffers that were just created (first upload or growth): a later
-        // flush then either updates slots with vkCmdUpdateBuffer or rebuilds from a fresh pair, so no copy still in
-        // flight can be reading bytes the CPU rewrites.
+        // A first upload or replacement uses a new or fully retired staging buffer. Its whole contents and all
+        // descriptors previously written are republished. Later appends use vkCmdUpdateBuffer in flight.
         const bool fresh = replace || !table_uploaded_;
         const auto upload_all = [&]() {
             if (fresh) {
@@ -1085,7 +1094,14 @@ private:
         VkDescriptorPool pool = VK_NULL_HANDLE;  // owns the descriptor set
         VkDescriptorSet set = VK_NULL_HANDLE;
         std::uint64_t ticket = 0;
+        bool device_local = false;
     };
+    void destroy_generation(Generation& generation) const {
+        destroy(generation.buffers);
+        if (generation.pool) vk_.vkDestroyDescriptorPool(device_, generation.pool, nullptr);
+        generation = {};
+    }
+    Generation spare_;  // never submitted again without a complete table upload and descriptor shadow republish
     std::vector<Generation> retired_;
     std::uint64_t generations_made_ = 0;
     FrameProfile flush_profile_;
