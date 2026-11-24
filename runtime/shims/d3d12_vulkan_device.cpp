@@ -3963,8 +3963,10 @@ public:
         VkMemoryPropertyFlags flags = 0;
         const bool attachment_only = desc_.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET ||
             desc_.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        // Use the same allocation and bind as the eager native path. A dedicated preference does not
+        // change those parameters. Required dedicated allocations were already refused above.
         const bool deferred = defer_placed_images(true) && region.Protect == PAGE_NOACCESS && !linear_color &&
-            !depth_projection && !dedicated.prefersDedicatedAllocation && attachment_only;
+            !depth_projection && attachment_only;
         if (defer_placed_images(true) && attachment_only && DeviceState::trace_texture_ranges()) {
             static std::atomic<unsigned> reports{};
             if (reports.fetch_add(1, std::memory_order_relaxed) < 12 ||
