@@ -209,8 +209,19 @@ public:
 
     const leonida::CommandList& commands() const { return list_; }
     bool can_record_graphics_state() const {
-        return type_ == D3D12_COMMAND_LIST_TYPE_DIRECT && !list_.closed() && !invalid_ && allocator_ &&
-               allocator_->recording() == this;
+        const bool active_allocator = allocator_ && allocator_->recording() == this;
+        const bool ready = type_ == D3D12_COMMAND_LIST_TYPE_DIRECT && !list_.closed() && !invalid_ && active_allocator;
+        if (!ready) {
+            static const bool trace = [] {
+                const char* value = std::getenv("LEONIDA_TRACE_TEXTURE_RANGES");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            if (trace)
+                std::fprintf(stderr, "[rt] d3d12: graphics state rejected list_type=%u closed=%u invalid=%u "
+                    "allocator_present=%u allocator_recording=%u\n", unsigned(type_), unsigned(list_.closed()),
+                    unsigned(invalid_), unsigned(allocator_ != nullptr), unsigned(active_allocator));
+        }
+        return ready;
     }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
     const std::vector<IUnknown*>& pinned() const { return held_; }
