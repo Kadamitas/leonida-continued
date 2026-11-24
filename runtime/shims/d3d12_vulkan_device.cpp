@@ -1036,9 +1036,11 @@ struct DeviceState {
         const auto overlap = std::min(bytes - (start - address), other_bytes - (start - other));
         const auto* shared = reinterpret_cast<const void*>(start);
         static std::atomic<unsigned> reports{}, first_page_reports{};
+        // The 4K target's BC1 source and the 512-square target's square and rectangular BC5 sources.
         if (owner && owner->trace && start == other && address < other &&
             ((owner->trace->page_count == 1 && bytes == 700416 && overlap == 28672) ||
-             (owner->trace->page_count == 4 && bytes == 352256 && overlap == 229376)) &&
+             (owner->trace->page_count == 4 && ((bytes == 352256 && overlap == 229376) ||
+                                                 (bytes == 704512 && overlap == 180224)))) &&
             first_page_reports.fetch_add(1, std::memory_order_relaxed) < 24) {
             context->report_attachment_writes(owner->serial, *owner->trace);
             using State = rt::xmem::PhysicalPageState;
@@ -1051,7 +1053,9 @@ struct DeviceState {
                 }
             };
             for (unsigned i = 0; i < owner->trace->page_count; ++i) {
-                const auto va = start + i * rt::xmem::kPhysicalPageBytes;
+                const auto offset = std::uint64_t(i) * rt::xmem::kPhysicalPageBytes;
+                if (offset >= overlap) break;
+                const auto va = start + offset;
                 const auto& before = owner->trace->at_placement[i];
                 const auto now = rt::xmem::physical_page_identity(reinterpret_cast<const void*>(va));
                 const char* relation = "unknown";
@@ -1059,7 +1063,7 @@ struct DeviceState {
                     if (before.frame != now.frame || before.allocation_epoch != now.allocation_epoch) relation = "replaced";
                     else if (now.allocation_epoch != UINT32_MAX) relation = "same";
                 }
-                const auto bytes_on_page = std::min<std::uint64_t>(rt::xmem::kPhysicalPageBytes, overlap - (va - start));
+                const auto bytes_on_page = std::min<std::uint64_t>(rt::xmem::kPhysicalPageBytes, overlap - offset);
                 std::fprintf(stderr, "[rt] d3d12: native RT overlap page owner=0x%llx page=%u va=0x%llx bytes=%llu "
                     "placement=%s/frame%llu/epoch%u/store_writes%u current=%s/frame%llu/epoch%u/store_writes%u "
                     "frame_relation=%s direct_cpu_writes=unknown\n",
