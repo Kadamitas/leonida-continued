@@ -199,7 +199,8 @@ inline constexpr bool title_display_bc_texture_shape(const D3D12_RESOURCE_DESC& 
 
 inline constexpr bool title_display_rgba8_array_shape(const D3D12_RESOURCE_DESC& desc) {
     return UINT(desc.Layout) == kTitleDisplay64k && (!desc.Alignment || desc.Alignment == 65536) &&
-        desc.DepthOrArraySize > 1 && desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM && title_sampled_2d_texture_shape(desc);
+        desc.DepthOrArraySize > 1 && title_sampled_2d_texture_shape(desc) &&
+        (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
 }
 
 // VIctory's host_texture translates resource usage and keeps the actual dimensions. Use that model for
