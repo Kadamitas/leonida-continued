@@ -10070,8 +10070,37 @@ public:
                     static_cast<unsigned long long>(guest_bytes), static_cast<unsigned long long>(alignment));
                 return d3d12_trace::result(method, E_NOTIMPL);
             }
+            // Serialize the observed repeat placement through publication of its first native image. Address
+            // SRV creation already takes this lock before title_placement_mutex in the same order.
+            const bool repeat_bc5 = desc.Format == DXGI_FORMAT_BC5_UNORM && desc.DepthOrArraySize == 1 &&
+                title_display_bc_texture_shape(desc);
+            std::unique_lock cache_lock(state_.host_static_texture_mutex);
+            if (repeat_bc5) {
+                Resource* pinned = nullptr;
+                {
+                    std::lock_guard placement_lock(state_.title_placement_mutex);
+                    const auto [first, last] = state_.title_image_resources.equal_range(start);
+                    for (auto it = first; it != last; ++it) {
+                        const auto& entry = it->second;
+                        auto* image = entry.resource;
+                        if (!entry.display_bc_snapshot || !entry.physical_snapshot || entry.linear_bytes != guest_bytes ||
+                            image->sampled_tile_bytes() != layout->tile_bytes || image->GetDesc().Alignment != alignment ||
+                            !same_texture_shape(image->desc(), native)) continue;
+                        const auto pages = rt::xmem::find_physical_cpu_view(address, guest_bytes);
+                        if (!pages.total_pages || pages.mapped_pages != pages.total_pages ||
+                            rt::xmem::validate_sparse_texture(address, guest_bytes) != rt::xmem::SparseTextureSnapshot::ready ||
+                            !image->pin_title_image()) return d3d12_trace::result(method, E_NOTIMPL);
+                        pinned = image;
+                        break;
+                    }
+                }
+                if (pinned) {
+                    cache_lock.unlock();
+                    // hand_out consumes the pin even when QueryInterface refuses this IID.
+                    return d3d12_trace::result(method, hand_out(pinned, riid, out));
+                }
+            }
             {
-                std::lock_guard lock(state_.host_static_texture_mutex);
                 const auto [first, last] = state_.host_static_textures.equal_range(start);
                 if (first != last) {
                     const auto cached = std::find_if(first, last, [&](const auto& row) {
@@ -10128,6 +10157,7 @@ public:
                     return d3d12_trace::result(method, image.QueryInterface(riid, out));
                 }
             }
+            if (!repeat_bc5) cache_lock.unlock();
             const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
             try {
                 const auto release = [](Resource* resource) { resource->Release(); };
