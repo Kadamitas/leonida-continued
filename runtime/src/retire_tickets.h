@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,17 @@ public:
             pending_.pop_front();
         }
         return completed_;
+    }
+
+    // Read one exact submission without consuming the retired prefix or waiting on an unrelated queue.
+    template<class Query>
+    std::optional<bool> observe(std::uint64_t ticket, Query&& query) const {
+        if (!ticket) return {};
+        if (ticket <= completed_) return true;
+        for (const Entry& entry : pending_) {
+            if (entry.ticket == ticket) return entry.idle ? std::optional<bool>(true) : query(entry.semaphore, entry.value);
+        }
+        return {};
     }
 
     // The (semaphore, value) of every submission up to `ticket` that has not been seen complete: what a caller

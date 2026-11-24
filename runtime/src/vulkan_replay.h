@@ -33,6 +33,7 @@
 #include "command_list.h"
 #include "deferred_image_binding.h"
 #include "frame_draw_activity.h"
+#include "attachment_write_trace.h"
 #include "depth24.h"
 #include "uav_clear.h"
 
@@ -131,6 +132,7 @@ struct ResourceBinding {
     std::uint64_t host_image_address = 0;  // descriptor identity, zero when no bounded identity is available
     std::uintptr_t draw_activity_image = 0;  // diagnostic identity for this native image's registration lifetime
     DeferredImageBinding* deferred_memory = nullptr;  // owned by the registered resource
+    AttachmentWriteTrace* attachment_write_trace = nullptr;  // owned by the native placement through command capture
 };
 
 struct VulkanAccess {
@@ -996,6 +998,7 @@ struct ReplayFunctions {
     std::vector<std::shared_ptr<void>>* execution_pins = nullptr;
     HostImageReads* image_reads = nullptr;
     FrameDrawTargets* frame_draws = nullptr;
+    AttachmentWriteBatch* attachment_writes = nullptr;
     bool has_host_readonly_images = false;  // null/global alias scopes can include a CPU-owned import
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
@@ -4237,6 +4240,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (tracker) tracker->set(id, range, new_layout);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;
+            if (vk.attachment_writes) vk.attachment_writes->add(p.binding.attachment_write_trace,
+                predicate.buffer ? AttachmentWrite::possible : p.rects.empty() ? AttachmentWrite::clear_full : AttachmentWrite::clear_rects);
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
@@ -4390,9 +4395,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                if (vk.attachment_writes) vk.attachment_writes->add(p.binding.attachment_write_trace, AttachmentWrite::copy);
                 vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, dst_layout,
                                         std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
             } else if (!p.image_copies.empty()) {
+                if (vk.attachment_writes) vk.attachment_writes->add(p.binding.attachment_write_trace, AttachmentWrite::copy);
                 // A subresource can be both the source and destination only in a shared layout.
                 const bool self = p.same_copy_subresource;
                 const VkImageLayout src_layout = detail::copy_layout(
@@ -4454,6 +4461,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                if (vk.attachment_writes) vk.attachment_writes->add(p.binding.attachment_write_trace, AttachmentWrite::copy);
                 vk.copy_buffer_to_image(command_buffer, source, p.binding.image, dst_layout,
                                         std::uint32_t(regions->size()), regions->data());
             } else {
@@ -4493,6 +4501,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // resolve_source and resolve_dest are the transfer layouts, as copy_source and copy_dest are.
             const auto [dst_id, src_id] = copy_ids(command);
             if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
+                if (vk.attachment_writes) vk.attachment_writes->add(p.binding.attachment_write_trace, AttachmentWrite::resolve);
                 // A rendering scope of its own, with no draws: the source plane as the attachment, the destination
                 // as its resolve target. Both go to the attachment layout and back. Resolves run in the colour
                 // attachment output stage with colour attachment accesses, depth and stencil ones included.
@@ -4579,6 +4588,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VkImageLayout dst_layout = detail::copy_layout(
                 vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+            if (vk.attachment_writes) vk.attachment_writes->add(p.binding.attachment_write_trace, AttachmentWrite::resolve);
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
         } else if (const auto* marker = std::get_if<DebugMarker>(&command)) {
             if (!vk.insert_label || !vk.begin_label || !vk.end_label) continue;
@@ -4993,6 +5003,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                 draw->first_instance);
             } else {
                 vk.draw(command_buffer, d.vertex_count, draw->instances, d.first_vertex, draw->first_instance);
+            }
+            if (vk.attachment_writes && scissor.extent.width && scissor.extent.height) {
+                for (const auto& color : d.colors)
+                    vk.attachment_writes->add(color.binding.attachment_write_trace, AttachmentWrite::possible);
             }
             if (vk.frame_draws && !graphics_indirect && !predicate.buffer && draw->instances &&
                 (draw->mesh ? draw->count && draw->first : draw->indexed ? draw->count : d.vertex_count) &&

@@ -1299,6 +1299,7 @@ public:
     }
     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
         std::unique_lock rlock(resource_mutex_);
+        if (binding.attachment_write_trace) trace_native_attachments_ = true;
         set_resource_locked(id, binding);
         if (binding.image) {
             std::lock_guard tlock(tracker_mutex_);
@@ -1692,6 +1693,29 @@ public:
         deletion_queue_.drain(current_ticket, device_, vk);
     }
 
+    void report_attachment_writes(std::uint64_t owner, const AttachmentWriteTrace& trace) {
+        std::unique_lock lock(submit_mutex_, std::try_to_lock);
+        if (!lock || is_device_lost()) {
+            std::fprintf(stderr, "[rt] d3d12: native RT replay owner=0x%llx retirement=unavailable\n",
+                         static_cast<unsigned long long>(owner));
+            return;
+        }
+        constexpr const char* names[] = {"clear_full", "clear_rects", "copy", "resolve", "possible_draw_or_predicated_clear"};
+        for (unsigned i = 0; i < trace.last_ticket.size(); ++i) {
+            const auto ticket = trace.last_ticket[i];
+            const auto retired = retire_tickets_.observe(ticket, [&](VkSemaphore semaphore, std::uint64_t value)
+                -> std::optional<bool> {
+                std::uint64_t done = 0;
+                if (vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) != VK_SUCCESS) return {};
+                return done >= value;
+            });
+            std::fprintf(stderr, "[rt] d3d12: native RT replay owner=0x%llx kind=%s last_global_ticket=%llu "
+                "retirement=%s incomplete=%u\n", static_cast<unsigned long long>(owner), names[i],
+                static_cast<unsigned long long>(ticket), !ticket ? "none_recorded" : !retired ? "unknown" :
+                *retired ? "retired" : "pending", unsigned(trace.incomplete.load(std::memory_order_relaxed)));
+        }
+    }
+
     // Both methods are called with submit_mutex_ held. A queue's own progress timeline is
     // monotonic even when another queue completes first; global tickets are retired in order.
     void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
@@ -1895,6 +1919,7 @@ private:
     FrameDrawActivity frame_draw_activity_;
     std::uintptr_t next_activity_image_ = 0;  // under resource_mutex_
     RetireTickets<VkSemaphore> retire_tickets_;
+    bool trace_native_attachments_ = false;  // protected by resource_mutex_
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
@@ -2726,6 +2751,8 @@ private:
         ReplayFunctions replay = context_.replay_;
         std::optional<FrameDrawTargets> frame_draws;
         if (FrameDrawActivity::enabled()) replay.frame_draws = &frame_draws.emplace();
+        std::optional<AttachmentWriteBatch> attachment_writes;
+        if (context_.trace_native_attachments_) replay.attachment_writes = &attachment_writes.emplace();
         replay.execution_pins = &pins;
         HostImageReads image_reads;
         if (!context_.host_images_.empty()) replay.image_reads = &image_reads;
@@ -3437,7 +3464,7 @@ private:
         record_profile_.record("begin,bindless,uploads,commands", profile_shadows, profile_before_bindless,
                                profile_after_bindless, profile_before_commands);
         const auto profile_emit = FrameProfile::now();
-        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0, replay.frame_draws);
+        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0, replay.frame_draws, replay.attachment_writes);
         if (!submitted && (!storage_images.empty() || !zero_buffers.empty())) {
             // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);
@@ -3990,7 +4017,7 @@ private:
     }
 
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
-                const FrameDrawTargets* frame_draws = nullptr) {
+                const FrameDrawTargets* frame_draws = nullptr, const AttachmentWriteBatch* attachment_writes = nullptr) {
         if (context_.is_device_lost()) return false;
         const std::uint64_t ticket = submitted_ + 1;
         if (last_sparse_) {
@@ -4051,6 +4078,7 @@ private:
                         static_cast<unsigned long long>(ticket), reinterpret_cast<void*>(command_buffer),
                         submit.commandBufferCount);
                 context_.record_submit_locked(progress_, ticket);
+                if (attachment_writes) attachment_writes->submit(context_.submitted_retire_ticket());
                 if (signals_fence) context_.holds().signaled(fence, value);
             }
         }
